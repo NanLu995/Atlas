@@ -13,12 +13,9 @@
 
 namespace atlas {
 
-// Send-only NetworkMessage carrying an entity-RPC reply. body is opaque:
-// for success it is the deserializer-readable reply payload; for failure
-// it is a VLE-prefixed error message string. The C# AtlasRpcSource<T>
-// matching this reply consumes [request_id][error_code] header itself.
+// Reply body is user data on success or a VLE-prefixed error string on failure.
 struct EntityRpcReply {
-  uint32_t request_id{0};
+  uint64_t request_id{0};
   int32_t error_code{0};
   std::span<const std::byte> body;
 
@@ -53,7 +50,7 @@ inline void WriteErrorBody(BinaryWriter& body, std::string_view error_msg) {
   body.WriteString(error_msg);
 }
 
-inline auto SendSuccess(Channel& ch, uint32_t request_id, std::span<const std::byte> body)
+inline auto SendSuccess(Channel& ch, uint64_t request_id, std::span<const std::byte> body)
     -> Result<void> {
   return ch.SendMessage(EntityRpcReply{
       .request_id = request_id,
@@ -62,7 +59,7 @@ inline auto SendSuccess(Channel& ch, uint32_t request_id, std::span<const std::b
   });
 }
 
-inline auto SendFailure(Channel& ch, uint32_t request_id, int32_t error_code,
+inline auto SendFailure(Channel& ch, uint64_t request_id, int32_t error_code,
                         std::string_view error_msg) -> Result<void> {
   BinaryWriter body;
   WriteErrorBody(body, error_msg);
@@ -71,6 +68,14 @@ inline auto SendFailure(Channel& ch, uint32_t request_id, int32_t error_code,
       .error_code = error_code,
       .body = body.Data(),
   });
+}
+
+inline void RejectRequest(Channel* channel, uint32_t rpc_id, std::span<const std::byte> payload,
+                          int32_t error_code, std::string_view message) {
+  if (!channel || (rpc_id & 0x80000000u) == 0) return;
+  BinaryReader reader(payload);
+  auto request_id = reader.Read<uint64_t>();
+  if (request_id && *request_id != 0) (void)SendFailure(*channel, *request_id, error_code, message);
 }
 
 }  // namespace entity_rpc_reply

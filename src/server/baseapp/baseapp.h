@@ -164,8 +164,8 @@ class BaseApp : public EntityApp {
   void OnCellRpcForward(Channel& ch, const baseapp::CellRpcForward& msg);
   void OnBroadcastRpcFromCell(Channel& ch, const baseapp::BroadcastRpcFromCell& msg);
   // Wraps target_entity_id + rpc_id + trace_id + payload in kClientRpcMessageId envelope.
-  void RelayRpcToClient(Channel& client_ch, EntityID target_entity_id, uint32_t rpc_id,
-                        const std::vector<std::byte>& payload, uint64_t trace_id);
+  RpcSendResult RelayRpcToClient(Channel& client_ch, EntityID target_entity_id, uint32_t rpc_id,
+                                 const std::vector<std::byte>& payload, uint64_t trace_id);
   void OnReplicatedDeltaFromCell(Channel& ch, const baseapp::ReplicatedDeltaFromCell& msg);
   void OnReplicatedReliableDeltaFromCell(Channel& ch,
                                          const baseapp::ReplicatedReliableDeltaFromCell& msg);
@@ -190,6 +190,8 @@ class BaseApp : public EntityApp {
   void OnClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg);
   void OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg);
   void OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg);
+  void ForwardClientCellRpc(Channel& client, Channel& cell, EntityID source_entity_id,
+                            const baseapp::ClientCellRpc& msg);
   void OnClientMovementInput(Channel& ch, const baseapp::ClientMovementInput& msg);
   void OnMovementCorrectionReport(Channel& ch, const baseapp::MovementCorrectionReport& msg);
 

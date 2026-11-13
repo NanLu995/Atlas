@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 from pathlib import Path
@@ -12,9 +13,40 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
+from cluster_control import test_cluster
 
 
 class DatabaseToolsTest(unittest.TestCase):
+    def test_cluster_script_override_is_explicit(self):
+        with patch.object(sys, 'argv', ['test_cluster.py']):
+            self.assertIsNone(test_cluster.parse_args().base_assembly)
+            self.assertIsNone(test_cluster.parse_args().cell_assembly)
+        with patch.object(sys, 'argv', ['test_cluster.py', '--base-assembly', 'fixture.dll']):
+            self.assertEqual(test_cluster.parse_args().base_assembly, Path('fixture.dll'))
+        with patch.object(sys, 'argv', ['test_cluster.py', '--cell-assembly', 'cell.dll']):
+            self.assertEqual(test_cluster.parse_args().cell_assembly, Path('cell.dll'))
+
+    def test_missing_explicit_assembly_never_starts_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'runtime').mkdir()
+            (root / 'runtime/atlas_server.runtimeconfig.json').write_text('{}')
+            (root / 'bin/debug').mkdir(parents=True)
+            (root / 'bin/debug/Atlas.Runtime.dll').write_bytes(b'')
+            missing = root / 'missing-fixture.dll'
+            args = SimpleNamespace(build_dir='debug', base_assembly=missing, cell_assembly=None)
+            with patch.object(test_cluster, 'resolve_repo_root', return_value=root), \
+                 patch.object(test_cluster, 'resolve_program', return_value=Path(__file__)), \
+                 patch.object(test_cluster, 'start_logged_process') as start, \
+                 patch.object(sys, 'stderr', new_callable=io.StringIO) as output:
+                self.assertEqual(test_cluster._spawn_cluster(args, 25000), 1)
+                start.assert_not_called()
+                self.assertIn(str(missing), output.getvalue())
+                args.base_assembly = None
+                args.cell_assembly = missing
+                self.assertEqual(test_cluster._spawn_cluster(args, 25000), 1)
+                start.assert_not_called()
+
     def args(self, *values):
         parser = argparse.ArgumentParser()
         add_database_options(parser)

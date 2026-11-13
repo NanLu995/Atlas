@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -24,6 +25,8 @@ namespace atlas::net_client {
 // Async Login/Auth state machine for the Unity DLL. Single-thread-owned.
 // Replaces the blocking poll loop in src/client/client_app.cc.
 class ClientSession {
+  friend struct ClientSessionTestAccess;
+
  public:
   ClientSession();
   ~ClientSession();
@@ -32,6 +35,7 @@ class ClientSession {
   ClientSession& operator=(const ClientSession&) = delete;
 
   auto Poll() -> int32_t;
+  void PrepareForDestroy();
 
   [[nodiscard]] auto GetState() const -> AtlasNetState { return state_; }
 
@@ -91,6 +95,9 @@ class ClientSession {
   NetworkInterface network_{dispatcher_};
 
   AtlasNetState state_{ATLAS_NET_STATE_DISCONNECTED};
+  bool polling_{false};
+  bool connection_lost_{false};
+  std::optional<AtlasDisconnectReason> pending_disconnect_;
 
   Channel* loginapp_channel_{nullptr};
   Channel* baseapp_channel_{nullptr};
@@ -123,6 +130,9 @@ class ClientSession {
 
 }  // namespace atlas::net_client
 
-struct AtlasNetContext : ::atlas::net_client::ClientSession {};
+struct AtlasNetContext : ::atlas::net_client::ClientSession {
+  uint32_t active_calls{0};
+  bool destroy_requested{false};
+};
 
 #endif  // ATLAS_LIB_NET_CLIENT_CLIENT_SESSION_H_

@@ -7,6 +7,7 @@ namespace Atlas.Coro.Rpc;
 public static class AtlasRpcRegistryHost
 {
     private static IAtlasRpcRegistry? _current;
+    internal static Func<ulong>? RequestIdAllocator { get; private set; }
 
     public static IAtlasRpcRegistry Current =>
         _current ?? throw new InvalidOperationException(
@@ -14,11 +15,16 @@ public static class AtlasRpcRegistryHost
 
     public static bool IsInstalled => _current is not null;
 
-    public static void Install(IAtlasRpcRegistry registry)
+    public static void Install(IAtlasRpcRegistry registry, Func<ulong>? requestIdAllocator = null)
     {
         if (registry is null) throw new ArgumentNullException(nameof(registry));
         _current = registry;
+        RequestIdAllocator = requestIdAllocator;
     }
 
-    public static void Reset() => _current = null;
+    public static void Reset()
+    {
+        _current = null;
+        RequestIdAllocator = null;
+    }
 }

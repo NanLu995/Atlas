@@ -45,11 +45,11 @@ class InterfaceTable {
   void SetDefaultHandler(DefaultHandler handler) { default_handler_ = std::move(handler); }
 
   // Lets RPC registries consume replies before typed dispatch.
-  using PreDispatchHook = std::function<bool(MessageID, std::span<const std::byte>)>;
+  using PreDispatchHook = std::function<bool(Channel*, MessageID, std::span<const std::byte>)>;
   void SetPreDispatchHook(PreDispatchHook hook) { pre_dispatch_hook_ = std::move(hook); }
 
-  auto TryPreDispatch(MessageID id, std::span<const std::byte> payload) -> bool {
-    if (pre_dispatch_hook_) return pre_dispatch_hook_(id, payload);
+  auto TryPreDispatch(Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool {
+    if (pre_dispatch_hook_) return pre_dispatch_hook_(channel, id, payload);
     return false;
   }
 

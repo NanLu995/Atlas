@@ -24,6 +24,7 @@
 #include "cellapp_native_provider.h"
 #include "cellappmgr/cellappmgr_messages.h"
 #include "controller_codec.h"
+#include "coro/entity_rpc_reply.h"
 #include "dbapp/dbapp_messages.h"
 #include "foundation/clock.h"
 #include "foundation/log.h"
@@ -155,6 +156,7 @@ CellApp::~CellApp() = default;
 auto CellApp::CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> {
   auto provider = std::make_unique<CellAppNativeProvider>(
       [this](uint32_t id) { return FindEntity(id); }, Network());
+  provider->SetRpcRegistry(rpc_registry_);
   provider->SetCreateLocalEntityFn([this](uint16_t type_id, uint32_t space_id, float px, float py,
                                           float pz, float dx, float dy, float dz, bool on_ground) {
     return CreateLocalEntity(type_id, space_id, math::Vector3{px, py, pz},
@@ -221,9 +223,10 @@ auto CellApp::Init(int argc, char* argv[]) -> bool {
   auto& table = Network().InterfaceTable();
 
   // Entity-RPC replies match here first; unmatched ids fall through to typed handlers.
-  table.SetPreDispatchHook([this](MessageID id, std::span<const std::byte> payload) -> bool {
-    return rpc_registry_.TryDispatch(id, payload);
-  });
+  table.SetPreDispatchHook(
+      [this](Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool {
+        return rpc_registry_.TryDispatch(id, payload, channel);
+      });
 
   (void)table.RegisterTypedHandler<cellapp::CreateCellEntity>(
       [this](const Address& src, Channel* ch, const cellapp::CreateCellEntity& msg) {
@@ -491,6 +494,7 @@ void CellApp::OnCellAppMgrDeath(const machined::DeathNotification& n) {
 }
 
 void CellApp::Fini() {
+  rpc_registry_.Shutdown();
   // Clear spaces before EntityApp tears down script state; CellEntity
   // destructors may publish final witness events.
   spaces_.clear();
@@ -1063,6 +1067,7 @@ void CellApp::RemoveEntityFromSpace(CellEntity* entity) {
       if (h.channel) (void)h.channel->SendMessage(del);
     }
   }
+  rpc_registry_.CancelRepliesForEntity(cell_id);
   if (native_provider_ && native_provider_->entity_destroyed_fn()) {
     native_provider_->entity_destroyed_fn()(cell_id);
   }
@@ -1384,8 +1389,10 @@ void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
     ATLAS_LOG_WARNING("CellApp: ClientCellRpcForward: dispatch_rpc callback not registered");
     return;
   }
-  dispatch_fn(entity->Id(), msg.rpc_id, reinterpret_cast<intptr_t>(ch),
-              reinterpret_cast<const uint8_t*>(msg.payload.data()),
+  const auto reply =
+      native_provider_->CreateEntityRpcReply(entity->Id(), msg.rpc_id, msg.payload, ch);
+  if ((msg.rpc_id & 0x80000000u) != 0 && reply == 0) return;
+  dispatch_fn(entity->Id(), msg.rpc_id, reply, reinterpret_cast<const uint8_t*>(msg.payload.data()),
               static_cast<int32_t>(msg.payload.size()), msg.trace_id);
 }
 
@@ -1416,6 +1423,7 @@ void CellApp::OnInternalCellRpc(const Address& /*src*/, Channel* ch,
   if (!entity) {
     ATLAS_LOG_WARNING("CellApp: InternalCellRpc for unknown target entity_id={} rpc_id=0x{:06X}",
                       msg.target_entity_id, msg.rpc_id);
+    entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4, "Cell entity unavailable");
     return;
   }
   if (!entity->IsReal()) {
@@ -1427,10 +1435,13 @@ void CellApp::OnInternalCellRpc(const Address& /*src*/, Channel* ch,
   auto dispatch_fn = native_provider_ ? native_provider_->dispatch_rpc_fn() : nullptr;
   if (!dispatch_fn) {
     ATLAS_LOG_WARNING("CellApp: InternalCellRpc: dispatch_rpc callback not registered");
+    entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4, "Cell dispatcher unavailable");
     return;
   }
-  dispatch_fn(entity->Id(), msg.rpc_id, reinterpret_cast<intptr_t>(ch),
-              reinterpret_cast<const uint8_t*>(msg.payload.data()),
+  const auto reply =
+      native_provider_->CreateEntityRpcReply(entity->Id(), msg.rpc_id, msg.payload, ch);
+  if ((msg.rpc_id & 0x80000000u) != 0 && reply == 0) return;
+  dispatch_fn(entity->Id(), msg.rpc_id, reply, reinterpret_cast<const uint8_t*>(msg.payload.data()),
               static_cast<int32_t>(msg.payload.size()), msg.trace_id);
 }
 

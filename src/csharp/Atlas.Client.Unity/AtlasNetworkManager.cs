@@ -1,6 +1,7 @@
 using System;
 using Atlas.Client;
 using Atlas.Client.Native;
+using Atlas.Protocol;
 using UnityEngine;
 
 namespace Atlas.Client.Unity
@@ -65,20 +66,28 @@ namespace Atlas.Client.Unity
             ClientHost.SendBaseRpcHandler = (entityId, rpcId, payload, traceId) =>
             {
                 _ = traceId;
-                if (_ctx == IntPtr.Zero) return;
+                if (_ctx == IntPtr.Zero) return RpcSendResult.InvalidTarget;
+                int result;
                 fixed (byte* p = payload)
-                    AtlasNetNative.AtlasNetSendBaseRpc(_ctx, entityId, rpcId, p, payload.Length);
+                    result = AtlasNetNative.AtlasNetSendBaseRpc(_ctx, entityId, rpcId, p, payload.Length);
                 ++_rpcOutCount;
+                return result == AtlasNetReturnCode.Ok ? RpcSendResult.Queued :
+                    result == AtlasNetReturnCode.ErrBusy ? RpcSendResult.Overloaded :
+                    result == AtlasNetReturnCode.ErrNoconn ? RpcSendResult.InvalidTarget : RpcSendResult.SendFailed;
             };
             Session.SendBaseRpcHandler = ClientHost.SendBaseRpcHandler;
 
             ClientHost.SendCellRpcHandler = (entityId, rpcId, payload, traceId) =>
             {
                 _ = traceId;
-                if (_ctx == IntPtr.Zero) return;
+                if (_ctx == IntPtr.Zero) return RpcSendResult.InvalidTarget;
+                int result;
                 fixed (byte* p = payload)
-                    AtlasNetNative.AtlasNetSendCellRpc(_ctx, entityId, rpcId, p, payload.Length);
+                    result = AtlasNetNative.AtlasNetSendCellRpc(_ctx, entityId, rpcId, p, payload.Length);
                 ++_rpcOutCount;
+                return result == AtlasNetReturnCode.Ok ? RpcSendResult.Queued :
+                    result == AtlasNetReturnCode.ErrBusy ? RpcSendResult.Overloaded :
+                    result == AtlasNetReturnCode.ErrNoconn ? RpcSendResult.InvalidTarget : RpcSendResult.SendFailed;
             };
             Session.SendCellRpcHandler = ClientHost.SendCellRpcHandler;
 
@@ -143,6 +152,7 @@ namespace Atlas.Client.Unity
         private void OnDestroy()
         {
             if (_ctx == IntPtr.Zero) return;
+            Session.CancelPendingRpcs();
             AtlasNetCallbackBridge.Unregister(_ctx);
             AtlasNetNative.AtlasNetDestroy(_ctx);
             _ctx = IntPtr.Zero;
@@ -168,9 +178,11 @@ namespace Atlas.Client.Unity
         }
 
         public int Logout()
-            => _ctx == IntPtr.Zero
-                ? AtlasNetReturnCode.ErrInval
-                : AtlasNetNative.AtlasNetDisconnect(_ctx, AtlasDisconnectReason.Logout);
+        {
+            if (_ctx == IntPtr.Zero) return AtlasNetReturnCode.ErrInval;
+            Session.CancelPendingRpcs();
+            return AtlasNetNative.AtlasNetDisconnect(_ctx, AtlasDisconnectReason.Logout);
+        }
 
         public int SetTransportImpairment(uint oneWayLatencyMs, uint lossPermyriad, uint seed = 1)
             => _ctx == IntPtr.Zero
@@ -254,7 +266,11 @@ namespace Atlas.Client.Unity
             AuthFinished?.Invoke(success != 0, entityId, typeId, err);
         }
 
-        void IAtlasNetEvents.OnDisconnect(int reason) => Disconnected?.Invoke(reason);
+        void IAtlasNetEvents.OnDisconnect(int reason)
+        {
+            Session.CancelPendingRpcs();
+            Disconnected?.Invoke(reason);
+        }
 
         void IAtlasNetEvents.OnDeliver(ushort msgId, ReadOnlySpan<byte> payload)
             => Session.DeliverFromServer(msgId, payload);

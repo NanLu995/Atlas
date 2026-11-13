@@ -116,39 +116,95 @@ uint8_t CellAppNativeProvider::GetProcessPrefix() {
   return static_cast<uint8_t>(ProcessType::kCellApp);
 }
 
+auto CellAppNativeProvider::CoroRegisterPending(uint16_t reply_id, uint64_t request_id,
+                                                int32_t timeout_ms, intptr_t managed_handle)
+    -> uint64_t {
+  if (!rpc_registry_) return 0;
+  return coro_bridge::RegisterPending(*rpc_registry_, coro_on_rpc_complete_fn_, reply_id,
+                                      request_id, timeout_ms, managed_handle);
+}
+
+void CellAppNativeProvider::CoroCancelPending(uint64_t handle) {
+  if (rpc_registry_) coro_bridge::CancelPending(*rpc_registry_, handle);
+}
+
+RpcSendResult CellAppNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t rpc_id,
+                                                 const std::byte* payload, int32_t len,
+                                                 uint64_t trace_id) {
+  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (!IsValidNativePayload(payload, len)) return RpcSendResult::kInvalidTarget;
+  const std::span<const std::byte> bytes{payload, static_cast<size_t>(len)};
+  auto fail = [&](Error error) {
+    if (rpc_registry_) coro_bridge::FailEntityRequest(*rpc_registry_, rpc_id, bytes, error);
+  };
+  auto* entity = lookup_ ? lookup_(entity_id) : nullptr;
+  if (!entity || entity->BaseAddr().Port() == 0 || !network_) {
+    fail(Error{ErrorCode::kReceiverGone, "entity BaseApp unavailable"});
+    return RpcSendResult::kInvalidTarget;
+  }
+  auto channel = network_->ConnectRudpNocwnd(entity->BaseAddr());
+  if (!channel) {
+    fail(channel.Error());
+    return RpcSendOutcome(Result<void>{channel.Error()});
+  }
+  if ((rpc_id & 0x80000000u) != 0 &&
+      (!rpc_registry_ || !coro_bridge::BindEntityRequest(*rpc_registry_, rpc_id, bytes, *channel)))
+    return RpcSendResult::kInvalidTarget;
+  baseapp::CellRpcForward message;
+  message.entity_id = entity_id;
+  message.rpc_id = rpc_id;
+  message.payload.assign(bytes.begin(), bytes.end());
+  message.trace_id = trace_id;
+  auto sent = (*channel)->SendMessage(message);
+  if (!sent) fail(sent.Error());
+  return RpcSendOutcome(sent);
+}
+
 void CellAppNativeProvider::ReportScriptTick(uint32_t entity_id, uint64_t elapsed_us) {
   if (script_tick_fn_) script_tick_fn_(entity_id, elapsed_us);
 }
 
-void CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
-                                          const std::byte* payload, int32_t len,
-                                          uint64_t trace_id) {
+RpcSendResult CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id,
+                                                   RpcTarget target, const std::byte* payload,
+                                                   int32_t len, uint64_t trace_id) {
+  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("CellApp: SendClientRpc rejected invalid payload len={}", len);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   if (!IsValidRpcTarget(target)) {
     ATLAS_LOG_WARNING("CellApp: SendClientRpc rejected invalid target={}",
                       static_cast<int>(target));
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   auto* source = lookup_ ? lookup_(entity_id) : nullptr;
   if (!source) {
     ATLAS_LOG_WARNING("CellApp: SendClientRpc: unknown entity_id={}", entity_id);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   if (!source->IsReal()) {
     ATLAS_LOG_WARNING("CellApp: SendClientRpc on Ghost entity_id={} - rejected", entity_id);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   if (!network_) {
     ATLAS_LOG_ERROR(
         "CellApp: SendClientRpc: provider was constructed without a NetworkInterface "
         "(handler-level test?); cannot route to BaseApp");
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
 
   // One BroadcastRpcFromCell per destination BaseApp.
+  bool queued = false;
+  bool failed = false;
+  RpcSendResult failure = RpcSendResult::kSendFailed;
+  auto record = [&](RpcSendResult outcome) {
+    if (outcome == RpcSendResult::kQueued)
+      queued = true;
+    else {
+      failed = true;
+      failure = outcome;
+    }
+  };
   std::unordered_map<Address, std::vector<EntityID>> by_baseapp;
   const EntityID source_entity_id = source->Id();
   const auto& source_base_addr = source->BaseAddr();
@@ -167,6 +223,7 @@ void CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id, R
   for (auto& [base_addr, ids] : by_baseapp) {
     auto base_ch = network_->ConnectRudpNocwnd(base_addr);
     if (!base_ch) {
+      record(RpcSendOutcome(Result<void>{base_ch.Error()}));
       ATLAS_LOG_WARNING("CellApp: SendClientRpc: cannot connect to base at {}",
                         base_addr.ToString());
       continue;
@@ -177,58 +234,86 @@ void CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id, R
     msg.dest_entity_ids = std::move(ids);
     msg.trace_id = trace_id;
     if (len > 0) msg.payload.assign(payload, payload + static_cast<std::size_t>(len));
-    (void)(*base_ch)->SendMessage(msg);
+    record(RpcSendOutcome((*base_ch)->SendMessage(msg)));
   }
 
   // Forward Others/All to each Haunt cell so Observers attached via the
   // remote Ghost mirror also see the RPC. Owner-only stays local.
-  if (target == RpcTarget::kOwner) return;
+  auto outcome = [&] {
+    return failed ? (queued ? RpcSendResult::kPartiallyQueued : failure) : RpcSendResult::kQueued;
+  };
+  if (target == RpcTarget::kOwner) return outcome();
   auto* rd = source->GetRealData();
-  if (rd == nullptr) return;
+  if (rd == nullptr) return outcome();
   for (const auto& haunt : rd->Haunts()) {
-    if (haunt.channel == nullptr) continue;
+    if (haunt.channel == nullptr) {
+      record(RpcSendResult::kInvalidTarget);
+      continue;
+    }
     cellapp::ClientRpcBroadcast bmsg;
     bmsg.source_entity_id = source_entity_id;
     bmsg.rpc_id = rpc_id;
     bmsg.target = static_cast<uint8_t>(target);
     bmsg.trace_id = trace_id;
     if (len > 0) bmsg.payload.assign(payload, payload + static_cast<std::size_t>(len));
-    (void)haunt.channel->SendMessage(bmsg);
+    record(RpcSendOutcome(haunt.channel->SendMessage(bmsg)));
   }
+  return outcome();
 }
 
-void CellAppNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
-                                        const std::byte* payload, int32_t len, uint64_t trace_id) {
+RpcSendResult CellAppNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
+                                                 const std::byte* payload, int32_t len,
+                                                 uint64_t trace_id) {
+  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("CellApp: SendCellRpc rejected invalid payload len={}", len);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
+  const std::span<const std::byte> bytes{payload, static_cast<size_t>(len)};
+  auto fail = [&](Error error) {
+    if (rpc_registry_) coro_bridge::FailEntityRequest(*rpc_registry_, rpc_id, bytes, error);
+  };
   auto* entity = lookup_ ? lookup_(entity_id) : nullptr;
   if (!entity) {
+    fail(Error{ErrorCode::kReceiverGone, "cell entity unavailable"});
     ATLAS_LOG_WARNING("CellApp: SendCellRpc: unknown entity_id={}", entity_id);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
-  // A Real here means the script could have called the method directly; this
-  // path exists only for Ghost->Real cross-cell routing.
   if (entity->IsReal()) {
-    ATLAS_LOG_WARNING("CellApp: SendCellRpc on Real entity_id={} rpc_id=0x{:06X} - call directly",
-                      entity_id, rpc_id);
-    return;
+    if (!dispatch_rpc_fn_) {
+      fail(Error{ErrorCode::kReceiverGone, "local cell dispatcher missing"});
+      return RpcSendResult::kInvalidTarget;
+    }
+    if ((rpc_id & 0x80000000u) != 0 &&
+        (!rpc_registry_ || !coro_bridge::BindEntityRequest(*rpc_registry_, rpc_id, bytes, nullptr)))
+      return RpcSendResult::kInvalidTarget;
+    const auto reply = CreateEntityRpcReply(entity_id, rpc_id, bytes, nullptr);
+    if ((rpc_id & 0x80000000u) != 0 && reply == 0) return RpcSendResult::kInvalidTarget;
+    dispatch_rpc_fn_(entity_id, rpc_id, reply, reinterpret_cast<const uint8_t*>(payload), len,
+                     trace_id);
+    return RpcSendResult::kQueued;
   }
   auto* real_ch = entity->GetRealChannel();
   if (!real_ch) {
+    fail(Error{ErrorCode::kReceiverGone, "real cell channel unavailable"});
     ATLAS_LOG_WARNING("CellApp: SendCellRpc: Ghost entity_id={} has no real_channel", entity_id);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
+  if ((rpc_id & 0x80000000u) != 0 &&
+      (!rpc_registry_ || !coro_bridge::BindEntityRequest(*rpc_registry_, rpc_id, bytes, real_ch)))
+    return RpcSendResult::kInvalidTarget;
   cellapp::InternalCellRpc msg;
   msg.target_entity_id = entity_id;
   msg.rpc_id = rpc_id;
   msg.trace_id = trace_id;
   if (len > 0) msg.payload.assign(payload, payload + static_cast<std::size_t>(len));
   if (auto r = real_ch->SendMessage(msg); !r) {
+    fail(r.Error());
     ATLAS_LOG_DEBUG("CellApp: SendCellRpc send failed (entity={}, rpc_id=0x{:06X}): {}", entity_id,
                     rpc_id, r.Error().Message());
+    return RpcSendOutcome(r);
   }
+  return RpcSendResult::kQueued;
 }
 
 auto CellAppNativeProvider::CreateLocalCellEntity(uint16_t type_id, uint32_t space_id, float pos_x,
@@ -676,6 +761,7 @@ void CellAppNativeProvider::SetNativeCallbacks(const void* native_callbacks, int
 
   restore_entity_fn_ = table.restore_entity;
   dispatch_rpc_fn_ = table.dispatch_rpc;
+  coro_on_rpc_complete_fn_ = table.coro_on_rpc_complete;
   entity_destroyed_fn_ = table.entity_destroyed;
   // nullptr => Offload ships empty persistent_blob (replication baseline covers it).
   serialize_entity_fn_ = table.serialize_entity;

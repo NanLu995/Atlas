@@ -12,10 +12,11 @@ public sealed class NativeRpcRegistry : IAtlasRpcRegistry
 
     private NativeRpcRegistry() { }
 
-    public long RegisterPending(int replyId, uint requestId, int timeoutMs,
+    public long RegisterPending(int replyId, ulong requestId, int timeoutMs,
         IAtlasRpcCallback callback)
     {
         if (callback is null) throw new ArgumentNullException(nameof(callback));
+        if (replyId <= 0 || replyId > ushort.MaxValue || requestId == 0) return 0;
 
         var managed = GCHandlePool.Rent(callback);
         var handle = NativeApi.CoroRegisterPending(
@@ -23,7 +24,6 @@ public sealed class NativeRpcRegistry : IAtlasRpcRegistry
         if (handle == 0)
         {
             GCHandlePool.Return(managed);
-            callback.OnError(RpcCompletionStatus.SendError);
             return 0;
         }
         return (long)handle;

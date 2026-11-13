@@ -35,6 +35,7 @@ public static class AtlasNetReturnCode
 {
     public const int Ok       = 0;
     public const int ErrBusy  = -16;
+    public const int ErrIo    = -5;
     public const int ErrNomem = -12;
     public const int ErrInval = -22;
     public const int ErrNoconn = -107;

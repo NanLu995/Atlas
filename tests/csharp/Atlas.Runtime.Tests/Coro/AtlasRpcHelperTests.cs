@@ -29,15 +29,69 @@ public sealed class AtlasRpcHelperTests : IDisposable
         AtlasLoop.Reset();
     }
 
+    [Fact]
+    public void RequestIdsCross32BitBoundaryAndRejectExhaustionWithoutReuse()
+    {
+        var field = typeof(AtlasRpc).GetField("_nextRequestId",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        var previous = field.GetValue(null);
+        try
+        {
+            field.SetValue(null, (long)uint.MaxValue - 1);
+            Assert.Equal((ulong)uint.MaxValue, AtlasRpc.NextRequestId());
+            Assert.Equal((ulong)uint.MaxValue + 1, AtlasRpc.NextRequestId());
+            field.SetValue(null, long.MaxValue);
+            Assert.Equal((ulong)long.MaxValue + 1, AtlasRpc.NextRequestId());
+            field.SetValue(null, -2L);
+            Assert.Equal(ulong.MaxValue, AtlasRpc.NextRequestId());
+            Assert.Equal(0UL, AtlasRpc.NextRequestId());
+            Assert.Equal(0UL, AtlasRpc.NextRequestId());
+            var rejected = AtlasRpc.Await<int>(100, 0, DeserInt);
+            Assert.Equal(RpcErrorCodes.SendFailed, _loop.RunAwait(rejected).Error);
+            Assert.Equal(0, _registry.PendingCount);
+        }
+        finally { field.SetValue(null, previous); }
+    }
+
+    [Fact]
+    public void ReplyIdsWithMatchingLow32BitsRemainIndependent()
+    {
+        const ulong oldId = 1;
+        const ulong newId = (1UL << 32) + oldId;
+        var oldCall = AtlasRpc.Await<int>(100, oldId, DeserInt);
+        _registry.CancelPending(1);
+        Assert.Equal(RpcErrorCodes.Cancelled, _loop.RunAwait(oldCall).Error);
+        var current = AtlasRpc.Await<int>(100, newId, DeserInt);
+        Assert.False(_registry.TryDispatch(100, oldId, BuildOkReply(oldId, 7)));
+        Assert.Equal(1, _registry.PendingCount);
+        Assert.True(_registry.TryDispatch(100, newId, BuildOkReply(newId, 8)));
+        Assert.Equal(8, _loop.RunAwait(current).Value);
+    }
+
     private static readonly AtlasRpcSource<RpcReply<int>>.SpanDeserializer DeserInt =
         static (ref SpanReader r) => RpcReply<int>.Ok(r.ReadInt32());
 
-    private static byte[] BuildOkReply(uint requestId, int value)
+    [Fact]
+    public void ServerAllocatorSurvivesHostReinstallAndDoesNotFallbackWhenExhausted()
+    {
+        ulong counter = 40;
+        Func<ulong> allocator = () => ++counter;
+        AtlasRpcRegistryHost.Install(_registry, allocator);
+        Assert.Equal(41UL, AtlasRpc.NextRequestId());
+        AtlasRpcRegistryHost.Reset();
+        AtlasRpcRegistryHost.Install(_registry, allocator);
+        Assert.Equal(42UL, AtlasRpc.NextRequestId());
+        AtlasRpcRegistryHost.Install(_registry, () => 0);
+        Assert.Equal(0UL, AtlasRpc.NextRequestId());
+        Assert.Equal(0UL, AtlasRpc.NextRequestId());
+    }
+
+    private static byte[] BuildOkReply(ulong requestId, int value)
     {
         var w = new SpanWriter(16);
         try
         {
-            w.WriteUInt32(requestId);
+            w.WriteUInt64(requestId);
             w.WriteInt32(0);
             w.WriteInt32(value);
             return w.WrittenSpan.ToArray();

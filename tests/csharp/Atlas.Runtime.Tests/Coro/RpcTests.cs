@@ -30,12 +30,12 @@ public sealed class RpcTests : IDisposable
     private static readonly AtlasRpcSource<RpcReply<int>>.SpanDeserializer DeserInt =
         static (ref SpanReader r) => RpcReply<int>.Ok(r.ReadInt32());
 
-    private static byte[] BuildOkReply(uint requestId, int value)
+    private static byte[] BuildOkReply(ulong requestId, int value)
     {
         var w = new SpanWriter(16);
         try
         {
-            w.WriteUInt32(requestId);
+            w.WriteUInt64(requestId);
             w.WriteInt32(0);
             w.WriteInt32(value);
             return w.WrittenSpan.ToArray();
@@ -43,12 +43,12 @@ public sealed class RpcTests : IDisposable
         finally { w.Dispose(); }
     }
 
-    private static byte[] BuildErrReply(uint requestId, int code, string msg)
+    private static byte[] BuildErrReply(ulong requestId, int code, string msg)
     {
         var w = new SpanWriter(64);
         try
         {
-            w.WriteUInt32(requestId);
+            w.WriteUInt64(requestId);
             w.WriteInt32(code);
             w.WriteString(msg);
             return w.WrittenSpan.ToArray();
@@ -174,7 +174,7 @@ public sealed class RpcTests : IDisposable
     private sealed class TestTriggerRegistry : IAtlasRpcRegistry
     {
         private IAtlasRpcCallback? _cb;
-        public long RegisterPending(int replyId, uint requestId, int timeoutMs, IAtlasRpcCallback cb)
+        public long RegisterPending(int replyId, ulong requestId, int timeoutMs, IAtlasRpcCallback cb)
         {
             _cb = cb;
             return 1;
@@ -189,9 +189,9 @@ public sealed class RpcTests : IDisposable
         var src = AtlasRpcSource<RpcReply<int>>.Rent();
         src.Start(_registry, 100, 14, DeserInt, RpcReplyHelpers.For<int>(), 5000);
 
-        // Only 4 bytes (request_id) — error_code read will throw.
-        var truncated = new byte[4];
-        BitConverter.GetBytes((uint)14).CopyTo(truncated, 0);
+        // Only 8 bytes (request_id) — error_code read will throw.
+        var truncated = new byte[8];
+        BitConverter.GetBytes((ulong)14).CopyTo(truncated, 0);
         Assert.True(_registry.TryDispatch(100, 14, truncated));
 
         var reply = _loop.RunAwait(src.Task);
@@ -243,12 +243,99 @@ public sealed class RpcTests : IDisposable
         Assert.Equal(1, _registry.PendingCount);
     }
 
+    [Fact]
+    public void Registry_RejectsAtLimitAndReturnsCapacityAfterCancellation()
+    {
+        var callback = new RecordingCallback(_ => { }, _ => { });
+        long first = 0;
+        for (ulong id = 1; id <= ManagedRpcRegistry.MaxPendingRpcs; ++id)
+        {
+            var handle = _registry.RegisterPending(100, id, 0, callback);
+            Assert.NotEqual(0, handle);
+            if (id == 1) first = handle;
+        }
+        Assert.Equal(0, _registry.RegisterPending(100, 5000, 0, callback));
+        Assert.Equal(ManagedRpcRegistry.MaxPendingRpcs, _registry.PendingCount);
+        _registry.CancelPending(first);
+        Assert.NotEqual(0, _registry.RegisterPending(100, 5000, 0, callback));
+        _registry.Dispose();
+        Assert.Equal(0, _registry.PendingCount);
+    }
+
+    [Fact]
+    public void RpcSource_SendFailureRemovesWaiterAndDoesNotCancelOtherCalls()
+    {
+        var src = AtlasRpcSource<RpcReply<int>>.Rent();
+        src.Start(_registry, 100, 91, DeserInt, RpcReplyHelpers.For<int>(), 0);
+        var peer = AtlasRpc.Await(_registry, 100, 92, DeserInt, timeoutMs: 0);
+        src.FailSend();
+        src.FailSend();
+        Assert.Equal(1, _registry.PendingCount);
+        Assert.Equal(RpcErrorCodes.SendFailed, _loop.RunAwait(src.Task).Error);
+        Assert.False(_registry.TryDispatch(100, 91, BuildOkReply(91, 7)));
+        Assert.True(_registry.TryDispatch(100, 92, BuildOkReply(92, 8)));
+        Assert.Equal(8, _loop.RunAwait(peer).Value);
+        Assert.Equal(0, _registry.PendingCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RpcSource_ExplicitAndLifetimeCancellationAreBothHonored(bool cancelLifetime)
+    {
+        var caller = new AtlasCancellationSource();
+        var lifetime = new AtlasCancellationSource();
+        var source = AtlasRpcSource<RpcReply<int>>.Rent();
+        source.Start(_registry, 100, 91, DeserInt, RpcReplyHelpers.For<int>(), 0,
+            caller.Token, lifetime.Token);
+        var task = source.Task;
+        if (cancelLifetime) lifetime.Cancel(); else caller.Cancel();
+        Assert.Equal(RpcErrorCodes.Cancelled, _loop.RunAwait(task).Error);
+        Assert.Equal(0, _registry.PendingCount);
+        var next = AtlasRpc.Await(_registry, 100, 92, DeserInt, timeoutMs: 0);
+        caller.Cancel();
+        lifetime.Cancel();
+        Assert.True(_registry.TryDispatch(100, 92, BuildOkReply(92, 8)));
+        Assert.Equal(8, _loop.RunAwait(next).Value);
+    }
+
+    [Fact]
+    public void Registry_DuplicateRegistrationDoesNotCancelOriginalCall()
+    {
+        var original = AtlasRpc.Await(_registry, 100, 91, DeserInt);
+        var duplicate = AtlasRpc.Await(_registry, 100, 91, DeserInt);
+        Assert.Equal(1, _registry.PendingCount);
+        Assert.Equal(RpcErrorCodes.SendFailed, _loop.RunAwait(duplicate).Error);
+        Assert.True(_registry.TryDispatch(100, 91, BuildOkReply(91, 777)));
+        Assert.Equal(777, _loop.RunAwait(original).Value);
+        Assert.Equal(0, _registry.PendingCount);
+    }
+
+    [Fact]
+    public void Registry_DisposeRejectsReentrantRegistrationAndCompletesPeers()
+    {
+        long rejected = -1;
+        int completions = 0;
+        var callback = new RecordingCallback(_ => { }, _ =>
+        {
+            ++completions;
+            rejected = _registry.RegisterPending(100, 92, 0,
+                new RecordingCallback(_ => { }, _ => { }));
+        });
+        _registry.RegisterPending(100, 90, 0, callback);
+        _registry.RegisterPending(100, 91, 0, callback);
+        _registry.Dispose();
+        Assert.Equal(0, rejected);
+        Assert.Equal(2, completions);
+        Assert.Equal(0, _registry.PendingCount);
+    }
+
     // -------- End-to-end via async/await --------
 
     [Fact]
     public void EndToEnd_AwaitRpc_Succeeds()
     {
-        async AtlasTask<int> AwaitReply(uint requestId)
+        async AtlasTask<int> AwaitReply(ulong requestId)
         {
             var src = AtlasRpcSource<RpcReply<int>>.Rent();
             src.Start(_registry, 100, requestId, DeserInt, RpcReplyHelpers.For<int>(), 5000);

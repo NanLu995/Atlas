@@ -41,7 +41,7 @@ C++20 stackless coroutine 把这套流程压回顺序代码，配合 RAII guard 
 ├──────────────────────────────────────────────────────────┤
 │ 网络层（既有）                                           │
 │   InterfaceTable::Dispatch()                             │
-│     ├ TryPreDispatch(id, payload) → 命中即消费消息       │
+│     ├ TryPreDispatch(channel, id, payload) → 命中即消费消息       │
 │     └ 否则走原 handler 路径                              │
 │   EventDispatcher：timer / poller / frequent-tasks       │
 └──────────────────────────────────────────────────────────┘
@@ -134,21 +134,21 @@ RpcCall<Reply>(registry, channel, request, timeout, token)
 `on_reply` / `on_error` 回调、timeout timer、所属 channel。
 
 ```cpp
-auto RegisterPending(MessageID reply_id, uint32_t request_id,
+auto RegisterPending(MessageID reply_id, uint64_t request_id,
                      ReplyCallback on_reply, ErrorCallback on_error,
                      Duration timeout, Channel* channel = nullptr) -> PendingHandle;
-auto TryDispatch(MessageID id, std::span<const std::byte> payload) -> bool;
+auto TryDispatch(MessageID id, std::span<const std::byte> payload, Channel* source) -> bool;
 void Cancel(PendingHandle handle);
 void CancelByChannel(Channel* channel);   // 断开 → kReceiverGone
 void CancelAll();                         // 进程关闭
 ```
 
-`TryDispatch` 由 `InterfaceTable` 的 pre-dispatch hook 调用：从 payload 头 4 字节
-读 little-endian `request_id`，命中则取消 timer、`erase` 后调用 `on_reply` 并返
+`TryDispatch` 由 `InterfaceTable` 的 pre-dispatch hook 调用：从 payload 头读取
+little-endian `request_id`（实体回复 8 字节，其余回复 4 字节），并校验来源通道，命中则取消 timer、`erase` 后调用 `on_reply` 并返
 回 true（消息被消费）；否则返回 false 走原 handler 路径。
 
-**协议约定：** 所有可作为 RPC reply 的消息类型，`request_id`（uint32_t）必须是
-`Serialize()` 写入的第一个字段。当前 `login_messages.h` / `dbapp_messages.h` /
+**协议约定：** 所有可作为 RPC reply 的消息类型，`request_id` 必须是
+`Serialize()` 写入的第一个字段；实体回复为 uint64_t，其余现有回复保持 uint32_t。当前 `login_messages.h` / `dbapp_messages.h` /
 `baseapp_messages.h` 全部消息满足此约定。
 
 `CancelByChannel` 是 channel 断开时立即清算 —— 比等到默认 10s 超时快；
@@ -161,7 +161,7 @@ disconnect callback（`BaseApp` internal/external、`CellApp`、`LoginApp`）触
 `network/message_ids.h`）。Reply payload：
 
 ```
-[request_id u32 LE][error_code i32 LE]
+[request_id u64 LE][error_code i32 LE]
   if error_code != 0: [error_msg VLE-len-prefixed UTF-8]
   if error_code == 0: [body 由调用方 deserializer 反序列化]
 ```
@@ -179,7 +179,7 @@ C# 端 `EntityRpcReplyHelpers.SendReplyOnComplete` 调入此路径完成跨语�
 ```cpp
 using PreDispatchHook = std::function<bool(MessageID, std::span<const std::byte>)>;
 void SetPreDispatchHook(PreDispatchHook hook);
-auto TryPreDispatch(MessageID id, std::span<const std::byte> payload) -> bool;
+auto TryPreDispatch(Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool;
 ```
 
 `PendingRpcRegistry::TryDispatch` 在 hook 中调用；命中则消息被协程消费，

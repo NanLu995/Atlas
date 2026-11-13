@@ -8,6 +8,8 @@
 #include "clrscript/coro_bridge.h"
 #include "coro/pending_rpc_registry.h"
 #include "network/event_dispatcher.h"
+#include "network/message_ids.h"
+#include "serialization/binary_stream.h"
 
 namespace {
 
@@ -35,6 +37,12 @@ auto MakePayload(uint32_t request_id) -> std::vector<std::byte> {
   std::vector<std::byte> buf(sizeof(uint32_t));
   std::memcpy(buf.data(), &request_id, sizeof(uint32_t));
   return buf;
+}
+
+auto MakeEntityPayload(uint64_t request_id) -> std::vector<std::byte> {
+  atlas::BinaryWriter writer;
+  writer.Write(request_id);
+  return {writer.Data().begin(), writer.Data().end()};
 }
 
 class CoroBridgeTest : public ::testing::Test {
@@ -96,7 +104,7 @@ TEST_F(CoroBridgeTest, NullCallbackReturnsZero) {
   EXPECT_EQ(registry_.PendingCount(), 0u);
 }
 
-TEST_F(CoroBridgeTest, HandleRoundTripsReplyAndRequestId) {
+TEST_F(CoroBridgeTest, OpaqueHandlesCancelIndependently) {
   // Two registrations with different (reply, req) pairs cancel independently.
   auto h1 = atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 1, 5000, 0x10);
   auto h2 = atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 2, 5000, 0x20);
@@ -111,6 +119,19 @@ TEST_F(CoroBridgeTest, HandleRoundTripsReplyAndRequestId) {
   EXPECT_EQ(Records()[1].handle, intptr_t{0x20});
 }
 
+TEST_F(CoroBridgeTest, DuplicateRegistrationReturnsZeroWithoutCompletingManagedHandle) {
+  auto original =
+      atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 1, 5000, 0x10);
+  auto duplicate =
+      atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 1, 5000, 0x20);
+  EXPECT_NE(original, 0u);
+  EXPECT_EQ(duplicate, 0u);
+  EXPECT_TRUE(Records().empty());
+  ASSERT_TRUE(registry_.TryDispatch(42, MakePayload(1)));
+  ASSERT_EQ(Records().size(), 1u);
+  EXPECT_EQ(Records().front().handle, 0x10);
+}
+
 TEST_F(CoroBridgeTest, DispatchAfterCancelDoesNotFire) {
   auto handle =
       atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 400, 5000, 0xF1);
@@ -120,4 +141,59 @@ TEST_F(CoroBridgeTest, DispatchAfterCancelDoesNotFire) {
   auto payload = MakePayload(400);
   EXPECT_FALSE(registry_.TryDispatch(42, payload));
   EXPECT_TRUE(Records().empty());
+}
+
+TEST_F(CoroBridgeTest, OldCancellationCannotCancelReusedRequestKey) {
+  auto old = atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 1, 5000, 0x10);
+  ASSERT_TRUE(registry_.TryDispatch(42, MakePayload(1)));
+  auto current =
+      atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, 42, 1, 5000, 0x20);
+  EXPECT_NE(old, current);
+  atlas::coro_bridge::CancelPending(registry_, old);
+  EXPECT_EQ(registry_.PendingCount(), 1u);
+  ASSERT_TRUE(registry_.TryDispatch(42, MakePayload(1)));
+  ASSERT_EQ(Records().size(), 2u);
+  EXPECT_EQ(Records().back().handle, 0x20);
+  EXPECT_EQ(Records().back().status, 0);
+}
+
+TEST_F(CoroBridgeTest, EntityRequestBindsReplyAndDisconnectToActualChannel) {
+  auto* expected = reinterpret_cast<atlas::Channel*>(0xA1A1);
+  auto* wrong = reinterpret_cast<atlas::Channel*>(0xB2B2);
+  const auto reply_id = atlas::msg_id::Id(atlas::msg_id::Common::kEntityRpcReply);
+  atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, reply_id, 1, 5000, 0x10);
+  auto payload = MakeEntityPayload(1);
+  EXPECT_TRUE(atlas::coro_bridge::BindEntityRequest(registry_, 0x80000001, payload, expected));
+  EXPECT_FALSE(atlas::coro_bridge::BindEntityRequest(registry_, 0x80000001, payload, wrong));
+  EXPECT_FALSE(registry_.TryDispatch(reply_id, payload, wrong));
+  registry_.CancelByChannel(expected);
+  ASSERT_EQ(Records().size(), 1u);
+  EXPECT_EQ(Records().back().status, 4);
+  EXPECT_FALSE(registry_.TryDispatch(reply_id, payload, expected));
+}
+
+TEST_F(CoroBridgeTest, FailedEntitySendCompletesOnceAndRejectsLateReply) {
+  const auto reply_id = atlas::msg_id::Id(atlas::msg_id::Common::kEntityRpcReply);
+  atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, reply_id, 1, 5000, 0x10);
+  auto payload = MakeEntityPayload(1);
+  atlas::coro_bridge::FailEntityRequest(registry_, 0x80000001, payload,
+                                        atlas::Error{atlas::ErrorCode::kIoError, "send failed"});
+  atlas::coro_bridge::FailEntityRequest(
+      registry_, 0x80000001, payload,
+      atlas::Error{atlas::ErrorCode::kIoError, "duplicate failure"});
+  EXPECT_FALSE(registry_.TryDispatch(reply_id, payload));
+  ASSERT_EQ(Records().size(), 1u);
+  EXPECT_EQ(Records().front().status, 3);
+  EXPECT_EQ(registry_.PendingCount(), 0u);
+}
+
+TEST_F(CoroBridgeTest, CancelledOrMalformedEntityRequestCannotBindChannel) {
+  const auto reply_id = atlas::msg_id::Id(atlas::msg_id::Common::kEntityRpcReply);
+  auto handle =
+      atlas::coro_bridge::RegisterPending(registry_, &RecordCompletion, reply_id, 1, 5000, 0x10);
+  EXPECT_FALSE(atlas::coro_bridge::BindEntityRequest(registry_, 0x80000001, {}, nullptr));
+  atlas::coro_bridge::CancelPending(registry_, handle);
+  EXPECT_FALSE(
+      atlas::coro_bridge::BindEntityRequest(registry_, 0x80000001, MakeEntityPayload(1), nullptr));
+  EXPECT_TRUE(atlas::coro_bridge::BindEntityRequest(registry_, 1, {}, nullptr));
 }

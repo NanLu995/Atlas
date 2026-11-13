@@ -22,6 +22,7 @@
     <ProjectReference Include="..\..\..\src\csharp\Atlas.Shared\Atlas.Shared.csproj" />
     <ProjectReference Include="..\..\..\src\csharp\Atlas.Client\Atlas.Client.csproj" />
     <ProjectReference Include="..\..\..\src\csharp\Atlas.Client.Desktop\Atlas.Client.Desktop.csproj" />
+    <ProjectReference Include="../Atlas.RpcFixture/Client/Atlas.RpcFixture.Client.csproj" />
   </ItemGroup>
 
 </Project>

@@ -50,6 +50,11 @@ class CellAppNativeProvider : public BaseNativeProvider {
   // `network` only needed for SendClientRpc (handler tests can omit it).
   explicit CellAppNativeProvider(EntityLookupFn lookup);
   CellAppNativeProvider(EntityLookupFn lookup, NetworkInterface& network);
+  auto CoroRegisterPending(uint16_t reply_id, uint64_t request_id, int32_t timeout_ms,
+                           intptr_t managed_handle) -> uint64_t override;
+  void CoroCancelPending(uint64_t handle) override;
+  RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
   // CellApp wires these at startup; tests may inject mocks.
   void SetCreateLocalEntityFn(CreateLocalEntityFn fn) { create_local_entity_fn_ = std::move(fn); }
@@ -81,13 +86,12 @@ class CellAppNativeProvider : public BaseNativeProvider {
 
   // kOwner targets the source's bound client; kOthers/kAll fan out to
   // every witness with source in AoI, grouped by base_addr.
-  void SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
-                     const std::byte* payload, int32_t len, uint64_t trace_id) override;
+  RpcSendResult SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
+                              const std::byte* payload, int32_t len, uint64_t trace_id) override;
 
-  // Ghost-side script invokes a cell method on its Real owner. Calls on a
-  // local Real warn because scripts should invoke directly in-process.
-  void SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  // Ghost calls route to their Real owner; local Real calls dispatch in-process.
+  RpcSendResult SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
   auto CreateLocalCellEntity(uint16_t type_id, uint32_t space_id, float pos_x, float pos_y,
                              float pos_z, float dir_x, float dir_y, float dir_z, bool on_ground)
@@ -182,6 +186,7 @@ class CellAppNativeProvider : public BaseNativeProvider {
   MovementCurveFn movement_curve_fn_;
   MovementHistorySampleFn movement_history_sample_fn_;
   NetworkInterface* network_{nullptr};  // null in handler-level tests
+  CoroOnRpcCompleteFn coro_on_rpc_complete_fn_{nullptr};
   RestoreEntityFn restore_entity_fn_{nullptr};
   DispatchRpcFn dispatch_rpc_fn_{nullptr};
   EntityDestroyedFn entity_destroyed_fn_{nullptr};

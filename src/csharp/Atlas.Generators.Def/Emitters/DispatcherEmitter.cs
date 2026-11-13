@@ -256,7 +256,7 @@ internal static class DispatcherEmitter
         sb.AppendLine("            {");
         sb.AppendLine("                try");
         sb.AppendLine("                {");
-        sb.AppendLine("                    uint requestId = reader.ReadUInt32();");
+        sb.AppendLine("                    ulong requestId = reader.ReadUInt64();");
         var argLocals = new List<string>(method.Args.Count);
         foreach (var arg in method.Args)
             argLocals.Add(RpcArgCodec.EmitRead(sb, arg, "reader", "                    "));
@@ -331,7 +331,7 @@ internal static class DispatcherEmitter
             sb.AppendLine("                {");
             if (serverSide && method.HasReply)
             {
-                sb.AppendLine("                    uint requestId = reader.ReadUInt32();");
+                sb.AppendLine("                    ulong requestId = reader.ReadUInt64();");
                 var argLocals = new List<string>(method.Args.Count);
                 foreach (var arg in method.Args)
                     argLocals.Add(RpcArgCodec.EmitRead(sb, arg, "reader", "                    "));

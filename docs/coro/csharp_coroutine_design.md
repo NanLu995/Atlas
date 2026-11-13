@@ -190,7 +190,7 @@ destroy / shutdown / hot-reload 时由 C# 侧主动 cancel；CellApp offload 之
 | `ManagedRpcRegistry` | 客户端 / 测试 | 纯 C# 字典 + .NET Timer |
 
 `AtlasRpcSource<T>` 是池化 source。Reply payload 协议固定为
-`[request_id u32][error_code i32]([error_msg vle-string]|[body])`，框架自己
+`[request_id u64][error_code i32]([error_msg vle-string]|[body])`，框架自己
 消费 header 后把 `SpanReader` 交给 user deserializer。所有失败路径走
 `ErrorMapper` 返回 `RpcReply<T>`，**永不抛** —— 调用方天然单分支。
 
@@ -386,10 +386,10 @@ unload 路径。
 | 项 | 内容 |
 |---|---|
 | MessageID | `Common::kEntityRpcReply = 102`（`network/message_ids.h`）；C# 镜像 `MessageIds.EntityRpcReply` |
-| 请求 payload | `[request_id u32 LE][args...]`；rpc_id 顶位 `kReplyBit` 标记 expects-reply |
-| Reply payload | `[request_id u32 LE][error_code i32 LE]`<br>`if error_code != 0:` `[error_msg VLE-len-prefixed UTF-8]`<br>`if error_code == 0:` `[body]` |
+| 请求 payload | `[request_id u64 LE][args...]`；rpc_id 顶位 `kReplyBit` 标记 expects-reply |
+| Reply payload | `[request_id u64 LE][error_code i32 LE]`<br>`if error_code != 0:` `[error_msg VLE-len-prefixed UTF-8]`<br>`if error_code == 0:` `[body]` |
 | `kReplyBit` | bit 31（`RpcIdEncoder.kReplyBit = 1u << 31`）；slot_idx 缩为 7 bit（bits 24–30，最大 127 component slot） |
-| 反向路由 | dispatcher 接受 `IntPtr replyChannel` 参数，由 `BaseApp/CellApp` 收消息时透传 `Channel*`；接收方续延 settled 后 `NativeApi.SendEntityRpc{Success,Failure}` 沿同一 channel 回写 |
+| 反向路由 | dispatcher 接受 `IntPtr replyChannel` 不透明原生句柄；完成后原生核对请求 ID 并消费句柄，本地分发或沿绑定通道回复。断线、实体销毁及注册表关闭使句柄失效 |
 | Channel 断开处理 | `PendingRpcRegistry::CancelByChannel(Channel*)`；BaseApp internal/external + CellApp + LoginApp 在 disconnect callback 中调用，立即 cancel 该 channel pending → `RpcErrorCodes.ReceiverGone` |
 
 ### 6.5 异常情况覆盖
@@ -451,10 +451,8 @@ GC 验证靠 `tests/csharp` 里的 stress 用例 + `Atlas.Runtime.Diagnostics`
 
 ## 9. 已知限制
 
-- **CellApp 端发起 entity-rpc**：`CellAppNativeProvider::CoroRegisterPending`
-  仍是基类 no-op，cellapp 内的 `await someEntity.Base.Method(...)` 注册不到
-  native registry。接收 reply 路径（cellapp 作为被叫方）已通；脚本宿主里
-  **主动 await 仅 BaseApp 可用**。
+- **客户端回复**：ClientSession 按会话分发实体回复；Client→Cell 经 BaseApp 改写请求 ID 并恢复原 ID，中转等待上限为 10 秒。CellApp 等待注册与取消已接入原生注册表；
+  本地 Base/Cell 回复使用不透明原生句柄，Cell→Base 及 Ghost→Real 发送绑定实际通道。
 - **Analyzer 规则**：仅落地 `ATLAS_RPC001`。"CellApp entity 内 await 必须显
   式传 ct"、"`FromBgWork` lambda safety" 规则未实现。
 

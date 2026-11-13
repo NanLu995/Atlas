@@ -1,16 +1,71 @@
 using System;
+using System.Threading.Tasks;
 using Atlas.Client;
+using Atlas.Client.Desktop;
 using Atlas.Client.Native;
+using Atlas.Coro.Rpc;
+using Atlas.Protocol;
+using Atlas.Serialization;
 using Xunit;
 
 namespace Atlas.Client.Tests;
 
-// LoginClient sits on top of atlas_net_client.dll; constructing one requires
-// the DLL on PATH. These tests only validate types / value-shapes that don't
-// require a live native context — full handshake coverage lives in
-// tests/integration/test_client_flow.
 public sealed class LoginClientTests
 {
+    [Fact]
+    public void MailboxSendReportsDisconnectedAndDisposed()
+    {
+        var session = new ClientSession();
+        var client = new LoginClient(session);
+        Assert.Same(session, client.Session);
+        Assert.Equal(RpcSendResult.InvalidTarget, client.SendBaseRpc(1, 1, default));
+        Assert.Equal(RpcSendResult.InvalidTarget, client.SendCellRpc(1, 1, default));
+        client.Dispose();
+        Assert.Equal(RpcSendResult.Stopping, client.SendBaseRpc(1, 1, default));
+        Assert.Equal(RpcSendResult.Stopping, client.SendCellRpc(1, 1, default));
+        Assert.Null(session.SendBaseRpcHandler);
+        Assert.Null(session.SendCellRpcHandler);
+    }
+
+    [Fact]
+    public async Task NativeEventsAndDisconnectStayWithinExplicitSession()
+    {
+        var first = new ClientSession();
+        var second = new ClientSession();
+        using var left = new LoginClient(first);
+        using var right = new LoginClient(second);
+        var a = AtlasRpc.Await<int>(first.RpcRegistry, 102, 17,
+            static (ref SpanReader reader) => RpcReply<int>.Ok(reader.ReadInt32()), timeoutMs: 0);
+        var b = AtlasRpc.Await<int>(second.RpcRegistry, 102, 17,
+            static (ref SpanReader reader) => RpcReply<int>.Ok(reader.ReadInt32()), timeoutMs: 0);
+        ((IAtlasNetEvents)left).OnDisconnect(0);
+        Assert.Equal(RpcErrorCodes.ReceiverGone, (await a).Error);
+        Assert.False(b.GetAwaiter().IsCompleted);
+        var writer = new SpanWriter(16);
+        byte[] reply;
+        try
+        {
+            writer.WriteUInt64(17);
+            writer.WriteInt32(0);
+            writer.WriteInt32(71);
+            reply = writer.WrittenSpan.ToArray();
+        }
+        finally { writer.Dispose(); }
+        ((IAtlasNetEvents)left).OnDeliver(102, reply);
+        Assert.False(b.GetAwaiter().IsCompleted);
+        ((IAtlasNetEvents)right).OnDeliver(102, reply);
+        Assert.Equal(71, (await b).Value);
+    }
+
+    [Fact]
+    public void StandaloneMailboxTransportExposesSessionAndSendResults()
+    {
+        var type = typeof(Atlas.Client.Desktop.LoginClient);
+        Assert.Equal(typeof(ClientSession), type.GetProperty("Session")?.PropertyType);
+        Assert.Equal(typeof(RpcSendResult), type.GetMethod("SendBaseRpc")?.ReturnType);
+        Assert.Equal(typeof(RpcSendResult), type.GetMethod("SendCellRpc")?.ReturnType);
+    }
+
     [Fact]
     public void LoginResult_StoresHostAndPort()
     {
@@ -45,9 +100,6 @@ public sealed class LoginClientTests
     [Fact]
     public void AtlasClientType_ExposesConnectAsyncSignature()
     {
-        // Smoke check that the high-level facade's ConnectAsync exists with
-        // the expected shape — guards against accidental rename / ctor-only
-        // refactors that would silently break Unity / desktop callers.
         var t = typeof(Atlas.Client.Desktop.AtlasClient);
         var method = t.GetMethod("ConnectAsync");
         Assert.NotNull(method);

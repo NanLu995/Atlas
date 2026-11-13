@@ -448,11 +448,7 @@ internal static class ComponentEmitter
                 break;
 
             case RpcRole.Send:
-                // Client: SendClientRpc unavailable (clients don't call
-                // client_methods on themselves). Client-side send for
-                // client_methods is unreachable, so don't emit it; the
-                // dispatch role table already routes that combination
-                // through Receive on the client side.
+                // Client methods are received locally; client-side sends are invalid.
                 if (ctx == ProcessContext.Client && section == "client_methods")
                 {
                     // Defensive: shouldn't happen given the role helper,
@@ -460,8 +456,7 @@ internal static class ComponentEmitter
                     sb.AppendLine($"    // {method.Name}: client_methods send role on client is invalid");
                     break;
                 }
-                sb.AppendLine($"    // Send stub for {section}.{method.Name}");
-                sb.AppendLine($"    public void {method.Name}({paramList})");
+                sb.AppendLine($"    public global::Atlas.Protocol.RpcSendResult {method.Name}({paramList})");
                 sb.AppendLine("    {");
                 EmitSerializeAndSend(sb, method, methodIdx, section);
                 sb.AppendLine("    }");
@@ -492,7 +487,7 @@ internal static class ComponentEmitter
         var sendArgs = section == "client_methods" ? "Atlas.Core.RpcTarget.Owner, " : "";
         if (method.Args.Count == 0)
         {
-            sb.AppendLine($"        {sendHelper}({methodIdx}, {sendArgs}System.ReadOnlySpan<byte>.Empty);");
+            sb.AppendLine($"        return {sendHelper}({methodIdx}, {sendArgs}System.ReadOnlySpan<byte>.Empty);");
             return;
         }
         sb.AppendLine("        var writer = new SpanWriter(64);");
@@ -500,7 +495,7 @@ internal static class ComponentEmitter
         sb.AppendLine("        {");
         foreach (var arg in method.Args)
             RpcArgCodec.EmitWrite(sb, arg, "writer", "            ");
-        sb.AppendLine($"            {sendHelper}({methodIdx}, {sendArgs}writer.WrittenSpan);");
+        sb.AppendLine($"            return {sendHelper}({methodIdx}, {sendArgs}writer.WrittenSpan);");
         sb.AppendLine("        }");
         sb.AppendLine("        finally { writer.Dispose(); }");
     }

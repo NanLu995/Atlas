@@ -7,6 +7,7 @@ using Atlas.DataTypes;
 using Atlas.Serialization;
 using Atlas.Shared.Protocol;
 using Xunit;
+using Atlas.Protocol;
 
 namespace Atlas.Client.Tests
 {
@@ -34,6 +35,24 @@ namespace Atlas.Client.Tests
                 nameof(AtlasMovementStateFrame.LastProcessedInputSeq)).ToInt32());
         }
 
+        [Fact]
+        public void CellReadyIsSessionScopedAndRejectsInvalidLengths()
+        {
+            var session = new ClientSession();
+            var other = new ClientSession();
+            uint seen = 0;
+            int calls = 0;
+            session.CellReadyReceived += id => { seen = id; ++calls; };
+            byte[] body = { 0x78, 0x56, 0x34, 0x12 };
+            other.DeliverFromServer(ClientCallbacks.kCellReadyMessageId, body);
+            session.DeliverFromServer(ClientCallbacks.kCellReadyMessageId, body.AsSpan(0, 3));
+            session.DeliverFromServer(ClientCallbacks.kCellReadyMessageId, new byte[5]);
+            Assert.Equal(0, calls);
+            session.DeliverFromServer(ClientCallbacks.kCellReadyMessageId, body);
+            Assert.Equal(0x12345678u, seen);
+            Assert.Equal(1, calls);
+        }
+
         private sealed class FakePeer : ClientEntity
         {
             public override string TypeName => "FakePeer";
@@ -53,9 +72,9 @@ namespace Atlas.Client.Tests
                 ++PositionUpdates;
             }
 
-            public void SendBaseForTest()
+            public RpcSendResult SendBaseForTest()
             {
-                SendBaseRpc(42, ReadOnlySpan<byte>.Empty);
+                return SendBaseRpc(42, ReadOnlySpan<byte>.Empty);
             }
 
             public void SendMovementForTest(AtlasMovementInputFrame frame)
@@ -716,13 +735,23 @@ namespace Atlas.Client.Tests
             right.EntityFactory.Register(777, () => new FakePeer());
             uint leftEntity = 0;
             uint rightEntity = 0;
-            left.SendBaseRpcHandler = (entityId, _, _, _) => leftEntity = entityId;
-            right.SendBaseRpcHandler = (entityId, _, _, _) => rightEntity = entityId;
+            left.SendBaseRpcHandler = (entityId, _, _, _) =>
+            {
+                leftEntity = entityId;
+                return RpcSendResult.PartiallyQueued;
+            };
+            right.SendBaseRpcHandler = (entityId, _, _, _) =>
+            {
+                rightEntity = entityId;
+                return RpcSendResult.Queued;
+            };
 
             left.CreateEntity(100, 777);
             right.CreateEntity(200, 777);
-            ((FakePeer)left.EntityManager.Get(100)!).SendBaseForTest();
-            ((FakePeer)right.EntityManager.Get(200)!).SendBaseForTest();
+            Assert.Equal(RpcSendResult.PartiallyQueued,
+                ((FakePeer)left.EntityManager.Get(100)!).SendBaseForTest());
+            Assert.Equal(RpcSendResult.Queued,
+                ((FakePeer)right.EntityManager.Get(200)!).SendBaseForTest());
 
             Assert.Equal(100u, leftEntity);
             Assert.Equal(200u, rightEntity);

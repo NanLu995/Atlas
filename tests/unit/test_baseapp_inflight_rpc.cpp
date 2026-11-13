@@ -1,10 +1,3 @@
-// BaseApp in-flight ClientCellRpc ordering across a cell-address change.
-//
-// During a teleport/offload the target entity briefly has no cell (CellAddr
-// port 0). Client cell RPCs that arrive in that window must buffer and then
-// drain to the new cell IN ORDER when OnCurrentCell installs the address.
-// Teleport reuses this exact OnCurrentCell path, so this locks the guarantee.
-
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -15,6 +8,7 @@
 #include "baseapp/baseapp.h"
 #include "baseapp/baseapp_messages.h"
 #include "cellapp/cellapp_messages.h"
+#include "coro/entity_rpc_reply.h"
 #include "entitydef/entity_def_registry.h"
 #include "entitydef/entity_type_descriptor.h"
 #include "foundation/intrusive_ptr.h"
@@ -59,6 +53,21 @@ auto ForwardedRpcs(const RecordingChannel& ch) -> std::vector<cellapp::ClientCel
     if (msg.HasValue()) out.push_back(std::move(*msg));
   }
   return out;
+}
+
+auto ReplyValues(const RecordingChannel& channel) -> std::vector<std::pair<uint64_t, int32_t>> {
+  std::vector<std::pair<uint64_t, int32_t>> result;
+  for (const auto& frame : channel.Sends()) {
+    BinaryReader reader(frame);
+    auto id = reader.ReadPackedInt();
+    auto size = reader.ReadPackedInt();
+    if (!id || !size || *id != EntityRpcReply::Descriptor().id) continue;
+    auto request = reader.Read<uint64_t>();
+    auto error = reader.Read<int32_t>();
+    auto value = reader.Read<int32_t>();
+    if (request && error && value && *error == 0) result.emplace_back(*request, *value);
+  }
+  return result;
 }
 
 }  // namespace
@@ -116,6 +125,11 @@ class BaseAppInflightRpcTest : public ::testing::Test {
     app_.OnCurrentCell(*cell_ch_, cc);
   }
 
+  void ForwardReplyRequest(Channel& client, EntityID source,
+                           const baseapp::ClientCellRpc& request) {
+    app_.ForwardClientCellRpc(client, *cell_ch_, source, request);
+  }
+
   EventDispatcher dispatcher_;
   NetworkInterface internal_network_;
   NetworkInterface external_network_;
@@ -163,6 +177,137 @@ TEST_F(BaseAppInflightRpcTest, BuffersDuringNoCellThenDrainsInOrderOnCurrentCell
     EXPECT_EQ(f.source_entity_id, eid);
     EXPECT_EQ(f.rpc_id, kCellRpcId);
   }
+}
+
+TEST_F(BaseAppInflightRpcTest, SameClientRequestIdsRelayIndependentlyAndRestoreOriginalIds) {
+  auto other = make_intrusive<RecordingChannel>(dispatcher_, table_, Address(0x7F000001u, 32002));
+  baseapp::ClientCellRpc request;
+  request.target_entity_id = 1200;
+  request.rpc_id = 0x80800001u;
+  BinaryWriter payload;
+  payload.Write(uint64_t{17});
+  request.payload.assign(payload.Data().begin(), payload.Data().end());
+  auto& registry = app_.GetRpcRegistry();
+  const auto server_id = registry.AllocateRequestId();
+  ForwardReplyRequest(*client_ch_, 1200, request);
+  ForwardReplyRequest(*other, 1201, request);
+  auto forwarded = ForwardedRpcs(*cell_ch_);
+  ASSERT_EQ(forwarded.size(), 2u);
+  BinaryReader first(forwarded[0].payload);
+  BinaryReader second(forwarded[1].payload);
+  auto first_id = first.Read<uint64_t>();
+  auto second_id = second.Read<uint64_t>();
+  ASSERT_TRUE(first_id);
+  ASSERT_TRUE(second_id);
+  EXPECT_NE(*first_id, *second_id);
+  EXPECT_NE(*first_id, server_id);
+  for (const auto& [id, value] : {std::pair{*second_id, 22}, std::pair{*first_id, 11}}) {
+    BinaryWriter response;
+    response.Write(id);
+    response.Write(int32_t{0});
+    response.Write(value);
+    EXPECT_FALSE(
+        registry.TryDispatch(EntityRpcReply::Descriptor().id, response.Data(), other.get()));
+    EXPECT_TRUE(
+        registry.TryDispatch(EntityRpcReply::Descriptor().id, response.Data(), cell_ch_.get()));
+    EXPECT_FALSE(
+        registry.TryDispatch(EntityRpcReply::Descriptor().id, response.Data(), cell_ch_.get()));
+  }
+  EXPECT_EQ(ReplyValues(*client_ch_), (std::vector<std::pair<uint64_t, int32_t>>{{17, 11}}));
+  EXPECT_EQ(ReplyValues(*other), (std::vector<std::pair<uint64_t, int32_t>>{{17, 22}}));
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+TEST_F(BaseAppInflightRpcTest, ClientDisconnectRemovesRelayAndLateCellReplyIsIgnored) {
+  baseapp::ClientCellRpc request;
+  request.target_entity_id = 1200;
+  request.rpc_id = 0x80800001u;
+  BinaryWriter payload;
+  payload.Write(uint64_t{17});
+  request.payload.assign(payload.Data().begin(), payload.Data().end());
+  ForwardReplyRequest(*client_ch_, 1200, request);
+  auto forwarded = ForwardedRpcs(*cell_ch_);
+  ASSERT_EQ(forwarded.size(), 1u);
+  BinaryReader forwarded_payload(forwarded[0].payload);
+  auto forwarded_id = forwarded_payload.Read<uint64_t>();
+  ASSERT_TRUE(forwarded_id);
+  auto& registry = app_.GetRpcRegistry();
+  registry.CancelByChannel(client_ch_.get());
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+  BinaryWriter response;
+  response.Write(*forwarded_id);
+  response.Write(int32_t{0});
+  EXPECT_FALSE(
+      registry.TryDispatch(EntityRpcReply::Descriptor().id, response.Data(), cell_ch_.get()));
+  EXPECT_TRUE(client_ch_->Sends().empty());
+}
+
+TEST_F(BaseAppInflightRpcTest, RelayPropagatesMalformedReplyCellDisconnectAndSendFailure) {
+  baseapp::ClientCellRpc request;
+  request.target_entity_id = 1200;
+  request.rpc_id = 0x80800001u;
+  BinaryWriter payload;
+  payload.Write(uint64_t{17});
+  request.payload.assign(payload.Data().begin(), payload.Data().end());
+  auto& registry = app_.GetRpcRegistry();
+  for (int failure = 0; failure < 3; ++failure) {
+    auto client =
+        make_intrusive<RecordingChannel>(dispatcher_, table_, Address(0x7F000001u, 32002));
+    if (failure == 2) cell_ch_->Condemn();
+    ForwardReplyRequest(*client, 1200, request);
+    if (failure == 0) {
+      auto forwarded = ForwardedRpcs(*cell_ch_);
+      ASSERT_FALSE(forwarded.empty());
+      BinaryReader reader(forwarded.back().payload);
+      auto id = reader.Read<uint64_t>();
+      ASSERT_TRUE(id);
+      BinaryWriter malformed;
+      malformed.Write(*id);
+      ASSERT_TRUE(
+          registry.TryDispatch(EntityRpcReply::Descriptor().id, malformed.Data(), cell_ch_.get()));
+    } else if (failure == 1) {
+      registry.CancelByChannel(cell_ch_.get());
+    }
+    ASSERT_EQ(client->Sends().size(), 1u);
+    BinaryReader reply(client->Sends().front());
+    ASSERT_TRUE(reply.ReadPackedInt());
+    ASSERT_TRUE(reply.ReadPackedInt());
+    auto original = reply.Read<uint64_t>();
+    auto error = reply.Read<int32_t>();
+    ASSERT_TRUE(original);
+    ASSERT_TRUE(error);
+    EXPECT_EQ(*original, 17u);
+    EXPECT_EQ(*error, failure == 0 ? -7 : (failure == 1 ? -4 : -5));
+    EXPECT_EQ(registry.PendingCount(), 0u);
+    EXPECT_EQ(registry.ReplyCount(), 0u);
+  }
+}
+
+TEST_F(BaseAppInflightRpcTest, RelayTimeoutRestoresClientIdAndRemovesBothRecords) {
+  baseapp::ClientCellRpc request;
+  request.target_entity_id = 1200;
+  request.rpc_id = 0x80800001u;
+  BinaryWriter payload;
+  payload.Write(uint64_t{17});
+  request.payload.assign(payload.Data().begin(), payload.Data().end());
+  ForwardReplyRequest(*client_ch_, 1200, request);
+  auto& registry = app_.GetRpcRegistry();
+  const auto deadline = Clock::now() + std::chrono::seconds(12);
+  while (registry.PendingCount() != 0 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+  ASSERT_EQ(client_ch_->Sends().size(), 1u);
+  BinaryReader response(client_ch_->Sends().front());
+  ASSERT_TRUE(response.ReadPackedInt());
+  ASSERT_TRUE(response.ReadPackedInt());
+  auto id = response.Read<uint64_t>();
+  auto error = response.Read<int32_t>();
+  ASSERT_TRUE(id);
+  ASSERT_TRUE(error);
+  EXPECT_EQ(*id, 17u);
+  EXPECT_EQ(*error, -1);
 }
 
 }  // namespace atlas

@@ -15,6 +15,19 @@ namespace {
 thread_local std::string g_global_last_error;
 std::atomic<AtlasLogFn> g_log_handler{nullptr};
 
+class ContextCall {
+ public:
+  explicit ContextCall(AtlasNetContext* context) : context_(context) { ++context_->active_calls; }
+  ContextCall(const ContextCall&) = delete;
+  auto operator=(const ContextCall&) -> ContextCall& = delete;
+  ~ContextCall() {
+    if (--context_->active_calls == 0 && context_->destroy_requested) delete context_;
+  }
+
+ private:
+  AtlasNetContext* context_;
+};
+
 class CallbackLogSink final : public atlas::LogSink {
  public:
   void Write(atlas::LogLevel level, std::string_view /*category*/, std::string_view message,
@@ -135,13 +148,16 @@ AtlasNetContext* AtlasNetCreate(uint32_t expected_abi) {
 }
 
 void AtlasNetDestroy(AtlasNetContext* ctx) {
-  if (!ctx) return;
-  ctx->Disconnect(ATLAS_DISCONNECT_INTERNAL);
-  delete ctx;
+  if (!ctx || ctx->destroy_requested) return;
+  ctx->destroy_requested = true;
+  ctx->PrepareForDestroy();
+  if (ctx->active_calls == 0) delete ctx;
 }
 
 int32_t AtlasNetPoll(AtlasNetContext* ctx) {
-  if (!ctx) return ATLAS_NET_ERR_INVAL;
+  if (!ctx || ctx->destroy_requested) return ATLAS_NET_ERR_INVAL;
+  if (ctx->active_calls != 0) return ATLAS_NET_ERR_BUSY;
+  ContextCall call(ctx);
   return ctx->Poll();
 }
 
@@ -172,7 +188,8 @@ int32_t AtlasNetSetEntityDefDigest(AtlasNetContext* ctx, const uint8_t* data, in
 }
 
 int32_t AtlasNetDisconnect(AtlasNetContext* ctx, AtlasDisconnectReason reason) {
-  if (!ctx) return ATLAS_NET_ERR_INVAL;
+  if (!ctx || ctx->destroy_requested) return ATLAS_NET_ERR_INVAL;
+  ContextCall call(ctx);
   return ctx->Disconnect(reason);
 }
 

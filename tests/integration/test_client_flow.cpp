@@ -8,13 +8,38 @@
 #include <gtest/gtest.h>
 
 #include "baseapp/baseapp_messages.h"
+#include "coro/entity_rpc_reply.h"
 #include "fake_cluster.h"
 #include "net_client/client_api.h"
+#include "net_client/client_session.h"
+#include "network/channel.h"
 #include "network/event_dispatcher.h"
+#include "network/reliable_udp.h"
 #include "serialization/binary_stream.h"
 
 using namespace atlas;
 using atlas::test::FakeCluster;
+
+namespace atlas::net_client {
+
+struct ClientSessionTestAccess {
+  static auto Setup(ClientSession& session, Channel* channel) -> InterfaceTable& {
+    session.baseapp_channel_ = channel;
+    session.InstallDefaultHandler();
+    return session.network_.InterfaceTable();
+  }
+  static void Clear(ClientSession& session) { session.baseapp_channel_ = nullptr; }
+  static void Stop(ClientSession& session) { session.pending_disconnect_ = ATLAS_DISCONNECT_USER; }
+  static void ConnectSilentBase(ClientSession& session) {
+    auto channel = session.network_.ConnectRudp(Address("127.0.0.1", 31003));
+    ASSERT_TRUE(channel.HasValue());
+    session.baseapp_channel_ = *channel;
+    session.state_ = ATLAS_NET_STATE_CONNECTED;
+    (*channel)->SetInactivityTimeout(std::chrono::milliseconds(1));
+  }
+};
+
+}  // namespace atlas::net_client
 
 namespace {
 
@@ -95,6 +120,71 @@ void DeliverCallback(AtlasNetContext*, uint16_t msg_id, const uint8_t* payload, 
 }
 
 }  // namespace
+
+TEST(NetClientFlow, ServerMessagesRequireBoundBaseAppChannel) {
+  EventDispatcher dispatcher("reply_source");
+  NetworkInterface network(dispatcher);
+  auto expected = network.ConnectRudp(Address("127.0.0.1", 31001));
+  auto wrong = network.ConnectRudp(Address("127.0.0.1", 31002));
+  ASSERT_TRUE(expected.HasValue());
+  ASSERT_TRUE(wrong.HasValue());
+  net_client::ClientSession session;
+  int deliveries = 0;
+  static int* counter;
+  counter = &deliveries;
+  AtlasNetCallbacks callbacks{};
+  callbacks.on_deliver = +[](AtlasNetContext*, uint16_t, const uint8_t*, int32_t) { ++*counter; };
+  (void)session.SetCallbacks(callbacks);
+  auto& table = net_client::ClientSessionTestAccess::Setup(session, *expected);
+  auto check = [&](const auto& message) {
+    BinaryWriter writer;
+    message.Serialize(writer);
+    auto dispatch = [&](Channel* channel) {
+      BinaryReader reader(writer.Data());
+      EXPECT_TRUE(table.Dispatch({}, channel, message.Descriptor().id, reader).HasValue());
+    };
+    const int before = deliveries;
+    dispatch(*wrong);
+    dispatch(nullptr);
+    EXPECT_EQ(deliveries, before);
+    dispatch(*expected);
+    EXPECT_EQ(deliveries, before + 1);
+  };
+  check(EntityRpcReply{(uint64_t{1} << 32) + 17, 0, {}});
+  check(baseapp::CellReady{42});
+  check(baseapp::EntityTransferred{42, 7});
+  net_client::ClientSessionTestAccess::Stop(session);
+  BinaryWriter writer;
+  EntityRpcReply reply{17, 0, {}};
+  reply.Serialize(writer);
+  BinaryReader reader(writer.Data());
+  EXPECT_TRUE(table.Dispatch({}, *expected, reply.Descriptor().id, reader).HasValue());
+  EXPECT_EQ(deliveries, 3);
+  net_client::ClientSessionTestAccess::Clear(session);
+  counter = nullptr;
+}
+
+TEST(NetClientFlow, LostBaseChannelNotifiesDisconnectExactlyOnce) {
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  static int notifications;
+  notifications = 0;
+  AtlasNetCallbacks callbacks{};
+  callbacks.on_disconnect = +[](AtlasNetContext*, int32_t) { ++notifications; };
+  (void)AtlasNetSetCallbacks(ctx, &callbacks);
+  net_client::ClientSessionTestAccess::ConnectSilentBase(*ctx);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (notifications == 0 && std::chrono::steady_clock::now() < deadline) {
+    (void)AtlasNetPoll(ctx);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(notifications, 1);
+  EXPECT_EQ(AtlasNetGetState(ctx), ATLAS_NET_STATE_DISCONNECTED);
+  EXPECT_EQ(AtlasNetSendBaseRpc(ctx, 1, 1, nullptr, 0), ATLAS_NET_ERR_NOCONN);
+  (void)AtlasNetPoll(ctx);
+  EXPECT_EQ(notifications, 1);
+  AtlasNetDestroy(ctx);
+}
 
 TEST(NetClientFlow, EndToEndCreateLoginAuthSendDisconnect) {
   FakeCluster cluster;
@@ -188,5 +278,116 @@ TEST(NetClientFlow, LoginToInvalidPortTimesOut) {
   EXPECT_EQ(AtlasNetGetState(ctx), ATLAS_NET_STATE_LOGGING_IN);
 
   EXPECT_EQ(ATLAS_NET_OK, AtlasNetDisconnect(ctx, ATLAS_DISCONNECT_USER));
+  AtlasNetDestroy(ctx);
+}
+
+TEST(NetClientFlow, DestroyDuringLoginCallbackWaitsForPollToReturn) {
+  FakeCluster cluster;
+  ASSERT_TRUE(cluster.Start());
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  struct State {
+    AtlasNetContext* context;
+    bool completed{false};
+    int32_t nested_poll{ATLAS_NET_OK};
+  } state{ctx};
+  auto callback = +[](void* data, uint8_t, const char*, uint16_t, const char*) {
+    auto& current = *static_cast<State*>(data);
+    current.nested_poll = AtlasNetPoll(current.context);
+    AtlasNetDestroy(current.context);
+    AtlasNetDestroy(current.context);
+    current.completed = true;
+  };
+  ASSERT_EQ(AtlasNetLogin(ctx, "127.0.0.1", cluster.LoginAppPort(), "callback_destroy",
+                          "<test-password>", callback, &state),
+            ATLAS_NET_OK);
+  EXPECT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return state.completed; }));
+  EXPECT_EQ(state.nested_poll, ATLAS_NET_ERR_BUSY);
+  if (!state.completed) AtlasNetDestroy(ctx);
+}
+
+TEST(NetClientFlow, DisconnectDuringLoginCallbackCanReconnectAfterPoll) {
+  FakeCluster cluster;
+  ASSERT_TRUE(cluster.Start());
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  struct State {
+    AtlasNetContext* context;
+    bool completed{false};
+    int32_t result{ATLAS_NET_ERR_INVAL};
+  } state{ctx};
+  auto callback = +[](void* data, uint8_t, const char*, uint16_t, const char*) {
+    auto& current = *static_cast<State*>(data);
+    current.result = AtlasNetDisconnect(current.context, ATLAS_DISCONNECT_USER);
+    current.completed = true;
+  };
+  ASSERT_EQ(AtlasNetLogin(ctx, "127.0.0.1", cluster.LoginAppPort(), "callback_disconnect",
+                          "<test-password>", callback, &state),
+            ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return state.completed; }));
+  EXPECT_EQ(state.result, ATLAS_NET_OK);
+  EXPECT_EQ(AtlasNetGetState(ctx), ATLAS_NET_STATE_DISCONNECTED);
+  LoginCallbackState reconnected;
+  EXPECT_EQ(AtlasNetLogin(ctx, "127.0.0.1", cluster.LoginAppPort(), "callback_reconnect",
+                          "<test-password>", &LoginCallback, &reconnected),
+            ATLAS_NET_OK);
+  EXPECT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return reconnected.done.load(); }));
+  AtlasNetDestroy(ctx);
+}
+
+TEST(NetClientFlow, DestroyFromLogoutCallbackCompletesOuterDisconnect) {
+  FakeCluster cluster;
+  ASSERT_TRUE(cluster.Start());
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  LoginCallbackState login;
+  ASSERT_EQ(AtlasNetLogin(ctx, "127.0.0.1", cluster.LoginAppPort(), "logout_destroy",
+                          "<test-password>", &LoginCallback, &login),
+            ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return login.done.load(); }));
+  AuthCallbackState auth;
+  ASSERT_EQ(AtlasNetAuthenticate(ctx, &AuthCallback, &auth), ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return auth.done.load(); }));
+  AtlasNetCallbacks callbacks{};
+  callbacks.on_disconnect = +[](AtlasNetContext* context, int32_t) { AtlasNetDestroy(context); };
+  ASSERT_EQ(AtlasNetSetCallbacks(ctx, &callbacks), ATLAS_NET_OK);
+  EXPECT_EQ(AtlasNetDisconnect(ctx, ATLAS_DISCONNECT_LOGOUT), ATLAS_NET_OK);
+}
+
+TEST(NetClientFlow, DisconnectDuringAuthCallbackRejectsFurtherSends) {
+  FakeCluster cluster;
+  ASSERT_TRUE(cluster.Start());
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  LoginCallbackState login;
+  ASSERT_EQ(AtlasNetLogin(ctx, "127.0.0.1", cluster.LoginAppPort(), "auth_disconnect",
+                          "<test-password>", &LoginCallback, &login),
+            ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return login.done.load(); }));
+  struct State {
+    AtlasNetContext* context;
+    bool completed{false};
+    int32_t base_result{ATLAS_NET_OK};
+    int32_t cell_result{ATLAS_NET_OK};
+  } state{ctx};
+  auto callback = +[](void* data, uint8_t, uint32_t, uint16_t, const char*) {
+    auto& current = *static_cast<State*>(data);
+    (void)AtlasNetDisconnect(current.context, ATLAS_DISCONNECT_USER);
+    current.base_result = AtlasNetSendBaseRpc(current.context, 42, 1, nullptr, 0);
+    current.cell_result = AtlasNetSendCellRpc(current.context, 42, 1, nullptr, 0);
+    current.completed = true;
+  };
+  ASSERT_EQ(AtlasNetAuthenticate(ctx, callback, &state), ATLAS_NET_OK);
+  EXPECT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
+                        [&] { return state.completed; }));
+  EXPECT_EQ(state.base_result, ATLAS_NET_ERR_NOCONN);
+  EXPECT_EQ(state.cell_result, ATLAS_NET_ERR_NOCONN);
+  EXPECT_EQ(AtlasNetGetState(ctx), ATLAS_NET_STATE_DISCONNECTED);
   AtlasNetDestroy(ctx);
 }

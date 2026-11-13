@@ -42,23 +42,23 @@ public abstract class ReplicatedComponent : ComponentBase
     // generated stub method; slot and TypeId are per-instance, so a single
     // component class instance can be slotted onto different entity types
     // and still target the right server-side dispatcher table.
-    protected void SendClientRpc(int methodIdx, RpcTarget target,
+    protected Atlas.Protocol.RpcSendResult SendClientRpc(int methodIdx, RpcTarget target,
         System.ReadOnlySpan<byte> payload)
     {
         int rpcId = (_slotIdx << 24) | (0x00 << 22) | (_entity.TypeId << 8) | methodIdx;
-        _entity.SendClientRpc(rpcId, target, payload);
+        return _entity.SendClientRpc(rpcId, target, payload);
     }
 
-    protected void SendCellRpc(int methodIdx, System.ReadOnlySpan<byte> payload)
+    protected Atlas.Protocol.RpcSendResult SendCellRpc(int methodIdx, System.ReadOnlySpan<byte> payload)
     {
         int rpcId = (_slotIdx << 24) | (0x02 << 22) | (_entity.TypeId << 8) | methodIdx;
-        _entity.SendCellRpc(rpcId, payload);
+        return _entity.SendCellRpc(rpcId, payload);
     }
 
-    protected void SendBaseRpc(int methodIdx, System.ReadOnlySpan<byte> payload)
+    protected Atlas.Protocol.RpcSendResult SendBaseRpc(int methodIdx, System.ReadOnlySpan<byte> payload)
     {
         int rpcId = (_slotIdx << 24) | (0x03 << 22) | (_entity.TypeId << 8) | methodIdx;
-        _entity.SendBaseRpc(rpcId, payload);
+        return _entity.SendBaseRpc(rpcId, payload);
     }
 
     // Generator-emitted subclasses override; the base no-op makes

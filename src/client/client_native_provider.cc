@@ -39,16 +39,18 @@ uint8_t ClientNativeProvider::GetProcessPrefix() {
   return static_cast<uint8_t>(ProcessType::kClient);
 }
 
-void ClientNativeProvider::SendBaseRpc(uint32_t /*entity_id*/, uint32_t rpc_id,
-                                       const std::byte* payload, int32_t len, uint64_t trace_id) {
+RpcSendResult ClientNativeProvider::SendBaseRpc(uint32_t /*entity_id*/, uint32_t rpc_id,
+                                                const std::byte* payload, int32_t len,
+                                                uint64_t trace_id) {
+  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("Client: send_base_rpc rejected invalid payload len={}", len);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   auto* ch = app_.BaseappChannel();
   if (!ch) {
     ATLAS_LOG_WARNING("Client: send_base_rpc: not connected to BaseApp");
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
 
   // entity_id is implicit on the proxy-bound channel.
@@ -57,19 +59,21 @@ void ClientNativeProvider::SendBaseRpc(uint32_t /*entity_id*/, uint32_t rpc_id,
   msg.trace_id = trace_id;
   if (len > 0) msg.payload.assign(payload, payload + static_cast<std::size_t>(len));
 
-  (void)ch->SendMessage(msg);
+  return RpcSendOutcome(ch->SendMessage(msg));
 }
 
-void ClientNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
-                                       const std::byte* payload, int32_t len, uint64_t trace_id) {
+RpcSendResult ClientNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
+                                                const std::byte* payload, int32_t len,
+                                                uint64_t trace_id) {
+  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("Client: send_cell_rpc rejected invalid payload len={}", len);
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
   auto* ch = app_.BaseappChannel();
   if (!ch) {
     ATLAS_LOG_WARNING("Client: send_cell_rpc: not connected to BaseApp");
-    return;
+    return RpcSendResult::kInvalidTarget;
   }
 
   baseapp::ClientCellRpc msg;
@@ -78,7 +82,7 @@ void ClientNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
   msg.trace_id = trace_id;
   if (len > 0) msg.payload.assign(payload, payload + static_cast<std::size_t>(len));
 
-  (void)ch->SendMessage(msg);
+  return RpcSendOutcome(ch->SendMessage(msg));
 }
 
 void ClientNativeProvider::SendMovementInput(uint32_t target_entity_id, const std::byte* frames,

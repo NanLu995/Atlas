@@ -4,12 +4,16 @@ using Atlas.Client.Native;
 using Atlas.Components;
 using Atlas.DataTypes;
 using Atlas.Diagnostics;
+using Atlas.Protocol;
 using Atlas.Serialization;
 
 namespace Atlas.Client;
 
 public abstract class ClientEntity
 {
+    private readonly Atlas.Coro.AtlasCancellationSource _lifecycle = new();
+    public Atlas.Coro.AtlasCancellationToken LifecycleCancellation => _lifecycle.Token;
+    internal void TriggerLifecycleCancellation() => _lifecycle.Cancel();
     private const uint kMovementFlagGrounded = 1u;
 
     public uint EntityId { get; internal set; }
@@ -207,22 +211,25 @@ public abstract class ClientEntity
     protected internal virtual void OnEnterWorld() { }
     protected internal virtual void OnDestroy() { }
 
-    protected internal void SendCellRpc(int rpcId, ReadOnlySpan<byte> payload)
+    protected internal RpcSendResult SendCellRpc(int rpcId, ReadOnlySpan<byte> payload)
     {
         ulong traceId = (ulong)Atlas.Diagnostics.TraceContext.Current;
         if (Session != null)
-            Session.SendCellRpc(EntityId, (uint)rpcId, payload, traceId);
+            return Session.SendCellRpc(EntityId, (uint)rpcId, payload, traceId);
         else
-            ClientHost.SendCellRpc(EntityId, (uint)rpcId, payload, traceId);
+            return ClientHost.SendCellRpc(EntityId, (uint)rpcId, payload, traceId);
     }
 
-    protected internal void SendBaseRpc(int rpcId, ReadOnlySpan<byte> payload)
+    public Atlas.Coro.Rpc.IAtlasRpcRegistry RpcRegistry =>
+        (Session ?? ClientCallbacks.DefaultSession).RpcRegistry;
+
+    protected internal RpcSendResult SendBaseRpc(int rpcId, ReadOnlySpan<byte> payload)
     {
         ulong traceId = (ulong)Atlas.Diagnostics.TraceContext.Current;
         if (Session != null)
-            Session.SendBaseRpc(EntityId, (uint)rpcId, payload, traceId);
+            return Session.SendBaseRpc(EntityId, (uint)rpcId, payload, traceId);
         else
-            ClientHost.SendBaseRpc(EntityId, (uint)rpcId, payload, traceId);
+            return ClientHost.SendBaseRpc(EntityId, (uint)rpcId, payload, traceId);
     }
 
     protected internal void SendMovementInput(ReadOnlySpan<AtlasMovementInputFrame> frames)

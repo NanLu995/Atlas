@@ -387,7 +387,8 @@ public partial class Avatar : ServerEntity
         Assert.Contains("RpcReplyHelpers.For<string>()", code);
         Assert.Contains("AtlasRpcSource<RpcReply<int>>.Rent()", code);
         // request_id header is the first thing written into the request body.
-        Assert.Contains("writer.WriteUInt32(requestId);", code);
+        Assert.Contains("writer.WriteUInt64(requestId);", code);
+        Assert.Contains("timeoutMs, ct, _entity.LifecycleCancellation", code);
         // Reply bit must be OR'd into rpc_id (high nibble has 8 in it).
         Assert.Contains("unchecked((int)0x", code);
     }
@@ -423,7 +424,7 @@ public partial class Avatar : ServerEntity
         var code = dispatcher!.GetText().ToString();
 
         Assert.Contains("IntPtr replyChannel", code);
-        Assert.Contains("uint requestId = reader.ReadUInt32();", code);
+        Assert.Contains("ulong requestId = reader.ReadUInt64();", code);
         Assert.Contains("var __task = target.GetLevel(", code);
         Assert.Contains("EntityRpcReplyHelpers.SendReplyOnComplete(__task, replyChannel, requestId,", code);
         // Reply serializer is emitted as a static field — closure-free.
@@ -609,7 +610,7 @@ public partial class Avatar : ClientEntity
             .GetText().ToString();
 
         // UseItem is exposed → should be in mailbox
-        Assert.Contains("public void UseItem(int itemId)", code);
+        Assert.Contains("public RpcSendResult UseItem(int itemId)", code);
         // OnPlayerDead is NOT exposed → should NOT be in mailbox
         // Count occurrences of OnPlayerDead in the mailbox section
         Assert.DoesNotContain("OnPlayerDead", code);

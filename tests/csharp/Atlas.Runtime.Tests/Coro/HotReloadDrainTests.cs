@@ -71,6 +71,19 @@ public sealed class HotReloadDrainTests : IDisposable
     }
 
     [Fact]
+    public void CancelLifecyclesAndDrain_CancelsMailboxLifetimeWithoutExplicitCallerToken()
+    {
+        var entity = EntityManager.Instance.Create<Dummy>();
+        var source = AtlasRpcSource<RpcReply<int>>.Rent();
+        source.Start(_registry, 100, 17, Deser, RpcReplyHelpers.For<int>(), 0,
+            lifetime: entity.LifecycleCancellation);
+        var task = source.Task;
+        HotReloadManager.CancelLifecyclesAndDrain(EntityManager.Instance.GetAllEntities());
+        Assert.Equal(0, _registry.PendingCount);
+        Assert.Equal(RpcErrorCodes.Cancelled, task.GetAwaiter().GetResult().Error);
+    }
+
+    [Fact]
     public void CancelLifecyclesAndDrain_RpcWithoutLifecycleToken_LeavesPendingForTimeout()
     {
         var e = EntityManager.Instance.Create<Dummy>();

@@ -4,6 +4,7 @@ using Atlas.Core;
 using Atlas.Coro;
 using Atlas.DataTypes;
 using Atlas.Entity.Components;
+using Atlas.Protocol;
 using Atlas.Serialization;
 
 namespace Atlas.Entity;
@@ -308,23 +309,26 @@ public abstract class ServerEntity
     // Each method forwards to the C++ engine via NativeApi.
     // =========================================================================
 
-    protected internal void SendClientRpc(int rpcId, RpcTarget target,
+    protected internal RpcSendResult SendClientRpc(int rpcId, RpcTarget target,
         ReadOnlySpan<byte> payload)
     {
-        if (IsGhost) return;
-        NativeApi.SendClientRpc(EntityId, (uint)rpcId, target, payload,
+        if (IsDestroyed || IsGhost) return RpcSendResult.InvalidTarget;
+        return NativeApi.SendClientRpc(EntityId, (uint)rpcId, target, payload,
                                 (ulong)Atlas.Diagnostics.TraceContext.Current);
     }
 
-    protected internal void SendCellRpc(int rpcId, ReadOnlySpan<byte> payload)
+    protected internal RpcSendResult SendCellRpc(int rpcId, ReadOnlySpan<byte> payload)
     {
-        NativeApi.SendCellRpc(EntityId, (uint)rpcId, payload,
+        return NativeApi.SendCellRpc(EntityId, (uint)rpcId, payload,
                               (ulong)Atlas.Diagnostics.TraceContext.Current);
     }
 
-    protected internal void SendBaseRpc(int rpcId, ReadOnlySpan<byte> payload)
+    public Atlas.Coro.Rpc.IAtlasRpcRegistry RpcRegistry =>
+        Atlas.Coro.Rpc.AtlasRpcRegistryHost.Current;
+
+    protected internal RpcSendResult SendBaseRpc(int rpcId, ReadOnlySpan<byte> payload)
     {
-        NativeApi.SendBaseRpc(EntityId, (uint)rpcId, payload,
+        return NativeApi.SendBaseRpc(EntityId, (uint)rpcId, payload,
                               (ulong)Atlas.Diagnostics.TraceContext.Current);
     }
 }

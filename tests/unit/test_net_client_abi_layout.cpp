@@ -190,6 +190,8 @@ TEST(NetClientAbi, StateMatrixRejectsIllegalCalls) {
             ATLAS_NET_ERR_BUSY);
   EXPECT_EQ(AtlasNetSendBaseRpc(ctx, 1, 1, nullptr, 0), ATLAS_NET_ERR_NOCONN);
   EXPECT_EQ(AtlasNetSendCellRpc(ctx, 1, 1, nullptr, 0), ATLAS_NET_ERR_NOCONN);
+  EXPECT_EQ(AtlasNetSendBaseRpc(ctx, 1, 1, nullptr, 1), ATLAS_NET_ERR_INVAL);
+  EXPECT_EQ(AtlasNetSendCellRpc(ctx, 1, 1, nullptr, -1), ATLAS_NET_ERR_INVAL);
   AtlasMovementInputFrame frame{};
   EXPECT_EQ(AtlasNetSendMovementInput(ctx, 1, &frame, 1), ATLAS_NET_ERR_NOCONN);
   EXPECT_EQ(AtlasNetSendMovementCorrectionReport(ctx, 1, 1, 1, 0.0f, 0),

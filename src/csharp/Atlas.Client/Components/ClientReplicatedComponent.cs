@@ -14,16 +14,16 @@ public abstract class ClientReplicatedComponent : ClientComponentBase
     public virtual void ApplyDelta(ref SpanReader reader) { }
 
     // rpc_id = slot<<24 | dir<<22 | typeId<<8 | methodIdx. Slot + typeId are per-instance.
-    protected void SendCellRpc(int methodIdx, ReadOnlySpan<byte> payload)
+    protected Atlas.Protocol.RpcSendResult SendCellRpc(int methodIdx, ReadOnlySpan<byte> payload)
     {
         int rpcId = (_slotIdx << 24) | (0x02 << 22) | (_entity.TypeId << 8) | methodIdx;
-        _entity.SendCellRpc(rpcId, payload);
+        return _entity.SendCellRpc(rpcId, payload);
     }
 
-    protected void SendBaseRpc(int methodIdx, ReadOnlySpan<byte> payload)
+    protected Atlas.Protocol.RpcSendResult SendBaseRpc(int methodIdx, ReadOnlySpan<byte> payload)
     {
         int rpcId = (_slotIdx << 24) | (0x03 << 22) | (_entity.TypeId << 8) | methodIdx;
-        _entity.SendBaseRpc(rpcId, payload);
+        return _entity.SendBaseRpc(rpcId, payload);
     }
 
     // public for cross-assembly codegen; double-underscore marks runtime-only — scripts never call it.

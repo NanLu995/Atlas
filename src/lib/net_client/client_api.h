@@ -17,6 +17,7 @@ extern "C" {
 
 #define ATLAS_NET_OK 0
 #define ATLAS_NET_ERR_BUSY -16
+#define ATLAS_NET_ERR_IO -5
 #define ATLAS_NET_ERR_NOMEM -12
 #define ATLAS_NET_ERR_INVAL -22
 #define ATLAS_NET_ERR_NOCONN -107
@@ -36,10 +37,10 @@ ATLAS_NET_API const char* AtlasNetGlobalLastError(void);
 // Returns NULL on ABI mismatch / OOM. Pre-installs noop callback table.
 ATLAS_NET_API AtlasNetContext* AtlasNetCreate(uint32_t expected_abi);
 
-// Tears down channels, zeroes SessionKey. NULL is a noop.
+// NULL is a noop. During callbacks, suppresses further callbacks and defers release until return.
 ATLAS_NET_API void AtlasNetDestroy(AtlasNetContext* ctx);
 
-// Single tick of the underlying dispatcher; callbacks fire synchronously here.
+// Callbacks fire synchronously. Reentrant Poll returns BUSY.
 ATLAS_NET_API int32_t AtlasNetPoll(AtlasNetContext* ctx);
 
 typedef enum AtlasNetState {
@@ -93,7 +94,7 @@ typedef enum AtlasDisconnectReason {
   ATLAS_DISCONNECT_INTERNAL = 2,
 } AtlasDisconnectReason;
 
-// LOGOUT fires on_disconnect with callback reason=3; USER is silent.
+// LOGOUT reports callback reason=3; transport loss reports 2 from Poll. USER is silent.
 ATLAS_NET_API int32_t AtlasNetDisconnect(AtlasNetContext* ctx, AtlasDisconnectReason reason);
 
 // Test hook: applies bidirectional RUDP latency/loss to current and future

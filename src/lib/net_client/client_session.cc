@@ -25,6 +25,7 @@ void SecureZero(void* p, std::size_t n) {
 }
 
 constexpr int32_t kRpcReason_LoggedOff = 3;
+constexpr int32_t kRpcReason_ConnectionLost = 2;
 
 auto MapLoginStatus(::atlas::login::LoginStatus status) -> AtlasLoginStatus {
   using ::atlas::login::LoginStatus;
@@ -58,7 +59,15 @@ auto FormatHostOnly(const Address& addr) -> std::string {
 
 }  // namespace
 
-ClientSession::ClientSession() = default;
+ClientSession::ClientSession() {
+  network_.SetDisconnectCallback([this](Channel& channel) {
+    if (&channel != loginapp_channel_ && &channel != baseapp_channel_) return;
+    if (&channel == loginapp_channel_) loginapp_channel_ = nullptr;
+    if (&channel == baseapp_channel_) baseapp_channel_ = nullptr;
+    connection_lost_ = true;
+    if (!pending_disconnect_) pending_disconnect_ = ATLAS_DISCONNECT_INTERNAL;
+  });
+}
 
 ClientSession::~ClientSession() {
   if (state_ != ATLAS_NET_STATE_DISCONNECTED) {
@@ -68,14 +77,37 @@ ClientSession::~ClientSession() {
 }
 
 auto ClientSession::Poll() -> int32_t {
+  if (polling_) return ATLAS_NET_ERR_BUSY;
+  polling_ = true;
   dispatcher_.ProcessOnce();
+  polling_ = false;
+  if (auto reason = std::exchange(pending_disconnect_, std::nullopt)) {
+    const bool lost = std::exchange(connection_lost_, false);
+    (void)Disconnect(lost ? ATLAS_DISCONNECT_INTERNAL : *reason);
+    if (lost) {
+      last_error_ = "Server channel disconnected";
+      FireLoginCallback(ATLAS_LOGIN_INTERNAL_ERROR, {}, 0, last_error_);
+      FireAuthCallback(false, kInvalidEntityID, 0, last_error_);
+      callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_ConnectionLost);
+    }
+  }
   return 0;
+}
+
+void ClientSession::PrepareForDestroy() {
+  (void)SetCallbacks(AtlasNetCallbacks{});
+  login_callback_ = nullptr;
+  login_user_data_ = nullptr;
+  auth_callback_ = nullptr;
+  auth_user_data_ = nullptr;
+  CancelLoginTimeout();
+  CancelAuthTimeout();
 }
 
 auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp_port,
                                std::string_view username, std::string_view password_hash,
                                AtlasLoginResultFn callback, void* user_data) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_DISCONNECTED) {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_DISCONNECTED) {
     last_error_ = "AtlasNetLogin requires Disconnected state";
     return ATLAS_NET_ERR_BUSY;
   }
@@ -169,7 +201,7 @@ void ClientSession::CancelLoginTimeout() {
 }
 
 auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_data) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_LOGIN_SUCCEEDED) {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_LOGIN_SUCCEEDED) {
     last_error_ = "AtlasNetAuthenticate requires LoginSucceeded state";
     return ATLAS_NET_ERR_BUSY;
   }
@@ -269,7 +301,8 @@ void ClientSession::InstallDefaultHandler() {
   // Typed handlers for fixed-length BaseApp-to-client msgs; the default handler's
   // packed-int fallback would misparse the first body byte as a length prefix.
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::EntityTransferred>(
-      [this](const Address&, Channel*, const ::atlas::baseapp::EntityTransferred& msg) {
+      [this](const Address&, Channel* channel, const ::atlas::baseapp::EntityTransferred& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
         uint8_t body[sizeof(uint32_t) + sizeof(uint16_t)];
         std::memcpy(body, &msg.new_entity_id, sizeof(uint32_t));
         std::memcpy(body + sizeof(uint32_t), &msg.new_type_id, sizeof(uint16_t));
@@ -279,7 +312,8 @@ void ClientSession::InstallDefaultHandler() {
             static_cast<int32_t>(sizeof(body)));
       });
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::CellReady>(
-      [this](const Address&, Channel*, const ::atlas::baseapp::CellReady& msg) {
+      [this](const Address&, Channel* channel, const ::atlas::baseapp::CellReady& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
         uint8_t body[sizeof(uint32_t)];
         std::memcpy(body, &msg.entity_id, sizeof(uint32_t));
         callbacks_.on_deliver(reinterpret_cast<AtlasNetContext*>(this),
@@ -287,7 +321,9 @@ void ClientSession::InstallDefaultHandler() {
                               static_cast<int32_t>(sizeof(body)));
       });
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::MovementStateAckToClient>(
-      [this](const Address&, Channel*, const ::atlas::baseapp::MovementStateAckToClient& msg) {
+      [this](const Address&, Channel* channel,
+             const ::atlas::baseapp::MovementStateAckToClient& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
         BinaryWriter writer(static_cast<std::size_t>(
             ::atlas::baseapp::MovementStateAckToClient::Descriptor().fixed_length));
         msg.Serialize(writer);
@@ -299,8 +335,9 @@ void ClientSession::InstallDefaultHandler() {
       });
   (void)network_.InterfaceTable()
       .RegisterTypedHandler<::atlas::baseapp::MovementCommandStartToClient>(
-          [this](const Address&, Channel*,
+          [this](const Address&, Channel* channel,
                  const ::atlas::baseapp::MovementCommandStartToClient& msg) {
+            if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
             BinaryWriter writer(static_cast<std::size_t>(
                 ::atlas::baseapp::MovementCommandStartToClient::Descriptor().fixed_length));
             msg.Serialize(writer);
@@ -312,8 +349,9 @@ void ClientSession::InstallDefaultHandler() {
           });
   (void)network_.InterfaceTable()
       .RegisterTypedHandler<::atlas::baseapp::MovementCommandEndToClient>(
-          [this](const Address&, Channel*,
+          [this](const Address&, Channel* channel,
                  const ::atlas::baseapp::MovementCommandEndToClient& msg) {
+            if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
             BinaryWriter writer(static_cast<std::size_t>(
                 ::atlas::baseapp::MovementCommandEndToClient::Descriptor().fixed_length));
             msg.Serialize(writer);
@@ -325,7 +363,8 @@ void ClientSession::InstallDefaultHandler() {
           });
 
   network_.InterfaceTable().SetDefaultHandler(
-      [this](const Address&, Channel*, MessageID id, BinaryReader& reader) {
+      [this](const Address&, Channel* channel, MessageID id, BinaryReader& reader) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
         const uint8_t* payload = nullptr;
         int32_t len = 0;
         const auto remaining = reader.Remaining();
@@ -342,6 +381,10 @@ void ClientSession::InstallDefaultHandler() {
 }
 
 auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
+  if (polling_) {
+    if (!pending_disconnect_) pending_disconnect_ = reason;
+    return ATLAS_NET_OK;
+  }
   const bool was_connected = state_ != ATLAS_NET_STATE_DISCONNECTED;
 
   CancelLoginTimeout();
@@ -384,7 +427,8 @@ auto ClientSession::SetTransportImpairment(uint32_t one_way_latency_ms, uint32_t
 
 auto ClientSession::SendBaseRpc(uint32_t /*entity_id*/, uint32_t rpc_id, const uint8_t* payload,
                                 int32_t len) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
+  if (len < 0 || (len > 0 && !payload)) return ATLAS_NET_ERR_INVAL;
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
     last_error_ = "AtlasNetSendBaseRpc requires Connected state";
     return ATLAS_NET_ERR_NOCONN;
   }
@@ -394,13 +438,22 @@ auto ClientSession::SendBaseRpc(uint32_t /*entity_id*/, uint32_t rpc_id, const u
     msg.payload.assign(reinterpret_cast<const std::byte*>(payload),
                        reinterpret_cast<const std::byte*>(payload) + len);
   }
-  (void)baseapp_channel_->SendMessage(msg);
+  auto sent = baseapp_channel_->SendMessage(msg);
+  if (!sent) {
+    last_error_ = std::string(sent.Error().Message());
+    if (sent.Error().Code() == ErrorCode::kWouldBlock ||
+        sent.Error().Code() == ErrorCode::kRateLimited)
+      return ATLAS_NET_ERR_BUSY;
+    if (sent.Error().Code() == ErrorCode::kChannelCondemned) return ATLAS_NET_ERR_NOCONN;
+    return ATLAS_NET_ERR_IO;
+  }
   return ATLAS_NET_OK;
 }
 
 auto ClientSession::SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const uint8_t* payload,
                                 int32_t len) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
+  if (len < 0 || (len > 0 && !payload)) return ATLAS_NET_ERR_INVAL;
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
     last_error_ = "AtlasNetSendCellRpc requires Connected state";
     return ATLAS_NET_ERR_NOCONN;
   }
@@ -411,14 +464,22 @@ auto ClientSession::SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const uint8
     msg.payload.assign(reinterpret_cast<const std::byte*>(payload),
                        reinterpret_cast<const std::byte*>(payload) + len);
   }
-  (void)baseapp_channel_->SendMessage(msg);
+  auto sent = baseapp_channel_->SendMessage(msg);
+  if (!sent) {
+    last_error_ = std::string(sent.Error().Message());
+    if (sent.Error().Code() == ErrorCode::kWouldBlock ||
+        sent.Error().Code() == ErrorCode::kRateLimited)
+      return ATLAS_NET_ERR_BUSY;
+    if (sent.Error().Code() == ErrorCode::kChannelCondemned) return ATLAS_NET_ERR_NOCONN;
+    return ATLAS_NET_ERR_IO;
+  }
   return ATLAS_NET_OK;
 }
 
 auto ClientSession::SendMovementInput(uint32_t target_entity_id,
                                       const AtlasMovementInputFrame* frames,
                                       int32_t frame_count) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
     last_error_ = "AtlasNetSendMovementInput requires Connected state";
     return ATLAS_NET_ERR_NOCONN;
   }
@@ -459,7 +520,7 @@ auto ClientSession::SendMovementCorrectionReport(uint32_t target_entity_id,
                                                  uint32_t server_tick,
                                                  float distance_m,
                                                  uint16_t correction_flags) -> int32_t {
-  if (state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_) {
     last_error_ = "AtlasNetSendMovementCorrectionReport requires Connected state";
     return ATLAS_NET_ERR_NOCONN;
   }

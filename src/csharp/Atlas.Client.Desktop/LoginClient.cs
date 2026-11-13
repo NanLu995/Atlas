@@ -5,6 +5,7 @@ using Atlas.Client;
 using Atlas.Client.Native;
 using Atlas.Core;
 using Atlas.Coro;
+using Atlas.Protocol;
 
 namespace Atlas.Client.Desktop;
 
@@ -18,12 +19,16 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
     private AuthSource? _authInflight;
     private bool _disposed;
 
-    public LoginClient()
+    public LoginClient() : this(ClientCallbacks.DefaultSession) { }
+
+    public LoginClient(ClientSession session)
     {
+        Session = session ?? throw new ArgumentNullException(nameof(session));
         _ctx = AtlasNetNative.Create();
         _selfHandle = GCHandle.Alloc(this, GCHandleType.Normal);
-        // Route net_client's on_deliver through the shared default session.
         AtlasNetCallbackBridge.Register(_ctx, this);
+        Session.SendBaseRpcHandler = SendBaseRpc;
+        Session.SendCellRpcHandler = SendCellRpc;
         var digest = ClientHost.EntityDefDigest;
         if (digest is not null)
         {
@@ -32,14 +37,41 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
         }
     }
 
+    public ClientSession Session { get; }
+
+    public RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+        ulong traceId = 0)
+    {
+        if (_disposed) return RpcSendResult.Stopping;
+        fixed (byte* ptr = payload)
+            return SendResult(AtlasNetNative.AtlasNetSendBaseRpc(_ctx, entityId, rpcId,
+                ptr, payload.Length));
+    }
+
+    public RpcSendResult SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+        ulong traceId = 0)
+    {
+        if (_disposed) return RpcSendResult.Stopping;
+        fixed (byte* ptr = payload)
+            return SendResult(AtlasNetNative.AtlasNetSendCellRpc(_ctx, entityId, rpcId,
+                ptr, payload.Length));
+    }
+
+    private static RpcSendResult SendResult(int result) => result switch
+    {
+        AtlasNetReturnCode.Ok => RpcSendResult.Queued,
+        AtlasNetReturnCode.ErrBusy => RpcSendResult.Overloaded,
+        AtlasNetReturnCode.ErrNoconn => RpcSendResult.InvalidTarget,
+        _ => RpcSendResult.SendFailed,
+    };
+
     void IAtlasNetEvents.OnDisconnect(int reason)
     {
-        // Inflight sources are already cleared on Dispose(); a late disconnect
-        // here just means the server closed the channel. No-op for now.
+        Session.CancelPendingRpcs();
     }
 
     void IAtlasNetEvents.OnDeliver(ushort msgId, ReadOnlySpan<byte> payload)
-        => ClientCallbacks.DefaultSession.DeliverFromServer(msgId, payload);
+        => Session.DeliverFromServer(msgId, payload);
 
     public int Poll()
     {
@@ -129,6 +161,7 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
     public void Disconnect(AtlasDisconnectReason reason = AtlasDisconnectReason.User)
     {
         if (_disposed) return;
+        Session.CancelPendingRpcs();
         AtlasNetNative.AtlasNetDisconnect(_ctx, reason);
     }
 
@@ -143,6 +176,9 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
     {
         if (_disposed) return;
         _disposed = true;
+        Session.CancelPendingRpcs();
+        if (Session.SendBaseRpcHandler == SendBaseRpc) Session.SendBaseRpcHandler = null;
+        if (Session.SendCellRpcHandler == SendCellRpc) Session.SendCellRpcHandler = null;
         // Native first: it cannot fire any more callbacks once destroyed.
         AtlasNetNative.AtlasNetDestroy(_ctx);
         AtlasNetCallbackBridge.Unregister(_ctx);

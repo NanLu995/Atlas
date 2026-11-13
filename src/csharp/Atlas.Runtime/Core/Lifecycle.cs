@@ -46,7 +46,7 @@ internal static class Lifecycle
             Log.Error($"AtlasTask continuation threw: {ex.Message}");
         EngineContext.CoroLoop = coroLoop;
         AtlasLoop.Install(coroLoop);
-        AtlasRpcRegistryHost.Install(NativeRpcRegistry.Instance);
+        AtlasRpcRegistryHost.Install(NativeRpcRegistry.Instance, NativeApi.CoroNextRequestId);
         AtlasShutdownToken.Reset();
 
         // Install the Tracy backend before any script user code runs, so

@@ -1,14 +1,34 @@
 using System;
 using System.Collections.Generic;
 using Atlas.Client.Native;
+using Atlas.Coro;
+using Atlas.Coro.Rpc;
 using Atlas.DataTypes;
 using Atlas.Diagnostics;
+using Atlas.Protocol;
 using Atlas.Serialization;
 
 namespace Atlas.Client;
 
 public sealed class ClientSession
 {
+    private ManagedRpcRegistry? _rpcRegistry;
+    private bool _closingRpcs;
+    public IAtlasRpcRegistry RpcRegistry => _rpcRegistry ??= new ManagedRpcRegistry(AtlasLoop.Current);
+
+    public void CancelPendingRpcs()
+    {
+        if (_closingRpcs) return;
+        var registry = _rpcRegistry;
+        _closingRpcs = true;
+        try { registry?.Close(RpcCompletionStatus.ReceiverGone); }
+        finally
+        {
+            _rpcRegistry = null;
+            _closingRpcs = false;
+        }
+    }
+
     private const byte kEntityEnter = 1;
     private const byte kEntityLeave = 2;
     private const byte kEntityPositionUpdate = 3;
@@ -56,12 +76,14 @@ public sealed class ClientSession
     public ClientHost.ReportEventSeqGapFn? ReportEventSeqGapHandler { get; set; }
 
     public event Action<uint, IReadOnlyList<ClientCallbacks.BspLeafRect>>? SpaceBspGeometryReceived;
+    public event Action<uint>? CellReadyReceived;
     public event Action<MovementStateAck>? MovementStateAckReceived;
     public event Action<MovementCommandStart>? MovementCommandStarted;
     public event Action<MovementCommandEnd>? MovementCommandEnded;
 
     public void Reset()
     {
+        CancelPendingRpcs();
         EntityManager.Clear();
         SpaceDataManager.Clear();
     }
@@ -90,17 +112,17 @@ public sealed class ClientSession
         }
     }
 
-    internal void SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    internal RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                               ulong traceId)
     {
-        Required(SendBaseRpcHandler, nameof(SendBaseRpcHandler))(
+        return Required(SendBaseRpcHandler, nameof(SendBaseRpcHandler))(
             entityId, rpcId, payload, traceId);
     }
 
-    internal void SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    internal RpcSendResult SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                               ulong traceId)
     {
-        Required(SendCellRpcHandler, nameof(SendCellRpcHandler))(
+        return Required(SendCellRpcHandler, nameof(SendCellRpcHandler))(
             entityId, rpcId, payload, traceId);
     }
 
@@ -169,6 +191,13 @@ public sealed class ClientSession
         {
             switch (msgId)
             {
+                case MessageIds.EntityRpcReply:
+                    if (_rpcRegistry is not null && body.Length >= sizeof(ulong))
+                    {
+                        var reader = new SpanReader(body);
+                        _rpcRegistry.TryDispatch(msgId, reader.ReadUInt64(), body);
+                    }
+                    break;
                 case ClientCallbacks.kClientDeltaMessageId:
                 case ClientCallbacks.kClientReliableDeltaMessageId:
                     DispatchAoIEnvelope(body);
@@ -180,6 +209,15 @@ public sealed class ClientSession
                     DispatchEntityTransferred(body);
                     break;
                 case ClientCallbacks.kCellReadyMessageId:
+                    if (body.Length == sizeof(uint))
+                    {
+                        var ready = new SpanReader(body);
+                        CellReadyReceived?.Invoke(ready.ReadUInt32());
+                    }
+                    else
+                    {
+                        Log.Error($"CellReady: invalid payload size {body.Length}");
+                    }
                     break;
                 case ClientCallbacks.kClientRpcMessageId:
                     DispatchClientRpc(body);

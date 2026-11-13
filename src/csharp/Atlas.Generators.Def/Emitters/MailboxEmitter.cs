@@ -69,11 +69,11 @@ internal static class MailboxEmitter
             sb.AppendLine($"    public {className}CellMailbox Cell => new(this);");
         sb.AppendLine();
         if (emitClientMailbox && def.ClientMethods.Count > 0)
-            sb.AppendLine("    internal void InternalSendClientRpc(int rpcId, RpcTarget target, ReadOnlySpan<byte> payload) => SendClientRpc(rpcId, target, payload);");
+            sb.AppendLine("    internal RpcSendResult InternalSendClientRpc(int rpcId, RpcTarget target, ReadOnlySpan<byte> payload) => SendClientRpc(rpcId, target, payload);");
         if (emitBaseMailbox || emitCellMailbox)
         {
-            sb.AppendLine("    internal void InternalSendBaseRpc(int rpcId, ReadOnlySpan<byte> payload) => SendBaseRpc(rpcId, payload);");
-            sb.AppendLine("    internal void InternalSendCellRpc(int rpcId, ReadOnlySpan<byte> payload) => SendCellRpc(rpcId, payload);");
+            sb.AppendLine("    internal RpcSendResult InternalSendBaseRpc(int rpcId, ReadOnlySpan<byte> payload) => SendBaseRpc(rpcId, payload);");
+            sb.AppendLine("    internal RpcSendResult InternalSendCellRpc(int rpcId, ReadOnlySpan<byte> payload) => SendCellRpc(rpcId, payload);");
         }
         sb.AppendLine("}");
 
@@ -132,11 +132,11 @@ internal static class MailboxEmitter
     {
         var paramList = RpcArgCodec.BuildParamList(method.Args);
         var sendArgs = isClientMailbox ? "_target, " : "";
-        sb.AppendLine($"    public void {method.Name}({paramList})");
+        sb.AppendLine($"    public RpcSendResult {method.Name}({paramList})");
         sb.AppendLine("    {");
         if (method.Args.Count == 0)
         {
-            sb.AppendLine($"        _entity.Internal{sendMethod}(0x{rpcId:X6}, {sendArgs}ReadOnlySpan<byte>.Empty);");
+            sb.AppendLine($"        return _entity.Internal{sendMethod}(0x{rpcId:X6}, {sendArgs}ReadOnlySpan<byte>.Empty);");
         }
         else
         {
@@ -145,7 +145,7 @@ internal static class MailboxEmitter
             sb.AppendLine("        {");
             foreach (var arg in method.Args)
                 RpcArgCodec.EmitWrite(sb, arg, "writer", "            ");
-            sb.AppendLine($"            _entity.Internal{sendMethod}(0x{rpcId:X6}, {sendArgs}writer.WrittenSpan);");
+            sb.AppendLine($"            return _entity.Internal{sendMethod}(0x{rpcId:X6}, {sendArgs}writer.WrittenSpan);");
             sb.AppendLine("        }");
             sb.AppendLine("        finally { writer.Dispose(); }");
         }
@@ -169,15 +169,17 @@ internal static class MailboxEmitter
         sb.AppendLine("    {");
         sb.AppendLine("        var requestId = AtlasRpc.NextRequestId();");
         sb.AppendLine($"        var src = AtlasRpcSource<RpcReply<{replyType}>>.Rent();");
-        sb.AppendLine($"        src.Start(AtlasRpcRegistryHost.Current, MessageIds.EntityRpcReply, requestId,");
-        sb.AppendLine($"            s_{method.Name}Deserializer, RpcReplyHelpers.For<{replyType}>(), timeoutMs, ct);");
+        sb.AppendLine($"        src.Start(_entity.RpcRegistry, MessageIds.EntityRpcReply, requestId,");
+        sb.AppendLine($"            s_{method.Name}Deserializer, RpcReplyHelpers.For<{replyType}>(), timeoutMs, ct, _entity.LifecycleCancellation);");
+        sb.AppendLine("        if (src.Task.Status != AtlasTaskStatus.Pending) return src.Task;");
         sb.AppendLine("        var writer = new SpanWriter(256);");
         sb.AppendLine("        try");
         sb.AppendLine("        {");
-        sb.AppendLine("            writer.WriteUInt32(requestId);");
+        sb.AppendLine("            writer.WriteUInt64(requestId);");
         foreach (var arg in method.Args)
             RpcArgCodec.EmitWrite(sb, arg, "writer", "            ");
-        sb.AppendLine($"            _entity.Internal{sendMethod}(unchecked((int)0x{rpcIdWithReplyBit:X8}), {sendArgs}writer.WrittenSpan);");
+        sb.AppendLine($"            var sent = _entity.Internal{sendMethod}(unchecked((int)0x{rpcIdWithReplyBit:X8}), {sendArgs}writer.WrittenSpan);");
+        sb.AppendLine("            if (sent != RpcSendResult.Queued) src.FailSend();");
         sb.AppendLine("        }");
         sb.AppendLine("        finally { writer.Dispose(); }");
         sb.AppendLine("        return src.Task;");

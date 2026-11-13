@@ -33,16 +33,20 @@ struct MockProvider final : public INativeApiProvider {
   float DeltaTime() override { return 0.016f; }
   uint8_t GetProcessPrefix() override { return process_prefix; }
 
-  void SendClientRpc(uint32_t, uint32_t, RpcTarget, const std::byte*, int32_t, uint64_t) override {
+  RpcSendResult SendClientRpc(uint32_t, uint32_t, RpcTarget, const std::byte*, int32_t,
+                              uint64_t) override {
     ++send_client_rpc_count;
+    return RpcSendResult::kQueued;
   }
 
-  void SendCellRpc(uint32_t, uint32_t, const std::byte*, int32_t, uint64_t) override {
+  RpcSendResult SendCellRpc(uint32_t, uint32_t, const std::byte*, int32_t, uint64_t) override {
     ++send_cell_rpc_count;
+    return RpcSendResult::kQueued;
   }
 
-  void SendBaseRpc(uint32_t, uint32_t, const std::byte*, int32_t, uint64_t) override {
+  RpcSendResult SendBaseRpc(uint32_t, uint32_t, const std::byte*, int32_t, uint64_t) override {
     ++send_base_rpc_count;
+    return RpcSendResult::kQueued;
   }
 
   void RegisterEntityType(const std::byte*, int32_t) override { ++register_type_count; }

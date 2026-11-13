@@ -32,6 +32,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--build-dir", default="debug",
                         help="Subdirectory of bin/ where binaries live (default: debug).")
+    parser.add_argument("--base-assembly", type=Path,
+                        help="BaseApp script assembly (default: bin/<build-dir>/Atlas.Runtime.dll).")
+    parser.add_argument("--cell-assembly", type=Path,
+                        help="Also start CellAppMgr and one CellApp with this script assembly.")
     parser.add_argument("--port-base", type=int, default=0,
                         help="Lowest port to use; 0 = auto-pick a free range.")
     # Allow database initialization and cold .NET JIT startup.
@@ -107,6 +111,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     bin_name = args.build_dir
     runtime_config = repo_root / "runtime" / "atlas_server.runtimeconfig.json"
     runtime_assembly = repo_root / "bin" / bin_name / "Atlas.Runtime.dll"
+    base_assembly = args.base_assembly or runtime_assembly
 
     machined = resolve_program(repo_root, bin_name, [], "machined")
     loginapp = resolve_program(repo_root, bin_name, [], "atlas_loginapp")
@@ -115,8 +120,13 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     dbapp = resolve_program(repo_root, bin_name, [], "atlas_dbapp")
     atlas_tool = resolve_program(repo_root, bin_name, [], "atlas_tool")
 
-    for prog in (machined, loginapp, baseapp, baseappmgr, dbapp, atlas_tool,
-                 runtime_config, runtime_assembly):
+    required = [machined, loginapp, baseapp, baseappmgr, dbapp, atlas_tool,
+                runtime_config, runtime_assembly, base_assembly]
+    if args.cell_assembly:
+        cellappmgr = resolve_program(repo_root, bin_name, [], "atlas_cellappmgr")
+        cellapp = resolve_program(repo_root, bin_name, [], "atlas_cellapp")
+        required.extend([cellappmgr, cellapp, args.cell_assembly])
+    for prog in required:
         if not prog.exists():
             print(f"missing: {prog}", file=sys.stderr, flush=True)
             return 1
@@ -131,7 +141,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     db_dir.mkdir(parents=True, exist_ok=True)
 
     database = database_config(args, db_dir / 'test_cluster.sqlite3')
-    record_database_run(run_root, database)
+    record_database_run(run_root, database, cellapps=1 if args.cell_assembly else 0)
 
     machined_address = f"127.0.0.1:{machined_port}"
     db_config_path.write_text(
@@ -175,6 +185,26 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        "--update-hertz", "50", "--log-level", "info"]))
         processes[-1].start_order = 3
 
+        if args.cell_assembly:
+            processes.append(start_logged_process(
+                name="cellappmgr", file_path=cellappmgr,
+                working_directory=repo_root, log_directory=log_dir,
+                arguments=["--type", "cellappmgr", "--name", "cellappmgr",
+                           "--machined", machined_address,
+                           "--internal-port", str(port_base + 8),
+                           "--update-hertz", "50", "--log-level", "info"]))
+            processes[-1].start_order = 3
+            processes.append(start_logged_process(
+                name="cellapp", file_path=cellapp,
+                working_directory=repo_root, log_directory=log_dir,
+                arguments=["--type", "cellapp", "--name", "cellapp",
+                           "--machined", machined_address,
+                           "--internal-port", str(port_base + 9),
+                           "--assembly", str(args.cell_assembly),
+                           "--runtime-config", str(runtime_config),
+                           "--update-hertz", "50", "--log-level", "info"]))
+            processes[-1].start_order = 3
+
         processes.append(start_logged_process(
             name="baseapp", file_path=baseapp,
             working_directory=repo_root, log_directory=log_dir,
@@ -182,7 +212,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        "--machined", machined_address,
                        "--internal-port", str(baseapp_internal_port),
                        "--external-port", str(baseapp_external_port),
-                       "--assembly", str(runtime_assembly),
+                       "--assembly", str(base_assembly),
                        "--runtime-config", str(runtime_config),
                        "--update-hertz", "50", "--log-level", "info"]))
         processes[-1].start_order = 4
@@ -222,6 +252,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             ("baseapp", "baseapp"),
             ("loginapp", "loginapp"),
         ]
+        if args.cell_assembly:
+            ready_targets.extend([("cellappmgr", "cellappmgr"), ("cellapp", "cellapp")])
         for proc_type, name in ready_targets:
             if not wait_for_registration(
                 atlas_tool=atlas_tool, machined_address=machined_address,
@@ -234,7 +266,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         # Single-line READY marker; consumers parse `key=value` pairs.
         print(
             f"READY loginapp_port={loginapp_port} baseapp_external_port={baseapp_external_port} "
-            f"machined_port={machined_port} log_dir={log_dir} db_backend={args.db_backend} dbapps=1",
+            f"machined_port={machined_port} log_dir={log_dir} db_backend={args.db_backend} "
+            f"dbapps=1 cellapps={1 if args.cell_assembly else 0}",
             flush=True,
         )
 

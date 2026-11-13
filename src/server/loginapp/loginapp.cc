@@ -86,9 +86,10 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
         OnShardTableUpdate(msg);
       });
 
-  table.SetPreDispatchHook([this](MessageID id, std::span<const std::byte> payload) -> bool {
-    return rpc_registry_.TryDispatch(id, payload);
-  });
+  table.SetPreDispatchHook(
+      [this](Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool {
+        return rpc_registry_.TryDispatch(id, payload, channel);
+      });
 
   Network().SetDisconnectCallback([this](Channel& ch) {
     rpc_registry_.CancelByChannel(&ch);

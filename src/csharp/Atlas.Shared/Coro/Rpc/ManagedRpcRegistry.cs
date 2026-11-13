@@ -7,9 +7,10 @@ namespace Atlas.Coro.Rpc;
 // Single-threaded — all calls expected on the IAtlasLoop main thread.
 public sealed class ManagedRpcRegistry : IAtlasRpcRegistry, IDisposable
 {
+    public const int MaxPendingRpcs = 4096;
     private readonly IAtlasLoop _loop;
     private readonly Dictionary<long, Pending> _byHandle = new();
-    private readonly Dictionary<long, long> _byKey = new();   // packed (replyId, requestId) -> handle
+    private readonly Dictionary<(int, ulong), long> _byKey = new();
     private long _nextHandle;
     private bool _disposed;
 
@@ -27,19 +28,14 @@ public sealed class ManagedRpcRegistry : IAtlasRpcRegistry, IDisposable
 
     public int PendingCount => _byHandle.Count;
 
-    public long RegisterPending(int replyId, uint requestId, int timeoutMs,
+    public long RegisterPending(int replyId, ulong requestId, int timeoutMs,
         IAtlasRpcCallback callback)
     {
         if (callback is null) throw new ArgumentNullException(nameof(callback));
-        if (_disposed) throw new ObjectDisposedException(nameof(ManagedRpcRegistry));
-
-        var key = PackKey(replyId, requestId);
-
-        // Overwrite-on-duplicate matches C++ PendingRpcRegistry semantics.
-        if (_byKey.TryGetValue(key, out var oldHandle))
-        {
-            CancelInternal(oldHandle, RpcCompletionStatus.Cancelled);
-        }
+        var key = (replyId, requestId);
+        if (_disposed || replyId <= 0 || requestId == 0 || _nextHandle == long.MaxValue ||
+            _byHandle.Count >= MaxPendingRpcs ||
+            _byKey.ContainsKey(key)) return 0;
 
         var handle = ++_nextHandle;
         long timerHandle = 0;
@@ -63,9 +59,9 @@ public sealed class ManagedRpcRegistry : IAtlasRpcRegistry, IDisposable
     }
 
     // Returns true if a pending entry claimed the reply.
-    public bool TryDispatch(int replyId, uint requestId, ReadOnlySpan<byte> payload)
+    public bool TryDispatch(int replyId, ulong requestId, ReadOnlySpan<byte> payload)
     {
-        var key = PackKey(replyId, requestId);
+        var key = (replyId, requestId);
         if (!_byKey.TryGetValue(key, out var handle)) return false;
         if (!_byHandle.TryGetValue(handle, out var pending)) return false;
 
@@ -77,14 +73,16 @@ public sealed class ManagedRpcRegistry : IAtlasRpcRegistry, IDisposable
         return true;
     }
 
-    public void Dispose()
+    public void Dispose() => Close(RpcCompletionStatus.Cancelled);
+
+    public void Close(RpcCompletionStatus status)
     {
         if (_disposed) return;
         _disposed = true;
 
         var snapshot = new List<long>(_byHandle.Keys);
         foreach (var h in snapshot)
-            CancelInternal(h, RpcCompletionStatus.Cancelled);
+            CancelInternal(h, status);
     }
 
     private void OnTimeout(long handle)
@@ -104,12 +102,9 @@ public sealed class ManagedRpcRegistry : IAtlasRpcRegistry, IDisposable
         pending.Callback.OnError(status);
     }
 
-    private static long PackKey(int replyId, uint requestId)
-        => ((long)(uint)replyId << 32) | requestId;
-
     private struct Pending
     {
-        public long Key;
+        public (int, ulong) Key;
         public IAtlasRpcCallback Callback;
         public long TimerHandle;
     }

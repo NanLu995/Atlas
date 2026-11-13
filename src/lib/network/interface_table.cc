@@ -23,7 +23,7 @@ auto InterfaceTable::Dispatch(const Address& source, Channel* channel, MessageID
                               BinaryReader& data) -> Result<void> {
   if (pre_dispatch_hook_) {
     auto payload = data.Data().subspan(data.Position());
-    if (pre_dispatch_hook_(id, payload)) {
+    if (pre_dispatch_hook_(channel, id, payload)) {
       data.Skip(payload.size());
       return {};
     }

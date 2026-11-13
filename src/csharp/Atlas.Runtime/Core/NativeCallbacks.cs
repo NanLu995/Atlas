@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using Atlas.Coro.Rpc;
 using Atlas.Diagnostics;
 using Atlas.Entity;
 using Atlas.Serialization;
@@ -429,9 +430,15 @@ internal static unsafe class NativeCallbacks
     public static void DispatchRpc(uint entityId, uint rpcId, IntPtr replyChannel,
                                    byte* payload, int len, ulong traceId)
     {
+        ulong requestId = 0;
         try
         {
             ThreadGuard.EnsureMainThread();
+            if (replyChannel != IntPtr.Zero && payload != null && len >= sizeof(ulong))
+            {
+                var header = new SpanReader(new ReadOnlySpan<byte>(payload, len));
+                requestId = header.ReadUInt64();
+            }
             using var __depth = new ThreadGuard.RpcScope(rpcId);
             using var __trace = Atlas.Diagnostics.TraceContext.BeginInbound((long)traceId);
 
@@ -439,11 +446,15 @@ internal static unsafe class NativeCallbacks
             if (entity is null)
             {
                 Log.Warning($"DispatchRpc: unknown entity {entityId}");
+                NativeApi.SendEntityRpcFailure(replyChannel, requestId, RpcErrorCodes.ReceiverGone,
+                    "RPC entity unavailable");
                 return;
             }
             if (entity.IsDestroyed)
             {
                 Log.Debug($"DispatchRpc: dropping rpc 0x{rpcId:X8} for destroyed entity {entityId}");
+                NativeApi.SendEntityRpcFailure(replyChannel, requestId, RpcErrorCodes.ReceiverGone,
+                    "RPC entity destroyed");
                 return;
             }
 
@@ -456,15 +467,22 @@ internal static unsafe class NativeCallbacks
             if (direction == 1)
             {
                 Log.Warning($"DispatchRpc: direction=1 is reserved (rpcId=0x{rpcId:X6})");
+                NativeApi.SendEntityRpcFailure(replyChannel, requestId, RpcErrorCodes.PayloadMalformed,
+                    "RPC direction reserved");
                 return;
             }
             int id = (int)rpcId;
 
             var dispatcher = RpcBridge.Dispatchers[direction];
-            dispatcher?.Invoke(entity, id, replyChannel, ref reader);
+            if (dispatcher is null)
+                NativeApi.SendEntityRpcFailure(replyChannel, requestId, RpcErrorCodes.ReceiverGone,
+                    "RPC dispatcher unavailable");
+            else
+                dispatcher.Invoke(entity, id, replyChannel, ref reader);
         }
         catch (Exception ex)
         {
+            Atlas.Runtime.Coro.EntityRpcReplyHelpers.SendException(replyChannel, requestId, ex);
             ErrorBridge.SetError(ex);
         }
     }

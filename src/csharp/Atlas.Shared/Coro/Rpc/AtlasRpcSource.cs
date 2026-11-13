@@ -3,7 +3,7 @@ using Atlas.Serialization;
 
 namespace Atlas.Coro.Rpc;
 
-// Reply wire: [request_id: u32][error_code: i32]([error_msg] | [body]).
+// Reply wire: [request_id: u64][error_code: i32]([error_msg] | [body]).
 // All failure paths go through errorMapper, so awaits never throw.
 public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
 {
@@ -16,6 +16,8 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
     private IAtlasRpcRegistry? _registry;
     private long _pendingHandle;
     private CancelRegistration _cancelReg;
+    private CancelRegistration _lifetimeReg;
+    private bool _sendFailed;
 
     private static readonly Action<object?> CancelTokenCallback =
         static state => ((AtlasRpcSource<T>)state!).OnCancellationRequested();
@@ -28,9 +30,10 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
 
     public AtlasTask<T> Task => new(this, _core.Version);
 
-    public void Start(IAtlasRpcRegistry registry, int replyId, uint requestId,
+    public void Start(IAtlasRpcRegistry registry, int replyId, ulong requestId,
         SpanDeserializer deserializer, ErrorMapper errorMapper,
-        int timeoutMs = AtlasRpc.DefaultTimeoutMs, AtlasCancellationToken ct = default)
+        int timeoutMs = AtlasRpc.DefaultTimeoutMs, AtlasCancellationToken ct = default,
+        AtlasCancellationToken lifetime = default)
     {
         if (registry is null) throw new ArgumentNullException(nameof(registry));
         if (deserializer is null) throw new ArgumentNullException(nameof(deserializer));
@@ -40,16 +43,23 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
         _deserializer = deserializer;
         _errorMapper = errorMapper;
 
-        if (ct.IsCancellationRequested)
+        if (ct.IsCancellationRequested || lifetime.IsCancellationRequested)
         {
             _core.TrySetResult(errorMapper(RpcErrorCodes.Cancelled, RpcFrameworkMessages.Cancelled));
             return;
         }
 
         _pendingHandle = registry.RegisterPending(replyId, requestId, timeoutMs, this);
+        if (_pendingHandle == 0)
+        {
+            OnError(RpcCompletionStatus.SendError);
+            return;
+        }
 
         if (ct.CanBeCanceled)
             _cancelReg = ct.Register(CancelTokenCallback, this);
+        if (lifetime.CanBeCanceled && !lifetime.Equals(ct))
+            _lifetimeReg = lifetime.Register(CancelTokenCallback, this);
     }
 
     private void OnCancellationRequested()
@@ -59,13 +69,20 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
         if (reg is not null && handle != 0) reg.CancelPending(handle);
     }
 
+    public void FailSend()
+    {
+        if (_core.GetStatus(_core.Version) != AtlasTaskStatus.Pending) return;
+        _sendFailed = true;
+        if (_pendingHandle != 0) _registry!.CancelPending(_pendingHandle);
+    }
+
     public void OnReply(ReadOnlySpan<byte> payload)
     {
         var reader = new SpanReader(payload);
         int errorCode;
         try
         {
-            _ = reader.ReadUInt32();
+            _ = reader.ReadUInt64();
             errorCode = reader.ReadInt32();
         }
         catch (Exception ex)
@@ -99,6 +116,7 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
 
     public void OnError(RpcCompletionStatus status)
     {
+        if (_sendFailed) status = RpcCompletionStatus.SendError;
         var (code, msg) = status switch
         {
             RpcCompletionStatus.Timeout      => (RpcErrorCodes.Timeout,      RpcFrameworkMessages.Timeout),
@@ -124,10 +142,13 @@ public sealed class AtlasRpcSource<T> : IAtlasTaskSource<T>, IAtlasRpcCallback
     {
         _cancelReg.Dispose();
         _cancelReg = default;
+        _lifetimeReg.Dispose();
+        _lifetimeReg = default;
         _registry = null;
         _deserializer = null;
         _errorMapper = null;
         _pendingHandle = 0;
+        _sendFailed = false;
         _core.Reset();
         TaskPool<AtlasRpcSource<T>>.Return(this);
     }

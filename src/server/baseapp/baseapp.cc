@@ -17,6 +17,7 @@
 #include "baseappmgr/baseappmgr_messages.h"
 #include "cellapp/cellapp_messages.h"
 #include "cellappmgr/cellappmgr_messages.h"
+#include "coro/entity_rpc_reply.h"
 #include "db/idatabase.h"
 #include "dbapp/dbapp_messages.h"
 #include "entitydef/entity_def_registry.h"
@@ -196,8 +197,8 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
 
   // RPC replies match here first; unmatched messages fall through to handlers.
   Network().InterfaceTable().SetPreDispatchHook(
-      [this](MessageID id, std::span<const std::byte> payload) -> bool {
-        return rpc_registry_.TryDispatch(id, payload);
+      [this](Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool {
+        return rpc_registry_.TryDispatch(id, payload, channel);
       });
 
   RegisterInternalHandlers();
@@ -416,7 +417,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
 }
 
 void BaseApp::Fini() {
-  rpc_registry_.CancelAll();
+  rpc_registry_.Shutdown();
   entity_mgr_.ForEach([this](const BaseEntity& ent) {
     if (ent.Dbid() != kInvalidDBID) ReleaseCheckout(ent.Dbid(), ent.TypeId(), ent.CheckoutOwner());
   });
@@ -1340,6 +1341,7 @@ void BaseApp::OnSpaceBspGeometry(const baseapp::SpaceBspGeometry& msg) {
 
 void BaseApp::OnCellRpcForward(Channel& ch, const baseapp::CellRpcForward& msg) {
   if (entity_mgr_.Find(msg.entity_id) == nullptr) {
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Base entity unavailable");
     ATLAS_LOG_WARNING("BaseApp: CellRpcForward for unknown entity {} (rpc_id=0x{:08X})",
                       msg.entity_id, msg.rpc_id);
     return;
@@ -1347,10 +1349,15 @@ void BaseApp::OnCellRpcForward(Channel& ch, const baseapp::CellRpcForward& msg) 
   auto dispatch_fn = GetNativeProvider().dispatch_rpc_fn();
   if (!dispatch_fn) {
     ATLAS_LOG_WARNING("BaseApp: OnCellRpcForward: dispatch_rpc callback not registered");
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4,
+                                    "Base dispatcher unavailable");
     return;
   }
   ++cell_rpc_forward_received_total_;
-  dispatch_fn(msg.entity_id, msg.rpc_id, reinterpret_cast<intptr_t>(&ch),
+  const auto reply =
+      GetNativeProvider().CreateEntityRpcReply(msg.entity_id, msg.rpc_id, msg.payload, &ch);
+  if ((msg.rpc_id & 0x80000000u) != 0 && reply == 0) return;
+  dispatch_fn(msg.entity_id, msg.rpc_id, reply,
               reinterpret_cast<const uint8_t*>(msg.payload.data()),
               static_cast<int32_t>(msg.payload.size()), msg.trace_id);
 }
@@ -1366,15 +1373,18 @@ void BaseApp::OnBroadcastRpcFromCell(Channel& /*ch*/, const baseapp::BroadcastRp
   }
 }
 
-void BaseApp::RelayRpcToClient(Channel& client_ch, EntityID target_entity_id, uint32_t rpc_id,
-                               const std::vector<std::byte>& payload, uint64_t trace_id) {
+RpcSendResult BaseApp::RelayRpcToClient(Channel& client_ch, EntityID target_entity_id,
+                                        uint32_t rpc_id, const std::vector<std::byte>& payload,
+                                        uint64_t trace_id) {
   auto args = payload.empty() ? std::span<const std::byte>{}
                               : std::span<const std::byte>(payload.data(), payload.size());
   baseapp::ClientRpcEnvelope env{target_entity_id, rpc_id, trace_id, args};
   if (auto r = client_ch.SendMessage(env); !r) {
     ATLAS_LOG_DEBUG("BaseApp: RelayRpcToClient send failed (rpc_id=0x{:08X}): {}", rpc_id,
                     r.Error().Message());
+    return RpcSendOutcome(r);
   }
+  return RpcSendResult::kQueued;
 }
 
 // Unreliable path runs through per-client DeltaForwarder.
@@ -4225,6 +4235,7 @@ auto BaseApp::RestoreManagedEntity(EntityID entity_id, uint16_t type_id, Databas
 }
 
 auto BaseApp::NotifyManagedEntityDestroyed(EntityID entity_id, std::string_view context) -> bool {
+  rpc_registry_.CancelRepliesForEntity(entity_id);
   auto* ent = entity_mgr_.Find(entity_id);
   if (!ent || !HasManagedEntityType(ent->TypeId())) {
     return true;
@@ -4490,8 +4501,10 @@ void BaseApp::OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg) {
     return;
   }
   ++client_base_rpc_received_total_;
-  dispatch_fn(entity_id, msg.rpc_id, reinterpret_cast<intptr_t>(&ch),
-              reinterpret_cast<const uint8_t*>(msg.payload.data()),
+  const auto reply =
+      GetNativeProvider().CreateEntityRpcReply(entity_id, msg.rpc_id, msg.payload, &ch);
+  if ((msg.rpc_id & 0x80000000u) != 0 && reply == 0) return;
+  dispatch_fn(entity_id, msg.rpc_id, reply, reinterpret_cast<const uint8_t*>(msg.payload.data()),
               static_cast<int32_t>(msg.payload.size()), msg.trace_id);
 }
 
@@ -4569,12 +4582,16 @@ void BaseApp::OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg) {
   // Stale Offload routing drops here or at the cell's Ghost guard.
   auto* target = entity_mgr_.Find(msg.target_entity_id);
   if (target == nullptr) {
-    // Entity destroyed mid-flight (logout race); silent drop.
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Cell target unavailable");
     return;
   }
   auto* ch_out =
       ResolveCellChannelByAddr(cellapp_peers_.Channels(), target->CellAddr());
   if (ch_out == nullptr) {
+    if ((msg.rpc_id & 0x80000000u) != 0) {
+      entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Cell route unavailable");
+      return;
+    }
     if (target->CellAddr().Port() == 0) {
       // Cellapp hasn't acked CurrentCell yet; buffer and replay there.
       auto& q = pending_client_rpcs_[msg.target_entity_id];
@@ -4608,14 +4625,70 @@ void BaseApp::OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg) {
     return;
   }
 
+  ForwardClientCellRpc(ch, *ch_out, source_entity_id, msg);
+}
+
+void BaseApp::ForwardClientCellRpc(Channel& client, Channel& cell, EntityID source_entity_id,
+                                   const baseapp::ClientCellRpc& msg) {
   cellapp::ClientCellRpcForward fwd;
   fwd.target_entity_id = msg.target_entity_id;
   fwd.source_entity_id = source_entity_id;
   fwd.rpc_id = msg.rpc_id;
   fwd.payload = msg.payload;
   fwd.trace_id = msg.trace_id;
+  uint64_t forwarded_id = 0;
+  if ((msg.rpc_id & 0x80000000u) != 0) {
+    BinaryReader reader(msg.payload);
+    auto original_id = reader.Read<uint64_t>();
+    if (!original_id || *original_id == 0) return;
+    forwarded_id = rpc_registry_.AllocateRequestId();
+    auto reply = forwarded_id == 0
+                     ? 0
+                     : rpc_registry_.RegisterReply(source_entity_id, *original_id, &client);
+    if (reply == 0) {
+      entity_rpc_reply::RejectRequest(&client, msg.rpc_id, msg.payload, -5,
+                                      "RPC relay registration rejected");
+      return;
+    }
+    const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+    auto pending = rpc_registry_.RegisterPending(
+        reply_id, forwarded_id,
+        [this, reply, original = *original_id](std::span<const std::byte> payload) {
+          BinaryReader response(payload);
+          auto id = response.Read<uint64_t>();
+          auto error = response.Read<int32_t>();
+          if (!id || !error) {
+            BinaryWriter body;
+            body.WriteString("Malformed Cell RPC reply");
+            rpc_registry_.SendReply(reply, original, -7, body.Data());
+            return;
+          }
+          rpc_registry_.SendReply(reply, original, *error, payload.subspan(response.Position()));
+        },
+        [this, reply, original = *original_id](Error error) {
+          BinaryWriter body;
+          body.WriteString(error.Message());
+          const int32_t code = error.Code() == ErrorCode::kTimeout
+                                   ? -1
+                                   : (error.Code() == ErrorCode::kReceiverGone ? -4 : -5);
+          rpc_registry_.SendReply(reply, original, code, body.Data());
+        },
+        std::chrono::seconds(10), &cell);
+    if (!pending.IsValid()) {
+      BinaryWriter body;
+      body.WriteString("RPC relay registration rejected");
+      rpc_registry_.SendReply(reply, *original_id, -5, body.Data());
+      return;
+    }
+    rpc_registry_.BindReplyWait(reply, pending);
+    const uint64_t wire_id = endian::ToLittle(forwarded_id);
+    std::memcpy(fwd.payload.data(), &wire_id, sizeof(wire_id));
+  }
   ++client_cell_rpc_received_total_;
-  (void)ch_out->SendMessage(fwd);
+  if (auto sent = cell.SendMessage(fwd); !sent && forwarded_id != 0) {
+    rpc_registry_.FailPending(msg_id::Id(msg_id::Common::kEntityRpcReply), forwarded_id,
+                              sent.Error());
+  }
 }
 
 void BaseApp::OnClientMovementInput(Channel& ch, const baseapp::ClientMovementInput& msg) {

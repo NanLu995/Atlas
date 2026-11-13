@@ -23,7 +23,7 @@ using GetEntityDataFn = void (*)(uint32_t entity_id, uint8_t** out_data, int32_t
 // Notifies C# that an entity has been removed natively.
 using EntityDestroyedFn = void (*)(uint32_t entity_id);
 
-// reply_channel is Channel* recast — C# hands it back via SendEntityRpcReply.
+// reply_channel is an opaque native reply handle; zero means no reply is expected.
 using DispatchRpcFn = void (*)(uint32_t entity_id, uint32_t rpc_id, intptr_t reply_channel,
                                const uint8_t* payload, int32_t len, uint64_t trace_id);
 
@@ -62,15 +62,15 @@ class BaseAppNativeProvider : public BaseNativeProvider {
 
   uint8_t GetProcessPrefix() override;
 
-  void SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
-                     const std::byte* payload, int32_t len, uint64_t trace_id) override;
+  RpcSendResult SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
+                              const std::byte* payload, int32_t len, uint64_t trace_id) override;
 
-  void SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  RpcSendResult SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
   // Forward to another BaseEntity on this BaseApp.
-  void SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
   void WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len) override;
 
@@ -91,7 +91,7 @@ class BaseAppNativeProvider : public BaseNativeProvider {
 
   void SetNativeCallbacks(const void* native_callbacks, int32_t len) override;
 
-  auto CoroRegisterPending(uint16_t reply_id, uint32_t request_id, int32_t timeout_ms,
+  auto CoroRegisterPending(uint16_t reply_id, uint64_t request_id, int32_t timeout_ms,
                            intptr_t managed_handle) -> uint64_t override;
   void CoroCancelPending(uint64_t handle) override;
 

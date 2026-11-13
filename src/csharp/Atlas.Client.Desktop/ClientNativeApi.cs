@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using Atlas.Client.Native;
 
+using Atlas.Protocol;
 namespace Atlas.Client;
 
 // Desktop-only C# -> C++ interop against atlas_engine; Unity uses its own
@@ -20,25 +21,25 @@ internal static unsafe partial class ClientNativeApi
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendBaseRpc")]
-    private static partial void SendBaseRpcNative(uint entityId, uint rpcId, byte* payload, int len,
+    private static partial RpcSendResult SendBaseRpcNative(uint entityId, uint rpcId, byte* payload, int len,
                                                   ulong traceId);
 
-    public static void SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    public static RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                    ulong traceId)
     {
         fixed (byte* ptr = payload)
-            SendBaseRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
+            return SendBaseRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendCellRpc")]
-    private static partial void SendCellRpcNative(uint entityId, uint rpcId, byte* payload, int len,
+    private static partial RpcSendResult SendCellRpcNative(uint entityId, uint rpcId, byte* payload, int len,
                                                   ulong traceId);
 
-    public static void SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    public static RpcSendResult SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                    ulong traceId)
     {
         fixed (byte* ptr = payload)
-            SendCellRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
+            return SendCellRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendMovementInput")]

@@ -1,0 +1,19 @@
+<entity name="Account">
+  <base_methods>
+    <method name="Throw" exposed="own_client" reply="int32" />
+    <method name="BadAsyncReply" exposed="own_client" reply="list[int32]" />
+    <method name="Echo" exposed="own_client" reply="int32">
+      <arg name="value" type="int32" />
+    </method>
+    <method name="DelayedEcho" exposed="own_client" reply="int32">
+      <arg name="value" type="int32" />
+      <arg name="delayMs" type="int32" />
+    </method>
+    <method name="Reject" exposed="own_client" reply="int32" />
+    <method name="Notify" exposed="own_client">
+      <arg name="value" type="int32" />
+    </method>
+    <method name="ReadNotification" exposed="own_client" reply="int32" />
+    <method name="AttachProbe" exposed="own_client" reply="uint32" />
+  </base_methods>
+</entity>

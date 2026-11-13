@@ -17,7 +17,7 @@ public static class EntityRpcReplyHelpers
     private const int kRemoteExceptionMessageMax = 512;
 
     public static void SendReplyOnComplete<T>(AtlasTask<RpcReply<T>> task,
-        IntPtr replyChannel, uint requestId, ReplySerializer<T> serializer)
+        IntPtr replyChannel, ulong requestId, ReplySerializer<T> serializer)
     {
         var awaiter = task.GetAwaiter();
         if (awaiter.IsCompleted)
@@ -29,17 +29,13 @@ public static class EntityRpcReplyHelpers
     }
 
     private static void Send<T>(AtlasTask<RpcReply<T>>.Awaiter awaiter,
-        IntPtr replyChannel, uint requestId, ReplySerializer<T> serializer)
+        IntPtr replyChannel, ulong requestId, ReplySerializer<T> serializer)
     {
         RpcReply<T> reply;
         try { reply = awaiter.GetResult(); }
         catch (Exception ex)
         {
-            var msg = ex.Message ?? "";
-            if (msg.Length > kRemoteExceptionMessageMax)
-                msg = msg.Substring(0, kRemoteExceptionMessageMax);
-            NativeApi.SendEntityRpcFailure(replyChannel, requestId,
-                RpcErrorCodes.RemoteException, msg);
+            SendException(replyChannel, requestId, ex);
             return;
         }
 
@@ -53,11 +49,21 @@ public static class EntityRpcReplyHelpers
                 serializer(ref body, reply.Value);
                 NativeApi.SendEntityRpcSuccess(replyChannel, requestId, body.WrittenSpan);
             }
+            catch (Exception ex) { SendException(replyChannel, requestId, ex); }
             finally { body.Dispose(); }
         }
         else
         {
             NativeApi.SendEntityRpcFailure(replyChannel, requestId, reply.Error, reply.ErrorMessage);
         }
+    }
+
+    internal static void SendException(IntPtr replyChannel, ulong requestId, Exception exception)
+    {
+        if (replyChannel == IntPtr.Zero || requestId == 0) return;
+        var message = exception.Message ?? "";
+        if (message.Length > kRemoteExceptionMessageMax)
+            message = message.Substring(0, kRemoteExceptionMessageMax);
+        NativeApi.SendEntityRpcFailure(replyChannel, requestId, RpcErrorCodes.RemoteException, message);
     }
 }

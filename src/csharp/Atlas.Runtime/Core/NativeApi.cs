@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Atlas.DataTypes;
 using Atlas.Entity;
 
+using Atlas.Protocol;
 namespace Atlas.Core;
 
 // Broadcast scope for cell-side server-to-client RPCs. Mirrors atlas::RpcTarget
@@ -48,29 +49,29 @@ internal static unsafe partial class NativeApi
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendClientRpc")]
-    private static partial void SendClientRpcNative(
+    private static partial RpcSendResult SendClientRpcNative(
         uint entityId, uint packedRpcId, byte target,
         byte* payload, int payloadLen, ulong traceId);
 
     // packedRpcId layout: reply:1 | slot:7 | direction:2 | typeIndex:14 | method:8.
-    public static void SendClientRpc(uint entityId, uint packedRpcId, RpcTarget target,
+    public static RpcSendResult SendClientRpc(uint entityId, uint packedRpcId, RpcTarget target,
         ReadOnlySpan<byte> payload, ulong traceId)
     {
         ThreadGuard.EnsureMainThread();
         fixed (byte* ptr = payload)
-            SendClientRpcNative(entityId, packedRpcId, (byte)target, ptr, payload.Length, traceId);
+            return SendClientRpcNative(entityId, packedRpcId, (byte)target, ptr, payload.Length, traceId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendCellRpc")]
-    private static partial void SendCellRpcNative(
+    private static partial RpcSendResult SendCellRpcNative(
         uint entityId, uint rpcId, byte* payload, int payloadLen, ulong traceId);
 
-    public static void SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    public static RpcSendResult SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                    ulong traceId)
     {
         ThreadGuard.EnsureMainThread();
         fixed (byte* ptr = payload)
-            SendCellRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
+            return SendCellRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSetSpaceMasterType")]
@@ -90,15 +91,15 @@ internal static unsafe partial class NativeApi
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendBaseRpc")]
-    private static partial void SendBaseRpcNative(
+    private static partial RpcSendResult SendBaseRpcNative(
         uint entityId, uint rpcId, byte* payload, int payloadLen, ulong traceId);
 
-    public static void SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    public static RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                    ulong traceId)
     {
         ThreadGuard.EnsureMainThread();
         fixed (byte* ptr = payload)
-            SendBaseRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
+            return SendBaseRpcNative(entityId, rpcId, ptr, payload.Length, traceId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasRegisterEntityType")]
@@ -575,17 +576,20 @@ internal static unsafe partial class NativeApi
 
     // Returns 0 when the process has no PendingRpcRegistry or callback fn.
     [LibraryImport(LibName, EntryPoint = "AtlasCoroRegisterPending")]
-    public static partial ulong CoroRegisterPending(ushort replyId, uint requestId,
+    public static partial ulong CoroRegisterPending(ushort replyId, ulong requestId,
         int timeoutMs, IntPtr managedHandle);
 
     [LibraryImport(LibName, EntryPoint = "AtlasCoroCancelPending")]
     public static partial void CoroCancelPending(ulong handle);
 
+    [LibraryImport(LibName, EntryPoint = "AtlasCoroNextRequestId")]
+    public static partial ulong CoroNextRequestId();
+
     [LibraryImport(LibName, EntryPoint = "AtlasSendEntityRpcSuccess")]
     public static unsafe partial void SendEntityRpcSuccessRaw(IntPtr replyChannel,
-        uint requestId, byte* body, int len);
+        ulong requestId, byte* body, int len);
 
-    public static unsafe void SendEntityRpcSuccess(IntPtr replyChannel, uint requestId,
+    public static unsafe void SendEntityRpcSuccess(IntPtr replyChannel, ulong requestId,
         ReadOnlySpan<byte> body)
     {
         fixed (byte* p = body)
@@ -596,9 +600,9 @@ internal static unsafe partial class NativeApi
 
     [LibraryImport(LibName, EntryPoint = "AtlasSendEntityRpcFailure")]
     public static unsafe partial void SendEntityRpcFailureRaw(IntPtr replyChannel,
-        uint requestId, int errorCode, byte* msg, int msgLen);
+        ulong requestId, int errorCode, byte* msg, int msgLen);
 
-    public static unsafe void SendEntityRpcFailure(IntPtr replyChannel, uint requestId,
+    public static unsafe void SendEntityRpcFailure(IntPtr replyChannel, ulong requestId,
         int errorCode, string? msg)
     {
         var buf = msg is null

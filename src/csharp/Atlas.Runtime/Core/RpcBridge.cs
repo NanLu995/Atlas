@@ -8,9 +8,7 @@ namespace Atlas.Core;
 // NativeCallbacks.DispatchRpc can route incoming RPCs.
 public static class RpcBridge
 {
-    // replyChannel is a Channel* recast (nullptr = in-process); receivers
-    // hand it back via NativeApi.SendEntityRpcReply when a reply-style
-    // RPC's user method completes.
+    // replyChannel is an opaque native reply handle, returned unchanged on completion.
     public delegate void RpcDispatchDelegate(ServerEntity entity, int rpcId,
                                              IntPtr replyChannel, ref SpanReader reader);
 

@@ -49,14 +49,14 @@ TEST(EntityRpcReply, SuccessRoundTripsThroughPendingRegistry) {
   auto wire = SerializeBody(reply);
 
   ASSERT_TRUE(registry.TryDispatch(reply.Descriptor().id, wire));
-  ASSERT_EQ(received.size(), 12u);  // [u32 req][i32 code][i32 payload]
+  ASSERT_EQ(received.size(), 16u);
 
-  uint32_t header_req;
+  uint64_t header_req;
   int32_t header_code;
   int32_t payload;
-  std::memcpy(&header_req, received.data(), 4);
-  std::memcpy(&header_code, received.data() + 4, 4);
-  std::memcpy(&payload, received.data() + 8, 4);
+  std::memcpy(&header_req, received.data(), 8);
+  std::memcpy(&header_code, received.data() + 8, 4);
+  std::memcpy(&payload, received.data() + 12, 4);
   EXPECT_EQ(header_req, 7u);
   EXPECT_EQ(header_code, 0);
   EXPECT_EQ(payload, 42);
@@ -87,7 +87,7 @@ TEST(EntityRpcReply, FailureCarriesErrorMessage) {
 
   // Decode header + VLE-string error message.
   BinaryReader r{received};
-  auto req = r.Read<uint32_t>();
+  auto req = r.Read<uint64_t>();
   auto code = r.Read<int32_t>();
   auto msg = r.ReadString();
   ASSERT_TRUE(req && code && msg);
@@ -103,6 +103,25 @@ TEST(EntityRpcReply, RegistryUnclaimedReturnsFalse) {
   EntityRpcReply reply{.request_id = 99, .error_code = 0, .body = {}};
   auto wire = SerializeBody(reply);
   EXPECT_FALSE(registry.TryDispatch(reply.Descriptor().id, wire));
+}
+
+TEST(EntityRpcReply, HighRequestBitsPreventOldReplyFromCompletingNewCall) {
+  EventDispatcher dispatcher{"test"};
+  PendingRpcRegistry registry{dispatcher};
+  const auto reply_id = EntityRpcReply::Descriptor().id;
+  constexpr uint64_t kOldId = 1;
+  constexpr uint64_t kNewId = (uint64_t{1} << 32) + kOldId;
+  int replies = 0;
+  auto old = registry.RegisterPending(
+      reply_id, kOldId, [](std::span<const std::byte>) {}, [](Error) {}, Milliseconds(5000));
+  registry.Cancel(old);
+  registry.RegisterPending(
+      reply_id, kNewId, [&](std::span<const std::byte>) { ++replies; }, [](Error) {},
+      Milliseconds(5000));
+  EXPECT_FALSE(registry.TryDispatch(reply_id, SerializeBody(EntityRpcReply{kOldId, 0, {}})));
+  EXPECT_EQ(registry.PendingCount(), 1u);
+  EXPECT_TRUE(registry.TryDispatch(reply_id, SerializeBody(EntityRpcReply{kNewId, 0, {}})));
+  EXPECT_EQ(replies, 1);
 }
 
 TEST(EntityRpcReply, MessageIdInCommonRange) {

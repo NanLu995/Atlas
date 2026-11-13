@@ -5,11 +5,18 @@
 #include <cstdint>
 
 #include "clrscript/native_api_provider.h"
+#include "coro/pending_rpc_registry.h"
 
 namespace atlas {
 
 class BaseNativeProvider : public INativeApiProvider {
  public:
+  void SetRpcRegistry(PendingRpcRegistry& registry) { rpc_registry_ = &registry; }
+  auto CoroNextRequestId() -> uint64_t override {
+    return rpc_registry_ ? rpc_registry_->AllocateRequestId() : 0;
+  }
+  auto CreateEntityRpcReply(uint32_t entity_id, uint32_t rpc_id, std::span<const std::byte> payload,
+                            Channel* channel) -> intptr_t;
   void LogMessage(int32_t level, const char* msg, int32_t len) override;
 
   double ServerTime() override;
@@ -17,14 +24,14 @@ class BaseNativeProvider : public INativeApiProvider {
 
   uint8_t GetProcessPrefix() override;
 
-  void SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
-                     const std::byte* payload, int32_t len, uint64_t trace_id) override;
+  RpcSendResult SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
+                              const std::byte* payload, int32_t len, uint64_t trace_id) override;
 
-  void SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  RpcSendResult SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
-  void SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
 
   void SendMovementInput(uint32_t target_entity_id, const std::byte* frames,
                          int32_t frame_count) override;
@@ -103,13 +110,14 @@ class BaseNativeProvider : public INativeApiProvider {
 
   void ReportClientEventSeqGap(uint32_t entity_id, uint32_t gap_delta) override;
 
-  void SendEntityRpcSuccess(intptr_t reply_channel, uint32_t request_id, const std::byte* body,
+  void SendEntityRpcSuccess(intptr_t reply_channel, uint64_t request_id, const std::byte* body,
                             int32_t len) override;
-  void SendEntityRpcFailure(intptr_t reply_channel, uint32_t request_id, int32_t error_code,
+  void SendEntityRpcFailure(intptr_t reply_channel, uint64_t request_id, int32_t error_code,
                             const char* msg, int32_t msg_len) override;
 
  protected:
   BaseNativeProvider() = default;
+  PendingRpcRegistry* rpc_registry_{nullptr};
 };
 
 }  // namespace atlas

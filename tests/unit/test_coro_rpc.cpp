@@ -6,25 +6,29 @@
 #include <gtest/gtest.h>
 
 #include "coro/pending_rpc_registry.h"
+#include "coro/rpc_call.h"
+#include "coro/task.h"
+#include "network/channel.h"
 #include "network/event_dispatcher.h"
 #include "network/interface_table.h"
+#include "network/message_ids.h"
 #include "serialization/binary_stream.h"
 
 using namespace atlas;
 
-// ============================================================================
-// Helper: build a fake payload with request_id as first 4 bytes (LE)
-// ============================================================================
+namespace atlas {
+struct PendingRpcRegistryTestAccess {
+  static void ExhaustAfterNext(PendingRpcRegistry& registry) {
+    registry.next_request_id_ = UINT64_MAX;
+  }
+};
+}  // namespace atlas
 
 static auto make_payload(uint32_t request_id) -> std::vector<std::byte> {
   std::vector<std::byte> buf(sizeof(uint32_t));
   std::memcpy(buf.data(), &request_id, sizeof(uint32_t));
   return buf;
 }
-
-// ============================================================================
-// PendingRpcRegistry tests
-// ============================================================================
 
 class PendingRpcRegistryTest : public ::testing::Test {
  protected:
@@ -37,6 +41,306 @@ class PendingRpcRegistryTest : public ::testing::Test {
     while (!done.load() && Clock::now() < deadline) dispatcher_.ProcessOnce();
   }
 };
+
+TEST_F(PendingRpcRegistryTest, NativeRequestIdsRemainMonotoneAcrossCleanupAndRejectExhaustion) {
+  PendingRpcRegistry registry(dispatcher_);
+  EXPECT_EQ(registry.AllocateRequestId(), 1u);
+  registry.CancelAll();
+  EXPECT_EQ(registry.AllocateRequestId(), 2u);
+  PendingRpcRegistryTestAccess::ExhaustAfterNext(registry);
+  EXPECT_EQ(registry.AllocateRequestId(), UINT64_MAX);
+  EXPECT_EQ(registry.AllocateRequestId(), 0u);
+  EXPECT_EQ(registry.AllocateRequestId(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, PendingLimitRejectsNewWaiterAndReleasesCapacityOnCompletion) {
+  PendingRpcRegistry registry(dispatcher_);
+  for (uint32_t id = 1; id <= PendingRpcRegistry::kMaxPendingRpcs; ++id) {
+    ASSERT_TRUE(registry
+                    .RegisterPending(
+                        42, id, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero())
+                    .IsValid());
+  }
+  EXPECT_FALSE(registry
+                   .RegisterPending(
+                       42, 5000, [](std::span<const std::byte>) {}, [](Error) { ADD_FAILURE(); },
+                       Duration::zero())
+                   .IsValid());
+  EXPECT_EQ(registry.PendingCount(), PendingRpcRegistry::kMaxPendingRpcs);
+  EXPECT_TRUE(registry.TryDispatch(42, make_payload(1)));
+  EXPECT_TRUE(registry
+                  .RegisterPending(
+                      42, 5000, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero())
+                  .IsValid());
+  registry.Shutdown();
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, ReplyLimitRejectsNewContextAndReturnsCapacityAfterCompletion) {
+  PendingRpcRegistry registry(dispatcher_);
+  intptr_t first = 0;
+  for (uint64_t id = 1; id <= PendingRpcRegistry::kMaxReplyContexts; ++id) {
+    auto reply = registry.RegisterReply(7, id, nullptr);
+    ASSERT_NE(reply, 0);
+    if (id == 1) first = reply;
+  }
+  EXPECT_EQ(registry.RegisterReply(7, 5000, nullptr), 0);
+  EXPECT_EQ(registry.ReplyCount(), PendingRpcRegistry::kMaxReplyContexts);
+  registry.SendReply(first, 1, 0, {});
+  EXPECT_NE(registry.RegisterReply(7, 5000, nullptr), 0);
+  registry.CancelRepliesForEntity(7);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, ShutdownPermanentlyRejectsReentrantAndSubsequentWork) {
+  PendingRpcRegistry registry(dispatcher_);
+  registry.RegisterPending(
+      42, 1, [](std::span<const std::byte>) {},
+      [&](Error) {
+        EXPECT_EQ(registry.AllocateRequestId(), 0u);
+        EXPECT_EQ(registry.RegisterReply(7, 2, nullptr), 0);
+      },
+      Duration::zero());
+  registry.RegisterReply(7, 1, nullptr);
+  registry.Shutdown();
+  registry.CancelAll();
+  EXPECT_TRUE(registry.IsStopping());
+  EXPECT_EQ(registry.AllocateRequestId(), 0u);
+  EXPECT_EQ(registry.RegisterReply(7, 3, nullptr), 0);
+  EXPECT_FALSE(registry
+                   .RegisterPending(
+                       42, 3, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero())
+                   .IsValid());
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+namespace {
+
+struct TestRpcMessage {
+  uint32_t request_id{0};
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc kDesc{42,
+                                   "TestRpc",
+                                   MessageLengthStyle::kVariable,
+                                   -1,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
+    return kDesc;
+  }
+  void Serialize(BinaryWriter& writer) const { writer.Write(request_id); }
+  static auto Deserialize(BinaryReader& reader) -> Result<TestRpcMessage> {
+    auto id = reader.Read<uint32_t>();
+    if (!id) return id.Error();
+    return TestRpcMessage{*id};
+  }
+};
+
+class RpcTestChannel final : public Channel {
+ public:
+  RpcTestChannel(EventDispatcher& dispatcher, InterfaceTable& table)
+      : Channel(dispatcher, table, Address(0x7F000001, 31000)) {}
+  auto Fd() const -> FdHandle override { return kInvalidFd; }
+  int sends{0};
+  std::function<void()> on_send;
+
+ private:
+  auto DoSend(std::span<const std::byte> data) -> Result<size_t> override {
+    ++sends;
+    if (on_send) on_send();
+    return data.size();
+  }
+};
+
+auto AwaitTestRpc(PendingRpcRegistry& registry, Channel& channel, Result<TestRpcMessage>& result)
+    -> Task<void> {
+  result =
+      co_await RpcCall<TestRpcMessage>(registry, channel, TestRpcMessage{100}, Milliseconds(5000));
+}
+
+}  // namespace
+
+TEST_F(PendingRpcRegistryTest, DestroyingSuspendedCallerRemovesPendingWaiter) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  RpcTestChannel channel(dispatcher_, table);
+  Result<TestRpcMessage> result{Error{ErrorCode::kInternalError, "not completed"}};
+  {
+    auto task = AwaitTestRpc(registry, channel, result);
+    task.operator co_await().await_suspend(std::noop_coroutine()).resume();
+    ASSERT_EQ(registry.PendingCount(), 1u);
+  }
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_FALSE(registry.TryDispatch(42, make_payload(100), &channel));
+}
+
+TEST_F(PendingRpcRegistryTest, LocalReplyHandleCompletesOnceAndChecksRequestId) {
+  PendingRpcRegistry registry(dispatcher_);
+  const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+  int replies = 0;
+  registry.RegisterPending(
+      reply_id, 99, [&](std::span<const std::byte>) { ++replies; }, [](Error) { ADD_FAILURE(); },
+      Milliseconds(5000));
+  auto reply = registry.RegisterReply(7, 99, nullptr);
+  ASSERT_NE(reply, 0);
+  registry.SendReply(reply, 98, 0, {});
+  EXPECT_EQ(registry.ReplyCount(), 1u);
+  registry.SendReply(reply, 99, 0, {});
+  registry.SendReply(reply, 99, 0, {});
+  EXPECT_EQ(replies, 1);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, EntityDestroyInvalidatesReplyHandleAndCompletesLocalWaiter) {
+  PendingRpcRegistry registry(dispatcher_);
+  int error_code = 0;
+  const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+  registry.RegisterPending(
+      reply_id, 99,
+      [&](std::span<const std::byte> payload) {
+        BinaryReader reader(payload);
+        ASSERT_TRUE(reader.Read<uint64_t>());
+        auto code = reader.Read<int32_t>();
+        ASSERT_TRUE(code);
+        error_code = *code;
+      },
+      [](Error) { ADD_FAILURE(); }, Milliseconds(5000));
+  auto reply = registry.RegisterReply(7, 99, nullptr);
+  registry.CancelRepliesForEntity(7);
+  registry.SendReply(reply, 99, 0, {});
+  EXPECT_EQ(error_code, -4);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, DisconnectInvalidatesReplyBeforeChannelIsReleased) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  auto channel = make_intrusive<RpcTestChannel>(dispatcher_, table);
+  auto* raw = channel.get();
+  auto reply = registry.RegisterReply(7, 99, raw);
+  ASSERT_NE(reply, 0);
+  channel.reset();
+  registry.CancelByChannel(raw);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+  registry.SendReply(reply, 99, 0, {});
+  auto next = registry.RegisterReply(7, 100, nullptr);
+  EXPECT_NE(reply, next);
+  registry.SendReply(reply, 99, 0, {});
+  EXPECT_EQ(registry.ReplyCount(), 1u);
+  registry.CancelAll();
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, RpcCallRejectsDuplicateBeforeSending) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  RpcTestChannel channel(dispatcher_, table);
+  registry.RegisterPending(
+      42, 100, [](std::span<const std::byte>) {}, [](Error) {}, Milliseconds(5000), &channel);
+  Result<TestRpcMessage> result{Error{ErrorCode::kInternalError, "not completed"}};
+  auto task = AwaitTestRpc(registry, channel, result);
+  task.operator co_await().await_suspend(std::noop_coroutine()).resume();
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kAlreadyExists);
+  EXPECT_EQ(channel.sends, 0);
+  EXPECT_EQ(registry.PendingCount(), 1u);
+}
+
+TEST_F(PendingRpcRegistryTest, RpcCallCanCompleteSynchronouslyDuringSend) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  RpcTestChannel channel(dispatcher_, table);
+  channel.on_send = [&] { EXPECT_TRUE(registry.TryDispatch(42, make_payload(100), &channel)); };
+  Result<TestRpcMessage> result{Error{ErrorCode::kInternalError, "not completed"}};
+  auto task = AwaitTestRpc(registry, channel, result);
+  task.operator co_await().await_suspend(std::noop_coroutine()).resume();
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->request_id, 100u);
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, RpcCallSendFailureLeavesNoPendingWaiter) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  RpcTestChannel channel(dispatcher_, table);
+  channel.Condemn();
+  Result<TestRpcMessage> result{Error{ErrorCode::kInternalError, "not completed"}};
+  auto task = AwaitTestRpc(registry, channel, result);
+  task.operator co_await().await_suspend(std::noop_coroutine()).resume();
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kChannelCondemned);
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, DuplicateRegistrationPreservesOriginalWaiter) {
+  PendingRpcRegistry registry(dispatcher_);
+  int replies = 0;
+  auto original = registry.RegisterPending(
+      42, 100, [&](std::span<const std::byte>) { ++replies; }, [](Error) {}, Milliseconds(5000));
+  auto duplicate = registry.RegisterPending(
+      42, 100, [](std::span<const std::byte>) { ADD_FAILURE() << "duplicate consumed reply"; },
+      [](Error) {}, Milliseconds(5000));
+  EXPECT_TRUE(original.IsValid());
+  EXPECT_FALSE(duplicate.IsValid());
+  EXPECT_EQ(registry.PendingCount(), 1u);
+  EXPECT_TRUE(registry.TryDispatch(42, make_payload(100)));
+  EXPECT_EQ(replies, 1);
+}
+
+TEST_F(PendingRpcRegistryTest, CancelAllRejectsReentrantRegistration) {
+  PendingRpcRegistry registry(dispatcher_);
+  PendingRpcRegistry::PendingHandle reentrant;
+  registry.RegisterPending(
+      42, 100, [](std::span<const std::byte>) {},
+      [&](Error) {
+        reentrant = registry.RegisterPending(
+            42, 101, [](std::span<const std::byte>) {}, [](Error) {}, Milliseconds(5000));
+      },
+      Milliseconds(5000));
+  registry.CancelAll();
+  EXPECT_FALSE(reentrant.IsValid());
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(PendingRpcRegistryTest, OnlyRegisteredChannelCanCompleteReply) {
+  PendingRpcRegistry registry(dispatcher_);
+  auto* expected = reinterpret_cast<Channel*>(0xA1A1);
+  auto* forged = reinterpret_cast<Channel*>(0xB2B2);
+  int replies = 0;
+  registry.RegisterPending(
+      42, 100, [&](std::span<const std::byte>) { ++replies; }, [](Error) {}, Milliseconds(5000),
+      expected);
+  auto payload = make_payload(100);
+  EXPECT_FALSE(registry.TryDispatch(42, payload, forged));
+  EXPECT_FALSE(registry.TryDispatch(42, payload));
+  EXPECT_EQ(registry.PendingCount(), 1u);
+  EXPECT_TRUE(registry.TryDispatch(42, payload, expected));
+  EXPECT_FALSE(registry.TryDispatch(42, payload, expected));
+  EXPECT_EQ(replies, 1);
+}
+
+TEST_F(PendingRpcRegistryTest, RemoteChannelCannotCompleteLocalWaiter) {
+  PendingRpcRegistry registry(dispatcher_);
+  int replies = 0;
+  registry.RegisterPending(
+      42, 100, [&](std::span<const std::byte>) { ++replies; }, [](Error) {}, Milliseconds(5000));
+  auto payload = make_payload(100);
+  EXPECT_FALSE(registry.TryDispatch(42, payload, reinterpret_cast<Channel*>(0xA1A1)));
+  EXPECT_TRUE(registry.TryDispatch(42, payload));
+  EXPECT_EQ(replies, 1);
+}
+
+TEST_F(PendingRpcRegistryTest, AbandonRemovesWaiterWithoutResumingDestroyedCaller) {
+  PendingRpcRegistry registry(dispatcher_);
+  auto handle = registry.RegisterPending(
+      42, 100, [](std::span<const std::byte>) { ADD_FAILURE(); }, [](Error) { ADD_FAILURE(); },
+      Milliseconds(5000));
+  registry.Abandon(handle);
+  registry.Cancel(handle);
+  EXPECT_FALSE(registry.TryDispatch(42, make_payload(100)));
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
 
 TEST_F(PendingRpcRegistryTest, CancelByChannelFiresReceiverGone) {
   PendingRpcRegistry registry(dispatcher_);
@@ -68,7 +372,7 @@ TEST_F(PendingRpcRegistryTest, CancelByChannelFiresReceiverGone) {
   EXPECT_TRUE(alive_errors.empty());
 
   auto payload = make_payload(1);
-  EXPECT_TRUE(registry.TryDispatch(10, payload));
+  EXPECT_TRUE(registry.TryDispatch(10, payload, alive));
   EXPECT_TRUE(alive_replied);
 }
 
@@ -180,19 +484,17 @@ TEST_F(PendingRpcRegistryTest, PayloadTooSmallNotConsumed) {
   EXPECT_EQ(registry.PendingCount(), 1u);
 }
 
-// ============================================================================
-// InterfaceTable pre-dispatch hook test
-// ============================================================================
-
 TEST(InterfaceTable, PreDispatchHookInterceptsMessage) {
   InterfaceTable table;
 
   bool hook_called = false;
   MessageID intercepted_id = 0;
+  auto* channel = reinterpret_cast<Channel*>(0xA1A1);
 
-  table.SetPreDispatchHook([&](MessageID id, std::span<const std::byte> payload) -> bool {
+  table.SetPreDispatchHook([&](Channel* source, MessageID id, std::span<const std::byte>) -> bool {
     hook_called = true;
     intercepted_id = id;
+    EXPECT_EQ(source, channel);
     return true;  // consume the message
   });
 
@@ -202,7 +504,7 @@ TEST(InterfaceTable, PreDispatchHookInterceptsMessage) {
   BinaryReader reader(writer.Data());
 
   Address addr;
-  auto result = table.Dispatch(addr, nullptr, 42, reader);
+  auto result = table.Dispatch(addr, channel, 42, reader);
 
   EXPECT_TRUE(result.HasValue());
   EXPECT_TRUE(hook_called);
@@ -212,7 +514,7 @@ TEST(InterfaceTable, PreDispatchHookInterceptsMessage) {
 TEST(InterfaceTable, PreDispatchHookPassThrough) {
   InterfaceTable table;
 
-  table.SetPreDispatchHook([](MessageID, std::span<const std::byte>) -> bool {
+  table.SetPreDispatchHook([](Channel*, MessageID, std::span<const std::byte>) -> bool {
     return false;  // do not consume
   });
 

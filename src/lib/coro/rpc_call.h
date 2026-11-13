@@ -32,6 +32,10 @@ auto RpcCall(PendingRpcRegistry& registry, Channel& channel, const Request& requ
     Result<Reply> result{Error{ErrorCode::kInternalError, "rpc_call: not completed"}};
     PendingRpcRegistry::PendingHandle pending_handle{};
     CancelRegistration cancel_reg{};
+    bool suspending{true};
+    bool completed{false};
+
+    ~Awaiter() { registry.Abandon(pending_handle); }
 
     auto await_ready() -> bool {
       if (token.IsCancelled()) {
@@ -42,13 +46,6 @@ auto RpcCall(PendingRpcRegistry& registry, Channel& channel, const Request& requ
     }
 
     auto await_suspend(std::coroutine_handle<> caller) -> std::coroutine_handle<> {
-      auto send_result = channel.SendMessage(request);
-      if (!send_result) {
-        result = Error{send_result.Error().Code(), std::string("rpc_call: send failed: ") +
-                                                       std::string(send_result.Error().Message())};
-        return caller;  // symmetric transfer back to caller
-      }
-
       auto reply_id = Reply::Descriptor().id;
       auto request_id = request.request_id;
 
@@ -61,19 +58,33 @@ auto RpcCall(PendingRpcRegistry& registry, Channel& channel, const Request& requ
               result = std::move(reply.Value());
             else
               result = reply.Error();
-            caller.resume();
+            completed = true;
+            if (!suspending) caller.resume();
           },
           [this, caller](Error error) mutable {
             result = std::move(error);
-            caller.resume();
+            completed = true;
+            if (!suspending) caller.resume();
           },
           timeout, &channel);
 
+      if (!pending_handle.IsValid()) {
+        result = Error{ErrorCode::kAlreadyExists, "rpc_call: pending registration rejected"};
+        return caller;
+      }
       if (token.IsValid()) {
         cancel_reg = token.OnCancel([this]() { registry.Cancel(pending_handle); });
       }
-
-      return std::noop_coroutine();  // suspend until reply/timeout/cancel
+      if (!completed) {
+        auto send_result = channel.SendMessage(request);
+        if (!send_result && !completed) {
+          registry.Abandon(pending_handle);
+          result = send_result.Error();
+          completed = true;
+        }
+      }
+      suspending = false;
+      return completed ? caller : std::noop_coroutine();
     }
 
     auto await_resume() -> Result<Reply> { return std::move(result); }

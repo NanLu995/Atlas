@@ -176,7 +176,7 @@ auto DispatchFrameImpl(InterfaceTable& interface_table, const Address& remote, C
       return frame_data.size();
     }
 
-    if (interface_table.TryPreDispatch(id, *payload_span)) {
+    if (interface_table.TryPreDispatch(channel, id, *payload_span)) {
       last_safe_pos = reader.Position();
       if (Clock::now() >= deadline) return last_safe_pos;
       continue;

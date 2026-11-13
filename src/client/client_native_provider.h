@@ -24,10 +24,10 @@ class ClientNativeProvider : public BaseNativeProvider {
 
   uint8_t GetProcessPrefix() override;
 
-  void SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
-  void SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload, int32_t len,
-                   uint64_t trace_id) override;
+  RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
+  RpcSendResult SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                            int32_t len, uint64_t trace_id) override;
   void SendMovementInput(uint32_t target_entity_id, const std::byte* frames,
                          int32_t frame_count) override;
   void SendMovementCorrectionReport(uint32_t target_entity_id, uint32_t acked_input_seq,

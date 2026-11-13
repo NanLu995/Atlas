@@ -2,12 +2,18 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "cell_entity.h"
 #include "cellapp_native_provider.h"
 #include "math/vector3.h"
+#include "network/message_ids.h"
+#include "network/network_interface.h"
+#include "real_entity_data.h"
+#include "serialization/binary_stream.h"
 #include "server/server_config.h"
 #include "space.h"
 #include "test_null_channel.h"
@@ -608,6 +614,165 @@ TEST_F(CellAppNativeProviderTest, SetNativeCallbacksDispatchRoundtrips) {
   EXPECT_TRUE(g_dispatch_called);
   EXPECT_EQ(g_dispatch_entity_id, 100u);
   EXPECT_EQ(g_dispatch_rpc_id, 0x00800001u);
+}
+
+TEST_F(CellAppNativeProviderTest, ManagedRpcRegistrationReplyAndCancellationUseCellRegistry) {
+  EventDispatcher dispatcher{"cell_rpc"};
+  PendingRpcRegistry registry{dispatcher};
+  provider_.SetRpcRegistry(registry);
+  TestCallbackTable table{};
+  struct Completion {
+    intptr_t handle;
+    int32_t status;
+  };
+  std::vector<Completion> completions;
+  table.coro_on_rpc_complete =
+      reinterpret_cast<void*>(+[](intptr_t handle, int32_t status, const uint8_t*, int32_t) {
+        auto* output = reinterpret_cast<std::vector<Completion>*>(handle);
+        output->push_back({handle, status});
+      });
+  provider_.SetNativeCallbacks(&table, sizeof(table));
+  const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+  const auto callback = reinterpret_cast<intptr_t>(&completions);
+  const auto first = provider_.CoroRegisterPending(reply_id, 1, 5000, callback);
+  ASSERT_NE(first, 0u);
+  BinaryWriter payload;
+  payload.Write(uint64_t{1});
+  payload.Write(int32_t{0});
+  EXPECT_TRUE(registry.TryDispatch(reply_id, payload.Data()));
+  const auto second = provider_.CoroRegisterPending(reply_id, 2, 5000, callback);
+  ASSERT_NE(second, 0u);
+  provider_.CoroCancelPending(first);
+  EXPECT_EQ(registry.PendingCount(), 1u);
+  provider_.CoroCancelPending(second);
+  ASSERT_EQ(completions.size(), 2u);
+  EXPECT_EQ(completions[0].status, 0);
+  EXPECT_EQ(completions[1].status, 2);
+  EXPECT_EQ(registry.PendingCount(), 0u);
+}
+
+TEST_F(CellAppNativeProviderTest, MissingBaseAndCellCompletePendingCallsWithoutTimeout) {
+  EventDispatcher dispatcher{"cell_rpc"};
+  PendingRpcRegistry registry{dispatcher};
+  provider_.SetRpcRegistry(registry);
+  const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+  int errors = 0;
+  for (bool to_base : {false, true}) {
+    registry.RegisterPending(
+        reply_id, 1, [](std::span<const std::byte>) { ADD_FAILURE(); },
+        [&](Error error) {
+          EXPECT_EQ(error.Code(), ErrorCode::kReceiverGone);
+          ++errors;
+        },
+        Milliseconds(5000));
+    BinaryWriter payload;
+    payload.Write(uint64_t{1});
+    if (to_base)
+      provider_.SendBaseRpc(9999, 0x80C00001, payload.Data().data(),
+                            static_cast<int32_t>(payload.Data().size()), 0);
+    else
+      provider_.SendCellRpc(9999, 0x80800001, payload.Data().data(),
+                            static_cast<int32_t>(payload.Data().size()), 0);
+    EXPECT_EQ(registry.PendingCount(), 0u);
+  }
+  EXPECT_EQ(errors, 2);
+}
+
+TEST_F(CellAppNativeProviderTest, LocalCellReplyUsesOpaqueHandleAndCompletesOnlyOnce) {
+  EventDispatcher dispatcher{"local_cell_rpc"};
+  PendingRpcRegistry registry{dispatcher};
+  provider_.SetRpcRegistry(registry);
+  AddEntity(10);
+  static intptr_t reply_handle;
+  reply_handle = 0;
+  TestCallbackTable table{};
+  table.dispatch_rpc =
+      reinterpret_cast<void*>(+[](uint32_t, uint32_t, intptr_t reply, const uint8_t*, int32_t,
+                                  uint64_t) { reply_handle = reply; });
+  provider_.SetNativeCallbacks(&table, sizeof(table));
+  const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);
+  int replies = 0;
+  registry.RegisterPending(
+      reply_id, 17, [&](std::span<const std::byte>) { ++replies; }, [](Error) { ADD_FAILURE(); },
+      Milliseconds(5000));
+  BinaryWriter payload;
+  payload.Write(uint64_t{17});
+  provider_.SendCellRpc(10, 0x80800001, payload.Data().data(),
+                        static_cast<int32_t>(payload.Data().size()), 0);
+  ASSERT_NE(reply_handle, 0);
+  EXPECT_EQ(registry.ReplyCount(), 1u);
+  provider_.SendEntityRpcSuccess(reply_handle, 17, nullptr, 0);
+  provider_.SendEntityRpcSuccess(reply_handle, 17, nullptr, 0);
+  EXPECT_EQ(replies, 1);
+  EXPECT_EQ(registry.PendingCount(), 0u);
+  EXPECT_EQ(registry.ReplyCount(), 0u);
+}
+
+TEST_F(CellAppNativeProviderTest, BroadcastReportsAllQueuedPartialAndAllFailed) {
+  EventDispatcher dispatcher{"send_outcomes"};
+  NetworkInterface network(dispatcher);
+  CellAppNativeProvider provider([this](uint32_t id) { return space_.FindEntity(id); }, network);
+  auto* entity = AddEntity(10);
+  auto* first = test_support::FakeChannel();
+  auto* second = test_support::FakeChannel();
+  ASSERT_TRUE(entity->GetRealData()->AddHaunt(first, Address(0x7F000001u, 31001)));
+  ASSERT_TRUE(entity->GetRealData()->AddHaunt(second, Address(0x7F000001u, 31002)));
+  EXPECT_EQ(provider.SendClientRpc(10, 1, RpcTarget::kOthers, nullptr, 0, 0),
+            RpcSendResult::kQueued);
+  first->Condemn();
+  EXPECT_EQ(provider.SendClientRpc(10, 1, RpcTarget::kOthers, nullptr, 0, 0),
+            RpcSendResult::kPartiallyQueued);
+  second->Condemn();
+  EXPECT_EQ(provider.SendClientRpc(10, 1, RpcTarget::kOthers, nullptr, 0, 0),
+            RpcSendResult::kInvalidTarget);
+}
+
+TEST_F(CellAppNativeProviderTest, SingleSendRejectsMissingTargetAndStoppingWithoutDispatch) {
+  EventDispatcher dispatcher{"send_outcomes"};
+  PendingRpcRegistry registry{dispatcher};
+  provider_.SetRpcRegistry(registry);
+  EXPECT_EQ(provider_.SendCellRpc(9999, 1, nullptr, 0, 0), RpcSendResult::kInvalidTarget);
+  registry.Shutdown();
+  EXPECT_EQ(provider_.SendCellRpc(9999, 1, nullptr, 0, 0), RpcSendResult::kStopping);
+  EXPECT_EQ(provider_.SendBaseRpc(9999, 1, nullptr, 0, 0), RpcSendResult::kStopping);
+  EXPECT_EQ(provider_.SendClientRpc(9999, 1, RpcTarget::kOwner, nullptr, 0, 0),
+            RpcSendResult::kStopping);
+}
+
+TEST(RpcSendResult, PreservesOverloadInvalidTargetAndOtherSendErrors) {
+  EXPECT_EQ(RpcSendOutcome(Result<void>{}), RpcSendResult::kQueued);
+  EXPECT_EQ(RpcSendOutcome(Error{ErrorCode::kWouldBlock, "full"}), RpcSendResult::kOverloaded);
+  EXPECT_EQ(RpcSendOutcome(Error{ErrorCode::kRateLimited, "limited"}), RpcSendResult::kOverloaded);
+  EXPECT_EQ(RpcSendOutcome(Error{ErrorCode::kChannelCondemned, "closed"}),
+            RpcSendResult::kInvalidTarget);
+  EXPECT_EQ(RpcSendOutcome(Error{ErrorCode::kIoError, "io"}), RpcSendResult::kSendFailed);
+}
+
+TEST_F(CellAppNativeProviderTest, GhostSendPropagatesActualTransportBackpressureAndFailure) {
+  class FailingChannel final : public Channel {
+   public:
+    FailingChannel(EventDispatcher& dispatcher, InterfaceTable& table, ErrorCode error)
+        : Channel(dispatcher, table, Address{}), error_(error) {}
+    auto Fd() const -> FdHandle override { return kInvalidFd; }
+
+   private:
+    auto DoSend(std::span<const std::byte>) -> Result<size_t> override {
+      return Error{error_, "injected transport failure"};
+    }
+    ErrorCode error_;
+  };
+  EventDispatcher dispatcher{"backpressure"};
+  InterfaceTable table;
+  for (const auto& [id, error, expected] :
+       {std::tuple{20u, ErrorCode::kWouldBlock, RpcSendResult::kOverloaded},
+        std::tuple{21u, ErrorCode::kIoError, RpcSendResult::kSendFailed}}) {
+    auto channel = make_intrusive<FailingChannel>(dispatcher, table, error);
+    space_.AddEntity(std::make_unique<CellEntity>(CellEntity::GhostTag{}, id, uint16_t{1}, space_,
+                                                  math::Vector3{}, math::Vector3{1, 0, 0},
+                                                  channel.get()));
+    EXPECT_EQ(provider_.SendCellRpc(id, 1, nullptr, 0, 0), expected);
+    space_.RemoveEntity(id);
+  }
 }
 
 TEST_F(CellAppNativeProviderTest, SetPositionRejectedOnGhost) {

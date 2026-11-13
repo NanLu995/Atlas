@@ -215,6 +215,7 @@ public sealed class ClientEntityManager
     private static void DestroyEntityInstance(ClientEntity entity)
     {
         entity.IsDestroyed = true;
+        entity.TriggerLifecycleCancellation();
         entity.OnDestroy();
         entity.DetachAllComponents();
         entity.Session = null;

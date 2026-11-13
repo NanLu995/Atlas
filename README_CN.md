@@ -237,6 +237,25 @@ tools/bin/test_cluster.sh
 tools\bin\test_cluster.bat
 ```
 
+`test_cluster` 支持 `--base-assembly <脚本.dll>`，用于为 BaseApp 加载测试脚本。
+默认仍为 `Atlas.Runtime.dll`；显式程序集不存在时，在启动集群进程前报错。
+CMake 的 `atlas_rpc_fixture_base_dll_deploy`、`atlas_rpc_fixture_client_dll_deploy`
+目标构建仅用于测试的生成式 RPC 两端。
+`--cell-assembly <脚本.dll>` 增加一个 CellAppMgr 和一个 CellApp；配套的
+`atlas_rpc_fixture_cell_dll_deploy` 目标构建 Cell 测试端。程序集缺失时在启动进程前报错，
+运行清单记录拓扑中是否包含 CellApp。
+
+运行独立的生成式 Mailbox 测试时，将 `ATLAS_BIN_DIR` 设为隔离二进制目录的绝对路径，
+通过 `ATLAS_DB_MYSQL_*` 指向空的测试数据库。现有 C# 集群夹具负责进程启动与结束，
+不依赖安装 Godot：
+
+```bash
+dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedName~RpcMailboxRealTests
+```
+
+覆盖 Client→Base、Client→Cell 回复，Base→Cell、Cell→Base 调用，Base/Cell→Client
+通知，以及异步乱序、业务错误、单向调用、超时、取消、晚回复及清理；先构建三端测试夹具。
+
 ## 数据库
 
 Atlas 通过 database factory 加载 SQLite 和 MySQL/MariaDB 插件。主要开发、联调、正式部署
@@ -482,9 +501,52 @@ public partial class Avatar : ClientEntity
 
 容器（`list[T]`、`dict[K,V]`、`list[list[int32]]` …）与用户 `<struct>` 类型同样通过 setter 路径以字段级 / op-log 级别 delta 复制；完整覆盖矩阵参见 `entity_defs/StressAvatar.def` 与 `samples/stress/`。
 
+实体 RPC 请求与回复头使用 64 位请求 ID。生成的 ID 在托管运行时内不复用，耗尽时拒绝新调用。
+原生 ABI 版本 7 要求运行时、服务器及生成调用代码一起重建，不支持旧 RPC 消息头。
+等待注册遇到重复键时明确拒绝，不替换原等待者。回复必须来自注册的通道，重复、晚到及
+错误通道的回复不能完成该等待者。取消表示停止等待，并阻止发送前已取消的生成调用；
+不承诺撤销远端已经执行的工作。
+CellApp 将托管 RPC 等待接入原生注册表。Cell 到 Base、Ghost 到 Real 调用在发送前绑定
+实际通道；目标不可用或发送失败会通知等待者。本地 Base/Cell 回复与远端调用使用同一套
+原生回复句柄；完成、断线、实体销毁或注册表关闭后使句柄失效，脚本晚完成不会访问
+过期通道或再次完成其他调用。ClientSession 按所属会话分发实体回复，生成的客户端 Mailbox
+使用该会话等待表；重置或 Desktop 传输断线时以 ReceiverGone 完成等待。
+服务器 C# 调用和 BaseApp 中转共用原生进程的 64 位 ID 分配器，脚本重载不重置计数器，
+耗尽时拒绝。BaseApp 改写 Client 到 Cell 的请求 ID，回复时恢复客户端原 ID，隔离不同
+客户端的同 ID 请求。中转等待在 10 秒后超时；客户端或 Cell 通道断开、损坏回复及发送
+失败均清理中转状态。Cell 路由未就绪时，有回复调用立即失败；单向调用保留已有有界队列。
+每个原生注册表最多保留 4096 个发起方等待和 4096 个回复上下文；每个托管注册表最多
+保留 4096 个等待。完成、取消或清理后释放容量，超限注册失败，不替换原等待者。
+BaseApp、CellApp 在结束流程卸载脚本前关闭 RPC 注册表；关闭后拒绝新请求，
+包括清理回调中重入的注册。此行为不代表完整的停服任务排空已经实现。
+生成的单向 Mailbox 和组件发送方法返回 `RpcSendResult`：`Queued`、`InvalidTarget`、
+`Overloaded`、`Stopping`、`SendFailed`、`PartiallyQueued`。已入队只确认本地分发或传输
+接纳，不确认远端已执行。广播汇总所有尝试的 BaseApp 和 Ghost 通道；部分入队表示至少
+一个通道已接纳且另一个失败，框架不会自动重试。`OtherClients` 无接收者时无需发送即成功。
+独立客户端 SDK 的 RPC 发送也传播底层错误，不再无条件报告成功。
+独立 Godot/桌面宿主可以向 `LoginClient` 传入 `ClientSession`；它接通该会话的
+Base/Cell 发送入口，并将回复和断线清理路由到该会话。每个并行连接使用独立会话，
+通过 `DefBootstrap.RegisterInto(session)` 注册生成的客户端定义。无参构造函数沿用
+仅供单连接使用的 `DefaultSession`。Dispose 会解除自身的发送委托。
+`ClientSession.CellReadyReceived` 分发服务器按实体发送的路由就绪通知；它是当时的状态
+通知，不保证后续调用一定成功。原生分发只接纳当前绑定 BaseApp 通道的回复与状态通知，
+断线等待清理期间拒绝这些消息。
+底层通道断开后，在轮询中完成原生断线清理，并且只通知一次原因码 2；在途登录/认证
+回调收到失败，会话 RPC 等待以 `ReceiverGone` 完成。Unity 网络管理器在登出和销毁时
+也会清理会话等待。
+原生回调内允许断线或销毁上下文：清理等当前原生调用退出后进行；销毁立即停用后续
+回调，递归 `AtlasNetPoll` 返回 `BUSY`。已请求断线时，在实际清理前也拒绝新发送。
+生成的有回复 Mailbox 同时订阅调用实体的生命周期令牌和显式取消令牌；即使调用方省略
+`ct`，实体销毁或脚本热重载也会取消等待。回收等待源时解除两种令牌订阅，避免影响后续调用。
+有回复调用中的同步脚本异常、异步回复序列化失败均返回 `RemoteException`，同时消费
+原生回复句柄，避免调用方只等超时和持续占用回复上下文。
+
 ## Profiling 与压测
 
 `profile` 预设启用 Tracy instrumentation 与 profiling helpers。默认基线为 200 客户端、120 秒，捕获文件写入 `.tmp/prof/baseline/`。
+
+Linux 构建将 Tracy 共享库及其加载用符号链接放在服务器旁，确保托管与原生代码使用
+同一份运行库，无需另外修改 `LD_LIBRARY_PATH`。
 
 ```bash
 tools\bin\build.bat profile

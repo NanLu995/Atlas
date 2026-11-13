@@ -1,4 +1,6 @@
+#include <chrono>
 #include <filesystem>
+#include <format>
 
 #include <gtest/gtest.h>
 
@@ -89,14 +91,17 @@ struct SqliteDatabaseTestAccess {
 }  // namespace atlas
 
 TEST(SqliteOwnership, RejectsSecondInstanceAndAllowsRestart) {
-  const auto directory = std::filesystem::temp_directory_path() / "atlas_sqlite_ownership";
-  std::filesystem::create_directories(directory);
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory =
+      std::filesystem::temp_directory_path() / std::format("atlas_sqlite_ownership_{}", stamp);
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
   DatabaseConfig config;
   config.type = "sqlite";
   config.sqlite_path = directory / "single.sqlite3";
   SqliteDatabase first;
   SqliteDatabase second;
-  ASSERT_TRUE(first.Startup(config, EntityDefRegistry::Instance()));
+  auto started = first.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_TRUE(started.HasValue()) << started.Error().Message();
   auto rejected = second.Startup(config, EntityDefRegistry::Instance());
   EXPECT_FALSE(rejected.HasValue());
   if (!rejected) {

@@ -11,16 +11,26 @@ public static class AtlasRpc
 
     public const int DefaultTimeoutMs = 10_000;
 
-    public static uint NextRequestId() =>
-        unchecked((uint)Interlocked.Increment(ref _nextRequestId));
+    public static ulong NextRequestId()
+    {
+        if (AtlasRpcRegistryHost.RequestIdAllocator is { } allocator) return allocator();
+        while (true)
+        {
+            var current = Interlocked.Read(ref _nextRequestId);
+            if (current == -1) return 0;
+            var next = unchecked(current + 1);
+            if (Interlocked.CompareExchange(ref _nextRequestId, next, current) == current)
+                return unchecked((ulong)next);
+        }
+    }
 
-    public static AtlasTask<RpcReply<U>> Await<U>(int replyId, uint requestId,
+    public static AtlasTask<RpcReply<U>> Await<U>(int replyId, ulong requestId,
         AtlasRpcSource<RpcReply<U>>.SpanDeserializer deserializer,
         int timeoutMs = DefaultTimeoutMs, AtlasCancellationToken ct = default)
         => Await(AtlasRpcRegistryHost.Current, replyId, requestId, deserializer, timeoutMs, ct);
 
     public static AtlasTask<RpcReply<U>> Await<U>(IAtlasRpcRegistry registry,
-        int replyId, uint requestId,
+        int replyId, ulong requestId,
         AtlasRpcSource<RpcReply<U>>.SpanDeserializer deserializer,
         int timeoutMs = DefaultTimeoutMs, AtlasCancellationToken ct = default)
     {

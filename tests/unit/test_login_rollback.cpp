@@ -132,11 +132,11 @@ class LoginRollbackTest : public ::testing::Test {
     app_.HandleLoginCoro(client_channel_id, Address(0x7F000001u, 26001), std::move(request));
     return request_id;
   }
-  void handle_auth_result(const login::AuthLoginResult& result) {
+  auto handle_auth_result(Channel* channel, const login::AuthLoginResult& result) -> bool {
     BinaryWriter writer;
     result.Serialize(writer);
-    ASSERT_TRUE(
-        app_.rpc_registry_.TryDispatch(login::AuthLoginResult::Descriptor().id, writer.Data()));
+    return app_.rpc_registry_.TryDispatch(login::AuthLoginResult::Descriptor().id, writer.Data(),
+                                          channel);
   }
   template <typename Predicate>
   auto drive_until(Predicate predicate, Duration timeout) -> bool {
@@ -267,7 +267,9 @@ TEST_F(LoginRollbackTest, AuthLoginRetriesAfterDbappDeathAndShardUpdate) {
   auth_reply.status = login::LoginStatus::kSuccess;
   auth_reply.dbid = 42;
   auth_reply.type_id = 7;
-  handle_auth_result(auth_reply);
+  EXPECT_FALSE(handle_auth_result(&old_shard, auth_reply));
+  EXPECT_FALSE(handle_auth_result(nullptr, auth_reply));
+  EXPECT_TRUE(handle_auth_result(&new_shard, auth_reply));
 
   EXPECT_TRUE(pending_by_username_empty());
   EXPECT_EQ(active_login_count(), 0u);

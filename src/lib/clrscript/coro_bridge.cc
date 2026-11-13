@@ -3,6 +3,8 @@
 #include <chrono>
 
 #include "foundation/error.h"
+#include "network/message_ids.h"
+#include "serialization/binary_stream.h"
 
 namespace atlas::coro_bridge {
 
@@ -14,31 +16,16 @@ constexpr int32_t kStatusCancelled = 2;
 constexpr int32_t kStatusSendError = 3;
 constexpr int32_t kStatusReceiverGone = 4;
 
-// "Never times out" is approximated by a year — the dispatcher won't reach it.
-constexpr auto kNoTimeoutDuration = std::chrono::hours{24 * 365};
-
-auto PackHandle(uint16_t reply_id, uint32_t request_id) -> uint64_t {
-  return (static_cast<uint64_t>(reply_id) << 32) | static_cast<uint64_t>(request_id);
-}
-
-auto UnpackHandle(uint64_t handle) -> PendingRpcRegistry::PendingHandle {
-  return PendingRpcRegistry::PendingHandle{
-      static_cast<MessageID>(handle >> 32),
-      static_cast<uint32_t>(handle & 0xFFFFFFFFu),
-  };
-}
-
 }  // namespace
 
 auto RegisterPending(PendingRpcRegistry& registry, CoroOnRpcCompleteFn on_complete,
-                     uint16_t reply_id, uint32_t request_id, int32_t timeout_ms,
+                     uint16_t reply_id, uint64_t request_id, int32_t timeout_ms,
                      intptr_t managed_handle) -> uint64_t {
   if (on_complete == nullptr) return 0;
 
-  auto timeout = timeout_ms > 0 ? std::chrono::milliseconds{timeout_ms}
-                                : std::chrono::duration_cast<Duration>(kNoTimeoutDuration);
+  auto timeout = timeout_ms > 0 ? std::chrono::milliseconds{timeout_ms} : Duration::zero();
 
-  registry.RegisterPending(
+  auto handle = registry.RegisterPending(
       reply_id, request_id,
       [on_complete, managed_handle](std::span<const std::byte> payload) {
         on_complete(managed_handle, kStatusSuccess,
@@ -57,12 +44,31 @@ auto RegisterPending(PendingRpcRegistry& registry, CoroOnRpcCompleteFn on_comple
       },
       timeout);
 
-  return PackHandle(reply_id, request_id);
+  return handle.value;
 }
 
 void CancelPending(PendingRpcRegistry& registry, uint64_t handle) {
   if (handle == 0) return;
-  registry.Cancel(UnpackHandle(handle));
+  registry.Cancel(PendingRpcRegistry::PendingHandle{handle});
+}
+
+auto BindEntityRequest(PendingRpcRegistry& registry, uint32_t rpc_id,
+                       std::span<const std::byte> payload, Channel* channel) -> bool {
+  if ((rpc_id & 0x80000000u) == 0) return true;
+  BinaryReader reader(payload);
+  auto request_id = reader.Read<uint64_t>();
+  return request_id &&
+         registry.BindChannel(msg_id::Id(msg_id::Common::kEntityRpcReply), *request_id, channel);
+}
+
+void FailEntityRequest(PendingRpcRegistry& registry, uint32_t rpc_id,
+                       std::span<const std::byte> payload, Error error) {
+  if ((rpc_id & 0x80000000u) == 0) return;
+  BinaryReader reader(payload);
+  auto request_id = reader.Read<uint64_t>();
+  if (request_id)
+    registry.FailPending(msg_id::Id(msg_id::Common::kEntityRpcReply), *request_id,
+                         std::move(error));
 }
 
 }  // namespace atlas::coro_bridge

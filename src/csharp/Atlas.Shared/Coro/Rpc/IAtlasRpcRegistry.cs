@@ -22,8 +22,8 @@ public interface IAtlasRpcCallback
 // NativeRpcRegistry (server, wraps C++ PendingRpcRegistry).
 public interface IAtlasRpcRegistry
 {
-    // Returns opaque handle for cancellation. timeoutMs <= 0 = no timeout.
-    long RegisterPending(int replyId, uint requestId, int timeoutMs, IAtlasRpcCallback callback);
+    // Zero rejects registration without a callback; timeoutMs <= 0 disables the timer.
+    long RegisterPending(int replyId, ulong requestId, int timeoutMs, IAtlasRpcCallback callback);
 
     void CancelPending(long handle);
 }

@@ -247,6 +247,26 @@ tools/bin/test_cluster.sh
 tools\bin\test_cluster.bat
 ```
 
+`test_cluster` also accepts `--base-assembly <script.dll>` to load a test script in
+BaseApp. The default remains `Atlas.Runtime.dll`; a missing explicit assembly fails
+before any cluster process starts. The `atlas_rpc_fixture_base_dll_deploy` and
+`atlas_rpc_fixture_client_dll_deploy` CMake targets build test-only generated RPC peers.
+`--cell-assembly <script.dll>` adds one CellAppMgr and one CellApp; the matching
+`atlas_rpc_fixture_cell_dll_deploy` target builds the Cell peer. Missing assemblies fail
+before process startup. Run manifests record whether the topology includes a CellApp.
+
+For the standalone generated-mailbox test, set `ATLAS_BIN_DIR` to the absolute isolated
+binary directory and use an empty test database through `ATLAS_DB_MYSQL_*`. The existing
+C# cluster fixture starts and stops the processes; no Godot installation is required:
+
+```bash
+dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedName~RpcMailboxRealTests
+```
+
+This covers Client→Base and Client→Cell replies, Base→Cell and Cell→Base calls,
+Base/Cell→Client notifications, asynchronous ordering, business errors, one-way calls,
+timeout, cancellation, late replies and cleanup. Build all three RPC fixture targets first.
+
 ## Database
 
 Atlas loads SQLite and MySQL/MariaDB plugins through the database factory. MySQL/MariaDB
@@ -530,9 +550,65 @@ public partial class Avatar : ClientEntity
 
 Containers (`list[T]`, `dict[K,V]`, `list[list[int32]]`, …) and user `<struct>` types replicate field- or op-level deltas through the same setter path; see `entity_defs/StressAvatar.def` and `samples/stress/` for the full coverage matrix.
 
+Entity RPC request and reply headers use 64-bit request IDs. Generated IDs are not reused
+within the managed runtime; exhaustion rejects new calls. Native ABI version 7 requires
+rebuilding the runtime, server and generated callers together; old RPC headers are unsupported.
+Pending RPC registrations reject duplicate keys without replacing the original waiter.
+Replies must arrive on the registered channel; duplicate, late and wrong-channel replies
+cannot complete that waiter. Cancellation stops waiting and prevents generated calls that
+were already cancelled before sending; it does not undo remote work already executed.
+CellApp registers managed RPC waits in its native registry. Cell-to-Base and Ghost-to-Real
+calls bind the actual channel before sending, and report unavailable targets or send failures
+to the waiter. Local Base/Cell replies use the same native reply handles as remote calls.
+Completion, channel loss, entity destruction and registry shutdown invalidate those handles;
+late script completions cannot dereference an expired channel or complete a second call.
+ClientSession dispatches entity replies through its own waiting registry, used by generated
+client mailboxes. Reset and Desktop transport disconnection complete pending calls with
+ReceiverGone. Server C# calls and BaseApp relays share the native process's 64-bit ID
+allocator, which survives script reloads and rejects exhaustion. BaseApp replaces
+Client-to-Cell request IDs and restores the original client ID on replies.
+Relay waits expire after 10 seconds. Client or Cell channel loss, malformed replies and
+send failures remove relay state; missing Cell routes reject reply-style calls immediately.
+One-way calls retain the existing bounded no-Cell queue.
+Each native registry accepts at most 4096 outgoing waits and 4096 reply contexts;
+each managed registry accepts at most 4096 waits. Capacity is released on completion,
+cancellation or cleanup. Registration beyond the limit fails without replacing a waiter.
+BaseApp and CellApp close the RPC registry before script teardown during finalization;
+closed registries reject new requests, including registrations from cleanup callbacks.
+Generated one-way mailboxes and component send methods return `RpcSendResult`: `Queued`,
+`InvalidTarget`, `Overloaded`, `Stopping`, `SendFailed`, or `PartiallyQueued`.
+`Queued` confirms local dispatch or transport admission, not remote execution. Broadcast
+results cover all attempted BaseApp and Ghost channels. `PartiallyQueued` means at least
+one channel accepted the call and another failed; the framework does not retry it.
+An empty `OtherClients` recipient set succeeds without sending. Independent client SDK
+RPC sends propagate transport errors instead of reporting success.
+Standalone Godot/desktop hosts can pass a `ClientSession` to `LoginClient`; it wires
+the session's Base/Cell send handlers and routes replies and disconnects to that session.
+Use a separate session for each simultaneous connection and register generated client
+definitions with `DefBootstrap.RegisterInto(session)`. The parameterless constructor
+uses `DefaultSession` for a single connection. Dispose detaches its send handlers.
+`ClientSession.CellReadyReceived` exposes the server's entity-specific route-ready notice;
+it is a notification, not a guarantee that a later call cannot fail. Native delivery
+accepts replies and state notifications only from the bound BaseApp channel, and rejects
+them while disconnect is pending.
+Transport loss completes the native disconnect on the next poll and reports reason 2
+once; pending login/auth callbacks receive failure, and session RPC waits complete as
+`ReceiverGone`. Unity's network manager also clears session waits on logout and destruction.
+Native callbacks may disconnect or destroy their context: cleanup waits until the
+active native call unwinds, further callbacks are suppressed on destroy, and recursive
+`AtlasNetPoll` returns `BUSY`. A queued disconnect rejects new sends before cleanup.
+Generated reply-style mailboxes always subscribe to the calling entity's lifetime token,
+in addition to an explicit cancellation token. Entity destruction and script reload cancel
+those waits even when the caller omits `ct`; cleanup detaches both token registrations.
+Reply-style dispatch reports synchronous script exceptions and asynchronous reply
+serialization failures as `RemoteException`, consuming the native reply handle.
+
 ## Profiling and Stress
 
 The `profile` preset enables Tracy instrumentation and profiling helpers. The default baseline runs 200 clients for 120 seconds and writes captures under `.tmp/prof/baseline/`.
+
+Linux builds keep Tracy's shared library and loader symlink beside the server so
+managed profiling resolves the same runtime as native code, without `LD_LIBRARY_PATH` overrides.
 
 ```bash
 tools\bin\build.bat profile

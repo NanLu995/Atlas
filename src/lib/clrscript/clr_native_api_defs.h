@@ -1,6 +1,8 @@
 #ifndef ATLAS_LIB_CLRSCRIPT_CLR_NATIVE_API_DEFS_H_
 #define ATLAS_LIB_CLRSCRIPT_CLR_NATIVE_API_DEFS_H_
 
+#include "coro/rpc_send_result.h"
+
 // Single source of truth for provider-backed Atlas* exports.
 // AtlasGetAbiVersion is separate because it returns a compile-time constant.
 
@@ -24,22 +26,22 @@
         (uint32_t entity_id, uint64_t elapsed_us), \
         atlas::GetNativeApiProvider().ReportScriptTick(entity_id, elapsed_us)) \
  \
-    X(void, SendClientRpc, \
+    X(atlas::RpcSendResult, SendClientRpc, \
         (uint32_t entity_id, uint32_t rpc_id, uint8_t target, \
          const uint8_t* payload, int32_t len, uint64_t trace_id), \
-        atlas::GetNativeApiProvider().SendClientRpc( \
+        return atlas::GetNativeApiProvider().SendClientRpc( \
             entity_id, rpc_id, static_cast<atlas::RpcTarget>(target), \
             reinterpret_cast<const std::byte*>(payload), len, trace_id)) \
-    X(void, SendCellRpc, \
+    X(atlas::RpcSendResult, SendCellRpc, \
         (uint32_t entity_id, uint32_t rpc_id, const uint8_t* payload, int32_t len, \
          uint64_t trace_id), \
-        atlas::GetNativeApiProvider().SendCellRpc( \
+        return atlas::GetNativeApiProvider().SendCellRpc( \
             entity_id, rpc_id, \
             reinterpret_cast<const std::byte*>(payload), len, trace_id)) \
-    X(void, SendBaseRpc, \
+    X(atlas::RpcSendResult, SendBaseRpc, \
         (uint32_t entity_id, uint32_t rpc_id, const uint8_t* payload, int32_t len, \
          uint64_t trace_id), \
-        atlas::GetNativeApiProvider().SendBaseRpc( \
+        return atlas::GetNativeApiProvider().SendBaseRpc( \
             entity_id, rpc_id, \
             reinterpret_cast<const std::byte*>(payload), len, trace_id)) \
     X(void, SendMovementInput, \
@@ -256,19 +258,21 @@
         atlas::GetNativeApiProvider().ReportClientEventSeqGap(entity_id, gap_delta)) \
  \
     X(uint64_t, CoroRegisterPending, \
-        (uint16_t reply_id, uint32_t request_id, int32_t timeout_ms, intptr_t managed_handle), \
+        (uint16_t reply_id, uint64_t request_id, int32_t timeout_ms, intptr_t managed_handle), \
         return atlas::GetNativeApiProvider().CoroRegisterPending( \
             reply_id, request_id, timeout_ms, managed_handle)) \
     X(void, CoroCancelPending, \
         (uint64_t handle), \
         atlas::GetNativeApiProvider().CoroCancelPending(handle)) \
+    X(uint64_t, CoroNextRequestId, (), \
+        return atlas::GetNativeApiProvider().CoroNextRequestId()) \
  \
     X(void, SendEntityRpcSuccess, \
-        (intptr_t reply_channel, uint32_t request_id, const std::byte* body, int32_t len), \
+        (intptr_t reply_channel, uint64_t request_id, const std::byte* body, int32_t len), \
         atlas::GetNativeApiProvider().SendEntityRpcSuccess( \
             reply_channel, request_id, body, len)) \
     X(void, SendEntityRpcFailure, \
-        (intptr_t reply_channel, uint32_t request_id, int32_t error_code, \
+        (intptr_t reply_channel, uint64_t request_id, int32_t error_code, \
          const char* msg, int32_t msg_len), \
         atlas::GetNativeApiProvider().SendEntityRpcFailure( \
             reply_channel, request_id, error_code, msg, msg_len))

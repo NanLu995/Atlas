@@ -24,6 +24,37 @@ atlas_dotnet_project(
   DEPENDS atlas_shared_dll atlas_client_dll atlas_client_desktop_dll
 )
 
+atlas_dotnet_project(
+  NAME atlas_rpc_fixture_base_dll
+  PROJECT_FILE Atlas.RpcFixture/Base/Atlas.RpcFixture.Base.csproj
+  ASSEMBLY_NAME Atlas.RpcFixture.Base.dll
+  DEPENDS atlas_runtime_dll
+  DEPLOY
+)
+
+atlas_dotnet_project(
+  NAME atlas_rpc_fixture_client_dll
+  PROJECT_FILE Atlas.RpcFixture/Client/Atlas.RpcFixture.Client.csproj
+  ASSEMBLY_NAME Atlas.RpcFixture.Client.dll
+  DEPENDS atlas_client_dll
+  DEPLOY
+)
+
+atlas_dotnet_project(
+  NAME atlas_rpc_fixture_cell_dll
+  PROJECT_FILE Atlas.RpcFixture/Cell/Atlas.RpcFixture.Cell.csproj
+  ASSEMBLY_NAME Atlas.RpcFixture.Cell.dll
+  DEPENDS atlas_runtime_dll
+  DEPLOY
+)
+
+foreach(_fixture IN ITEMS base client cell)
+  get_target_property(_fixture_output atlas_rpc_fixture_${_fixture}_dll DOTNET_ASSEMBLY)
+  add_custom_command(OUTPUT "${_fixture_output}" APPEND
+    DEPENDS Atlas.RpcFixture/Account.def Atlas.RpcFixture/Probe.def Atlas.RpcFixture/entity_ids.xml
+  )
+endforeach()
+
 foreach(_suite IN ITEMS Runtime Generators Client)
   add_test(NAME test_csharp_${_suite}
     COMMAND "${DOTNET_EXECUTABLE}" test

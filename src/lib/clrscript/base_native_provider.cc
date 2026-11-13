@@ -36,28 +36,31 @@ uint8_t BaseNativeProvider::GetProcessPrefix() {
   return 0;
 }
 
-void BaseNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
-                                       RpcTarget /*target*/, const std::byte* /*payload*/,
-                                       int32_t /*len*/, uint64_t /*trace_id*/) {
+RpcSendResult BaseNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
+                                                RpcTarget /*target*/, const std::byte* /*payload*/,
+                                                int32_t /*len*/, uint64_t /*trace_id*/) {
   ATLAS_LOG_ERROR("send_client_rpc() not supported on this process type (entity_id={})", entity_id);
+  return RpcSendResult::kInvalidTarget;
 }
 
-void BaseNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
-                                     const std::byte* /*payload*/, int32_t /*len*/,
-                                     uint64_t /*trace_id*/) {
+RpcSendResult BaseNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
+                                              const std::byte* /*payload*/, int32_t /*len*/,
+                                              uint64_t /*trace_id*/) {
   ATLAS_LOG_ERROR(
       "send_cell_rpc() not supported on this process type "
       "(entity_id={})",
       entity_id);
+  return RpcSendResult::kInvalidTarget;
 }
 
-void BaseNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
-                                     const std::byte* /*payload*/, int32_t /*len*/,
-                                     uint64_t /*trace_id*/) {
+RpcSendResult BaseNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t /*rpc_id*/,
+                                              const std::byte* /*payload*/, int32_t /*len*/,
+                                              uint64_t /*trace_id*/) {
   ATLAS_LOG_ERROR(
       "send_base_rpc() not supported on this process type "
       "(entity_id={})",
       entity_id);
+  return RpcSendResult::kInvalidTarget;
 }
 
 void BaseNativeProvider::SendMovementInput(uint32_t target_entity_id,
@@ -309,30 +312,33 @@ void BaseNativeProvider::ReportClientEventSeqGap(uint32_t entity_id, uint32_t /*
       entity_id);
 }
 
-void BaseNativeProvider::SendEntityRpcSuccess(intptr_t reply_channel, uint32_t request_id,
+void BaseNativeProvider::SendEntityRpcSuccess(intptr_t reply_channel, uint64_t request_id,
                                               const std::byte* body, int32_t len) {
-  if (reply_channel == 0) return;  // in-process call, no remote to reply to
-  auto* ch = reinterpret_cast<Channel*>(reply_channel);
+  if (!rpc_registry_ || len < 0 || (!body && len > 0)) return;
   std::span<const std::byte> body_span =
       (body != nullptr && len > 0) ? std::span<const std::byte>{body, static_cast<size_t>(len)}
                                    : std::span<const std::byte>{};
-  if (auto r = entity_rpc_reply::SendSuccess(*ch, request_id, body_span); !r) {
-    ATLAS_LOG_WARNING("SendEntityRpcSuccess: send failed (req={}, err={})", request_id,
-                      r.Error().Message());
-  }
+  rpc_registry_->SendReply(reply_channel, request_id, 0, body_span);
 }
 
-void BaseNativeProvider::SendEntityRpcFailure(intptr_t reply_channel, uint32_t request_id,
+void BaseNativeProvider::SendEntityRpcFailure(intptr_t reply_channel, uint64_t request_id,
                                               int32_t error_code, const char* msg,
                                               int32_t msg_len) {
-  if (reply_channel == 0) return;
-  auto* ch = reinterpret_cast<Channel*>(reply_channel);
+  if (!rpc_registry_ || msg_len < 0 || (!msg && msg_len > 0)) return;
   std::string_view msg_view{msg != nullptr ? msg : "",
                             msg_len > 0 ? static_cast<size_t>(msg_len) : 0};
-  if (auto r = entity_rpc_reply::SendFailure(*ch, request_id, error_code, msg_view); !r) {
-    ATLAS_LOG_WARNING("SendEntityRpcFailure: send failed (req={}, code={}, err={})", request_id,
-                      error_code, r.Error().Message());
-  }
+  BinaryWriter body;
+  body.WriteString(msg_view);
+  rpc_registry_->SendReply(reply_channel, request_id, error_code, body.Data());
+}
+
+auto BaseNativeProvider::CreateEntityRpcReply(uint32_t entity_id, uint32_t rpc_id,
+                                              std::span<const std::byte> payload, Channel* channel)
+    -> intptr_t {
+  if ((rpc_id & 0x80000000u) == 0 || !rpc_registry_) return 0;
+  BinaryReader reader(payload);
+  auto request_id = reader.Read<uint64_t>();
+  return request_id ? rpc_registry_->RegisterReply(entity_id, *request_id, channel) : 0;
 }
 
 }  // namespace atlas

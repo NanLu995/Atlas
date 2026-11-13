@@ -289,9 +289,10 @@ class Session {
         });
     (void)table.RegisterTypedHandler<baseapp::CellReady>(
         [this](const Address&, Channel*, const baseapp::CellReady& msg) { OnCellReady(msg); });
-    table.SetPreDispatchHook([this](MessageID id, std::span<const std::byte> payload) -> bool {
-      return OnRawMessage(id, payload);
-    });
+    table.SetPreDispatchHook(
+        [this](Channel*, MessageID id, std::span<const std::byte> payload) -> bool {
+          return OnRawMessage(id, payload);
+        });
   }
 
   void StartAttempt(TimePoint now) {

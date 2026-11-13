@@ -1,13 +1,14 @@
 using System;
 using Atlas.Client.Native;
 
+using Atlas.Protocol;
 namespace Atlas.Client;
 
 // Delegate slots wired by the host app at startup (Atlas.Client.Desktop or the Unity package).
 // Unset slots throw InvalidOperationException on call rather than silently dropping work.
 public static class ClientHost
 {
-    public delegate void SendRpcFn(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    public delegate RpcSendResult SendRpcFn(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                    ulong traceId);
     public delegate void RegisterEntityTypeFn(ReadOnlySpan<byte> data);
     public delegate void RegisterStructFn(ReadOnlySpan<byte> data);
@@ -43,12 +44,12 @@ public static class ClientHost
             $"ClientHost.{name} is not set; the host app must install its handler "
             + "at startup.");
 
-    internal static void SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    internal static RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                      ulong traceId)
         => Required(SendBaseRpcHandler, nameof(SendBaseRpcHandler))(
             entityId, rpcId, payload, traceId);
 
-    internal static void SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
+    internal static RpcSendResult SendCellRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
                                      ulong traceId)
         => Required(SendCellRpcHandler, nameof(SendCellRpcHandler))(
             entityId, rpcId, payload, traceId);

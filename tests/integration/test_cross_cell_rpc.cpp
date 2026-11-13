@@ -1,12 +1,3 @@
-// Cross-cell cell-method RPC: shooter cell holds a Ghost, target cell holds
-// the Real. The Ghost->Real wire is cellapp::InternalCellRpc (already used
-// by Base->Cell); CellAppNativeProvider::SendCellRpc looks up the Ghost,
-// pulls real_channel_, and sends. Receiver's OnInternalCellRpc dispatches
-// via dispatch_rpc_fn to C# DispatchCellRpc -> generated switch.
-//
-// Drives the end-to-end wire across two CellApps with a mock dispatch_rpc_fn
-// on the receiver so the test does not need a live CLR script host.
-
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -17,12 +8,14 @@
 
 #include <gtest/gtest.h>
 
+#include "baseapp/baseapp_messages.h"
 #include "cell.h"
 #include "cell_entity.h"
 #include "cellapp.h"
 #include "cellapp_messages.h"
 #include "cellapp_native_provider.h"
 #include "clrscript/native_api_provider.h"
+#include "coro/entity_rpc_reply.h"
 #include "math/vector3.h"
 #include "network/channel.h"
 #include "network/event_dispatcher.h"
@@ -94,6 +87,10 @@ struct Host {
     CallbackTable table{};
     table.dispatch_rpc = reinterpret_cast<void*>(&FakeDispatchRpc);
     app.NativeProvider()->SetNativeCallbacks(&table, sizeof(table));
+    network.InterfaceTable().SetPreDispatchHook(
+        [this](Channel* channel, MessageID id, std::span<const std::byte> payload) {
+          return app.GetRpcRegistry().TryDispatch(id, payload, channel);
+        });
   }
 };
 
@@ -101,6 +98,8 @@ auto PumpUntil(Host& a, Host& b, const std::function<bool()>& pred,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) -> bool {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
+    a.network.FlushDirtySendChannels();
+    b.network.FlushDirtySendChannels();
     a.dispatcher.ProcessOnce();
     b.dispatcher.ProcessOnce();
     if (pred()) return true;
@@ -170,6 +169,79 @@ TEST(CrossCellRpc, GhostSendCellRpcReachesRealsDispatcher) {
   EXPECT_EQ(dispatched[0].first_byte, static_cast<uint8_t>(amount));
 
   g_dispatched = nullptr;
+}
+
+TEST(CrossCellRpc, CellToBaseReplyUsesBoundChannelAndFullRequestId) {
+  Host caller("cell_caller");
+  Host receiver("base_receiver");
+  caller.StartServer();
+  auto receiver_addr = receiver.StartServer();
+  caller.WireProviderWithDispatch();
+  cellapp::CreateCellEntity create;
+  create.entity_id = 7100;
+  create.type_id = 1;
+  create.space_id = 1;
+  caller.app.OnCreateCellEntity({}, nullptr, create);
+  auto* entity = caller.app.FindRealEntity(7100);
+  ASSERT_NE(entity, nullptr);
+  entity->SetBaseAddr(receiver_addr);
+  constexpr uint64_t kRequestId = (uint64_t{1} << 32) + 9;
+  bool received = false;
+  ASSERT_TRUE(receiver.network.InterfaceTable().RegisterTypedHandler<baseapp::CellRpcForward>(
+      [&](const Address&, Channel* channel, const baseapp::CellRpcForward& message) {
+        received = true;
+        EXPECT_EQ(message.entity_id, 7100u);
+        EXPECT_EQ(message.rpc_id, 0x80C00001u);
+        BinaryReader reader(message.payload);
+        auto request_id = reader.Read<uint64_t>();
+        ASSERT_TRUE(request_id);
+        EXPECT_EQ(*request_id, kRequestId);
+        EXPECT_TRUE(entity_rpc_reply::SendSuccess(*channel, *request_id, {}));
+      }));
+  int replies = 0;
+  caller.app.GetRpcRegistry().RegisterPending(
+      EntityRpcReply::Descriptor().id, kRequestId, [&](std::span<const std::byte>) { ++replies; },
+      [](Error) { ADD_FAILURE(); }, Milliseconds(5000));
+  BinaryWriter request;
+  request.Write(kRequestId);
+  caller.app.NativeProvider()->SendBaseRpc(7100, 0x80C00001, request.Data().data(),
+                                           static_cast<int32_t>(request.Data().size()), 0);
+  EXPECT_TRUE(PumpUntil(caller, receiver, [&] { return replies == 1; }));
+  EXPECT_TRUE(received);
+  EXPECT_EQ(caller.app.GetRpcRegistry().PendingCount(), 0u);
+}
+
+TEST(CrossCellRpc, MissingRemoteCellReturnsReceiverGoneWithoutWaitingForTimeout) {
+  Host caller("missing_caller");
+  Host receiver("missing_receiver");
+  caller.StartServer();
+  auto receiver_addr = receiver.StartServer();
+  caller.WireProviderWithDispatch();
+  receiver.WireProviderWithDispatch();
+  auto channel = caller.network.ConnectRudp(receiver_addr);
+  ASSERT_TRUE(channel);
+  int error_code = 0;
+  caller.app.GetRpcRegistry().RegisterPending(
+      EntityRpcReply::Descriptor().id, 77,
+      [&](std::span<const std::byte> payload) {
+        BinaryReader reader(payload);
+        ASSERT_TRUE(reader.Read<uint64_t>());
+        auto error = reader.Read<int32_t>();
+        ASSERT_TRUE(error);
+        error_code = *error;
+      },
+      [](Error) { ADD_FAILURE(); }, Milliseconds(5000), *channel);
+  cellapp::InternalCellRpc message;
+  message.target_entity_id = 9999;
+  message.rpc_id = 0x80800001;
+  BinaryWriter request;
+  request.Write(uint64_t{77});
+  message.payload.assign(request.Data().begin(), request.Data().end());
+  ASSERT_TRUE((*channel)->SendMessage(message));
+  EXPECT_TRUE(PumpUntil(caller, receiver, [&] { return error_code != 0; }));
+  EXPECT_EQ(error_code, -4);
+  EXPECT_EQ(caller.app.GetRpcRegistry().PendingCount(), 0u);
+  EXPECT_EQ(receiver.app.GetRpcRegistry().ReplyCount(), 0u);
 }
 
 }  // namespace

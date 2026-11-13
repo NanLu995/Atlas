@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "coro/rpc_send_result.h"
+
 namespace atlas {
 
 enum class RpcTarget : uint8_t {
@@ -68,14 +70,14 @@ class INativeApiProvider {
 
   // Only CellAppNativeProvider supports kOthers / kAll; other hosts
   // log + no-op when target != kOwner.
-  virtual void SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
-                             const std::byte* payload, int32_t len, uint64_t trace_id) = 0;
+  virtual RpcSendResult SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
+                                      const std::byte* payload, int32_t len, uint64_t trace_id) = 0;
 
-  virtual void SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
-                           int32_t len, uint64_t trace_id) = 0;
+  virtual RpcSendResult SendCellRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                                    int32_t len, uint64_t trace_id) = 0;
 
-  virtual void SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
-                           int32_t len, uint64_t trace_id) = 0;
+  virtual RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
+                                    int32_t len, uint64_t trace_id) = 0;
 
   virtual void SendMovementInput(uint32_t, const std::byte*, int32_t) {}
   virtual void SendMovementCorrectionReport(uint32_t, uint32_t, uint32_t, float, uint16_t) {}
@@ -196,17 +198,18 @@ class INativeApiProvider {
   virtual void ReportClientEventSeqGap(uint32_t entity_id, uint32_t gap_delta) = 0;
 
   // 0 on failure; default no-op for hosts without PendingRpcRegistry.
-  virtual auto CoroRegisterPending(uint16_t /*reply_id*/, uint32_t /*request_id*/,
+  virtual auto CoroRegisterPending(uint16_t /*reply_id*/, uint64_t /*request_id*/,
                                    int32_t /*timeout_ms*/, intptr_t /*managed_handle*/)
       -> uint64_t {
     return 0;
   }
   virtual void CoroCancelPending(uint64_t /*handle*/) {}
+  virtual auto CoroNextRequestId() -> uint64_t { return 0; }
 
-  // reply_channel == 0 means in-process; drop and let the await time out.
-  virtual void SendEntityRpcSuccess(intptr_t /*reply_channel*/, uint32_t /*request_id*/,
+  // reply_channel is an opaque reply handle; zero means no reply is expected.
+  virtual void SendEntityRpcSuccess(intptr_t /*reply_channel*/, uint64_t /*request_id*/,
                                     const std::byte* /*body*/, int32_t /*len*/) {}
-  virtual void SendEntityRpcFailure(intptr_t /*reply_channel*/, uint32_t /*request_id*/,
+  virtual void SendEntityRpcFailure(intptr_t /*reply_channel*/, uint64_t /*request_id*/,
                                     int32_t /*error_code*/, const char* /*msg*/,
                                     int32_t /*msg_len*/) {}
 };

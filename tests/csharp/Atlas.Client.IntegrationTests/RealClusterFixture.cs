@@ -16,7 +16,9 @@ public sealed class RealClusterFixture : IDisposable
     public ushort LoginAppPort { get; private set; }
     public ushort BaseAppExternalPort { get; private set; }
 
-    public RealClusterFixture()
+    public RealClusterFixture() : this(null) { }
+
+    internal RealClusterFixture(string? assembly, string? cellAssembly = null)
     {
         var repoRoot = ResolveRepoRoot();
         var launcher = Path.Combine(repoRoot, "tools", "cluster_control", "test_cluster.py");
@@ -28,10 +30,6 @@ public sealed class RealClusterFixture : IDisposable
             StartInfo = new ProcessStartInfo
             {
                 FileName = ResolvePython(),
-                Arguments = $"\"{launcher}\" --db-backend " +
-                    (Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql") +
-                    " --build-dir \"" + Path.GetFileName(
-                        Environment.GetEnvironmentVariable("ATLAS_BIN_DIR") ?? "debug") + "\"",
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -40,6 +38,23 @@ public sealed class RealClusterFixture : IDisposable
                 WorkingDirectory = repoRoot,
             },
         };
+
+        var arguments = _launcher.StartInfo.ArgumentList;
+        arguments.Add(launcher);
+        arguments.Add("--db-backend");
+        arguments.Add(Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql");
+        arguments.Add("--build-dir");
+        arguments.Add(Path.GetFileName(Environment.GetEnvironmentVariable("ATLAS_BIN_DIR") ?? "debug"));
+        if (!string.IsNullOrEmpty(assembly))
+        {
+            arguments.Add("--base-assembly");
+            arguments.Add(assembly);
+        }
+        if (!string.IsNullOrEmpty(cellAssembly))
+        {
+            arguments.Add("--cell-assembly");
+            arguments.Add(cellAssembly);
+        }
 
         // Async stderr drain so a chatty launcher can't deadlock on a full
         // OS pipe; the buffer feeds diagnostics on the timeout path below.
