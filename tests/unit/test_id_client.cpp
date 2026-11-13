@@ -115,3 +115,23 @@ TEST(IDClient, InvalidRangeIsIgnored) {
   client.AddIds(kInvalidEntityID, 5);  // invalid: start == 0
   EXPECT_EQ(client.Available(), 0u);
 }
+
+TEST(IDClient, DuplicateAndOverlappingReservationsCannotReuseConsumedIds) {
+  IDClient client;
+  client.AddIds(100, 199);
+  for (EntityID id = 100; id < 110; ++id) EXPECT_EQ(client.AllocateId(), id);
+  client.AddIds(100, 199);
+  client.AddIds(199, 220);
+  client.AddIds(50, 99);
+  EXPECT_EQ(client.Available(), 90u);
+  client.AddIds(300, 399);
+  EXPECT_EQ(client.Available(), 190u);
+  EXPECT_EQ(client.AllocateId(), 110u);
+}
+
+TEST(IDClient, ClientLocalIdsCannotEnterServerCache) {
+  IDClient client;
+  client.AddIds(kFirstLocalEntityID, kFirstLocalEntityID + 10);
+  client.AddIds(kFirstLocalEntityID - 1, kFirstLocalEntityID);
+  EXPECT_EQ(client.Available(), 0u);
+}

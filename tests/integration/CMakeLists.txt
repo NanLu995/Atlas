@@ -26,9 +26,19 @@ atlas_add_test(NAME test_dbapp_login_flow
 
 atlas_add_test(NAME test_dbapp_checkout_cleanup
   SOURCES test_dbapp_checkout_cleanup.cpp
-  DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform
+  DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform sqlite3
   LABEL integration
 )
+target_compile_definitions(test_dbapp_checkout_cleanup
+  PRIVATE ATLAS_TEST_MYSQL_ENABLED=$<BOOL:${ATLAS_DB_MYSQL}>)
+if(ATLAS_DB_MYSQL)
+  add_executable(dbapp_test_process dbapp_test_process.cpp)
+  target_link_libraries(dbapp_test_process PRIVATE atlas_dbapp_lib atlas_platform)
+  atlas_set_output_dir("" dbapp_test_process)
+  atlas_deploy_clr_runtime(dbapp_test_process)
+  atlas_deploy_db_plugins(dbapp_test_process)
+  add_dependencies(test_dbapp_checkout_cleanup dbapp_test_process)
+endif()
 
 atlas_add_test(NAME test_login_flow
   SOURCES test_login_flow.cpp
@@ -86,6 +96,18 @@ atlas_add_test(NAME test_cellappmgr_process
   DEPS atlas_cellappmgr_messages atlas_server atlas_network atlas_platform
   LABEL integration
 )
+
+if(WIN32)
+  add_dependencies(test_login_flow machined atlas_dbapp atlas_baseappmgr atlas_baseapp atlas_loginapp)
+  add_dependencies(test_cellapp_integration machined atlas_cellappmgr atlas_cellapp)
+  add_dependencies(test_cellappmgr_process machined atlas_cellappmgr atlas_reviver)
+  set_tests_properties(test_login_flow PROPERTIES
+    ENVIRONMENT "ATLAS_RUNTIME_CONFIG_RLOC=${CMAKE_BINARY_DIR}/runtime/atlas_server.runtimeconfig.json"
+  )
+  if(TARGET atlas_runtime_dll_deploy)
+    add_dependencies(test_login_flow atlas_runtime_dll_deploy)
+  endif()
+endif()
 
 atlas_add_test(NAME test_distributed_space
   SOURCES test_distributed_space.cpp

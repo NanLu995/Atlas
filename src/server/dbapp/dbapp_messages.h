@@ -1,6 +1,7 @@
 #ifndef ATLAS_SERVER_DBAPP_DBAPP_MESSAGES_H_
 #define ATLAS_SERVER_DBAPP_DBAPP_MESSAGES_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -28,9 +29,11 @@ enum class CheckoutStatus : uint8_t {
 };
 
 struct WriteEntity {
+  std::array<std::byte, 16> operation_id{};
   WriteFlags flags{WriteFlags::kNone};
   uint16_t type_id{0};
   DatabaseID dbid{kInvalidDBID};
+  CheckoutInfo owner{};
   uint32_t entity_id{0};
   uint32_t request_id{0};
   uint32_t shard_table_version{0};
@@ -46,9 +49,16 @@ struct WriteEntity {
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
     w.Write(static_cast<uint8_t>(flags));
     w.Write(type_id);
     w.Write(dbid);
+    w.Write(owner.base_addr.Ip());
+    w.Write(owner.base_addr.Port());
+    w.Write(owner.app_id);
+    w.Write(owner.entity_id);
+    w.Write(owner.ownership_version);
+    w.Write(owner.process_instance);
     w.Write(entity_id);
     w.Write(request_id);
     w.Write(shard_table_version);
@@ -58,22 +68,32 @@ struct WriteEntity {
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<WriteEntity> {
+    auto operation = r.ReadBytes(16);
     auto f = r.Read<uint8_t>();
     auto ti = r.Read<uint16_t>();
     auto db = r.Read<int64_t>();
+    auto ip = r.Read<uint32_t>();
+    auto port = r.Read<uint16_t>();
+    auto app = r.Read<uint32_t>();
+    auto entity = r.Read<uint32_t>();
+    auto lease = r.Read<uint64_t>();
+    auto instance = r.Read<uint64_t>();
     auto eid = r.Read<uint32_t>();
     auto rid = r.Read<uint32_t>();
     auto version = r.Read<uint32_t>();
     auto id_str = r.ReadString();
     auto blob_sz = r.Read<uint32_t>();
-    if (!f || !ti || !db || !eid || !rid || !version || !id_str || !blob_sz)
+    if (!ip || !port || !app || !entity || !lease || !instance || !operation || !f || !ti || !db ||
+        !eid || !rid || !version || !id_str || !blob_sz)
       return Error{ErrorCode::kInvalidArgument, "WriteEntity: truncated"};
     auto blob_span = r.ReadBytes(*blob_sz);
     if (!blob_span) return Error{ErrorCode::kInvalidArgument, "WriteEntity: blob truncated"};
     WriteEntity msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
     msg.flags = static_cast<WriteFlags>(*f);
     msg.type_id = *ti;
     msg.dbid = *db;
+    msg.owner = CheckoutInfo{Address(*ip, *port), *app, *entity, *lease, *instance};
     msg.entity_id = *eid;
     msg.request_id = *rid;
     msg.shard_table_version = *version;
@@ -85,9 +105,12 @@ struct WriteEntity {
 static_assert(NetworkMessage<WriteEntity>);
 
 struct WriteEntityAck {
+  std::array<std::byte, 16> operation_id{};
   uint32_t request_id{0};
   bool success{false};
+  DatabaseErrorKind error_kind{DatabaseErrorKind::kNone};
   DatabaseID dbid{kInvalidDBID};
+  CheckoutInfo owner{};
   uint32_t current_shard_table_version{0};
   std::string error;
 
@@ -102,25 +125,49 @@ struct WriteEntityAck {
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
     w.Write(request_id);
     w.Write(static_cast<uint8_t>(success ? 1 : 0));
+    w.Write(static_cast<uint8_t>(error_kind));
     w.Write(dbid);
+    w.Write(owner.base_addr.Ip());
+    w.Write(owner.base_addr.Port());
+    w.Write(owner.app_id);
+    w.Write(owner.entity_id);
+    w.Write(owner.ownership_version);
+    w.Write(owner.process_instance);
     w.Write(current_shard_table_version);
     w.WriteString(error);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<WriteEntityAck> {
+    auto operation = r.ReadBytes(16);
     auto rid = r.Read<uint32_t>();
     auto ok = r.Read<uint8_t>();
+    auto kind = r.Read<uint8_t>();
     auto db = r.Read<int64_t>();
+    auto ip = r.Read<uint32_t>();
+    auto port = r.Read<uint16_t>();
+    auto app = r.Read<uint32_t>();
+    auto entity = r.Read<uint32_t>();
+    auto lease = r.Read<uint64_t>();
+    auto instance = r.Read<uint64_t>();
     auto version = r.Read<uint32_t>();
     auto err = r.ReadString();
-    if (!rid || !ok || !db || !version || !err)
+    if (!ip || !port || !app || !entity || !lease || !instance || !operation || !rid || !ok ||
+        !kind || !db || !version || !err)
       return Error{ErrorCode::kInvalidArgument, "WriteEntityAck: truncated"};
+    if (*ok > 1 || *kind > static_cast<uint8_t>(DatabaseErrorKind::kOwnershipConflict) ||
+        (*ok != 0 && *kind != 0)) {
+      return Error{ErrorCode::kInvalidArgument, "WriteEntityAck: invalid result"};
+    }
     WriteEntityAck msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
     msg.request_id = *rid;
     msg.success = *ok != 0;
+    msg.error_kind = static_cast<DatabaseErrorKind>(*kind);
     msg.dbid = *db;
+    msg.owner = CheckoutInfo{Address(*ip, *port), *app, *entity, *lease, *instance};
     msg.current_shard_table_version = *version;
     msg.error = std::move(*err);
     return msg;
@@ -129,6 +176,7 @@ struct WriteEntityAck {
 static_assert(NetworkMessage<WriteEntityAck>);
 
 struct CheckoutEntity {
+  std::array<std::byte, 16> operation_id{};
   LoadMode mode{LoadMode::kByDbid};
   uint16_t type_id{0};
   DatabaseID dbid{kInvalidDBID};
@@ -137,6 +185,8 @@ struct CheckoutEntity {
   uint32_t request_id{0};
   uint32_t shard_table_version{0};
   Address owner_addr;
+  uint32_t owner_app_id{0};
+  uint64_t owner_process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::DBApp::kCheckoutEntity),
@@ -149,6 +199,7 @@ struct CheckoutEntity {
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
     w.Write(static_cast<uint8_t>(mode));
     w.Write(type_id);
     w.Write(dbid);
@@ -158,9 +209,12 @@ struct CheckoutEntity {
     w.Write(shard_table_version);
     w.Write(owner_addr.Ip());
     w.Write(owner_addr.Port());
+    w.Write(owner_app_id);
+    w.Write(owner_process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CheckoutEntity> {
+    auto operation = r.ReadBytes(16);
     auto m = r.Read<uint8_t>();
     auto ti = r.Read<uint16_t>();
     auto db = r.Read<int64_t>();
@@ -170,9 +224,12 @@ struct CheckoutEntity {
     auto version = r.Read<uint32_t>();
     auto oip = r.Read<uint32_t>();
     auto oport = r.Read<uint16_t>();
-    if (!m || !ti || !db || !id_str || !eid || !rid || !version || !oip || !oport)
+    auto app = r.Read<uint32_t>();
+    if (!operation || !app || !m || !ti || !db || !id_str || !eid || !rid || !version || !oip ||
+        !oport)
       return Error{ErrorCode::kInvalidArgument, "CheckoutEntity: truncated"};
     CheckoutEntity msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
     msg.mode = static_cast<LoadMode>(*m);
     msg.type_id = *ti;
     msg.dbid = *db;
@@ -181,12 +238,19 @@ struct CheckoutEntity {
     msg.request_id = *rid;
     msg.shard_table_version = *version;
     msg.owner_addr = Address(*oip, *oport);
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.owner_app_id = *app;
+    msg.owner_process_instance = *instance;
     return msg;
   }
 };
 static_assert(NetworkMessage<CheckoutEntity>);
 
 struct CheckoutEntityAck {
+  std::array<std::byte, 16> operation_id{};
+  DatabaseErrorKind error_kind{DatabaseErrorKind::kNone};
+  uint64_t checkout_version{0};
   uint32_t request_id{0};
   CheckoutStatus status{CheckoutStatus::kSuccess};
   DatabaseID dbid{kInvalidDBID};
@@ -194,6 +258,7 @@ struct CheckoutEntityAck {
   Address holder_addr;
   uint32_t holder_app_id{0};
   uint32_t holder_entity_id{0};
+  uint64_t holder_process_instance{0};
   uint32_t current_shard_table_version{0};
   std::string error;
 
@@ -208,6 +273,10 @@ struct CheckoutEntityAck {
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
+    w.Write(static_cast<uint8_t>(error_kind));
+    w.Write(checkout_version);
+    w.Write(holder_process_instance);
     w.Write(request_id);
     w.Write(static_cast<uint8_t>(status));
     w.Write(dbid);
@@ -222,12 +291,21 @@ struct CheckoutEntityAck {
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CheckoutEntityAck> {
+    auto operation = r.ReadBytes(16);
+    auto kind = r.Read<uint8_t>();
+    auto lease = r.Read<uint64_t>();
+    auto instance = r.Read<uint64_t>();
     auto rid = r.Read<uint32_t>();
     auto st = r.Read<uint8_t>();
     auto db = r.Read<int64_t>();
     auto blob_sz = r.Read<uint32_t>();
-    if (!rid || !st || !db || !blob_sz)
+    if (!operation || !kind || !lease || !instance || !rid || !st || !db || !blob_sz)
       return Error{ErrorCode::kInvalidArgument, "CheckoutEntityAck: truncated"};
+    if (*kind > static_cast<uint8_t>(DatabaseErrorKind::kOwnershipConflict) ||
+        *st > static_cast<uint8_t>(CheckoutStatus::kDbError) ||
+        (*st == static_cast<uint8_t>(CheckoutStatus::kSuccess) &&
+         (*kind != static_cast<uint8_t>(DatabaseErrorKind::kNone) || *lease == 0 || *db <= 0)))
+      return Error{ErrorCode::kInvalidArgument, "CheckoutEntityAck: invalid result"};
     auto blob_span = r.ReadBytes(*blob_sz);
     auto h_ip = r.Read<uint32_t>();
     auto h_port = r.Read<uint16_t>();
@@ -238,6 +316,10 @@ struct CheckoutEntityAck {
     if (!blob_span || !h_ip || !h_port || !h_app || !h_eid || !version || !err)
       return Error{ErrorCode::kInvalidArgument, "CheckoutEntityAck: field truncated"};
     CheckoutEntityAck msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
+    msg.error_kind = static_cast<DatabaseErrorKind>(*kind);
+    msg.checkout_version = *lease;
+    msg.holder_process_instance = *instance;
     msg.request_id = *rid;
     msg.status = static_cast<CheckoutStatus>(*st);
     msg.dbid = *db;
@@ -253,37 +335,88 @@ struct CheckoutEntityAck {
 static_assert(NetworkMessage<CheckoutEntityAck>);
 
 struct CheckinEntity {
+  uint32_t request_id{0};
   uint16_t type_id{0};
   DatabaseID dbid{kInvalidDBID};
+  CheckoutInfo owner{};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::DBApp::kCheckinEntity),
                                    "dbapp::CheckinEntity",
                                    MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(uint16_t) + sizeof(int64_t)),
+                                   static_cast<int>(sizeof(uint16_t) + sizeof(int64_t) + 34),
                                    MessageReliability::kReliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.Write(request_id);
     w.Write(type_id);
     w.Write(dbid);
+    w.Write(owner.base_addr.Ip());
+    w.Write(owner.base_addr.Port());
+    w.Write(owner.app_id);
+    w.Write(owner.entity_id);
+    w.Write(owner.ownership_version);
+    w.Write(owner.process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CheckinEntity> {
+    auto request = r.Read<uint32_t>();
     auto ti = r.Read<uint16_t>();
     auto db = r.Read<int64_t>();
-    if (!ti || !db) return Error{ErrorCode::kInvalidArgument, "CheckinEntity: truncated"};
+    auto ip = r.Read<uint32_t>();
+    auto port = r.Read<uint16_t>();
+    auto app = r.Read<uint32_t>();
+    auto entity = r.Read<uint32_t>();
+    auto lease = r.Read<uint64_t>();
+    auto instance = r.Read<uint64_t>();
+    if (!request || !ip || !port || !app || !entity || !lease || !instance || !ti || !db)
+      return Error{ErrorCode::kInvalidArgument, "CheckinEntity: truncated"};
     CheckinEntity msg;
+    msg.request_id = *request;
     msg.type_id = *ti;
     msg.dbid = *db;
+    msg.owner = CheckoutInfo{Address(*ip, *port), *app, *entity, *lease, *instance};
     return msg;
   }
 };
 static_assert(NetworkMessage<CheckinEntity>);
 
+struct CheckinEntityAck {
+  CheckinEntity request;
+  bool success{false};
+  std::string error;
+
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc kDesc{msg_id::Id(msg_id::DBApp::kCheckinEntityAck),
+                                   "dbapp::CheckinEntityAck",
+                                   MessageLengthStyle::kVariable,
+                                   -1,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
+    return kDesc;
+  }
+  void Serialize(BinaryWriter& w) const {
+    request.Serialize(w);
+    w.Write(static_cast<uint8_t>(success));
+    w.WriteString(error);
+  }
+  static auto Deserialize(BinaryReader& r) -> Result<CheckinEntityAck> {
+    auto request = CheckinEntity::Deserialize(r);
+    auto success = r.Read<uint8_t>();
+    auto error = r.ReadString();
+    if (!request || !success || *success > 1 || !error)
+      return Error{ErrorCode::kInvalidArgument, "CheckinEntityAck: invalid or truncated"};
+    return CheckinEntityAck{std::move(*request), *success != 0, std::move(*error)};
+  }
+};
+static_assert(NetworkMessage<CheckinEntityAck>);
+
 struct DeleteEntity {
+  std::array<std::byte, 16> operation_id{};
+  CheckoutInfo owner{};
   uint16_t type_id{0};
   DatabaseID dbid{kInvalidDBID};
   uint32_t request_id{0};
@@ -293,24 +426,41 @@ struct DeleteEntity {
         msg_id::Id(msg_id::DBApp::kDeleteEntity),
         "dbapp::DeleteEntity",
         MessageLengthStyle::kFixed,
-        static_cast<int>(sizeof(uint16_t) + sizeof(int64_t) + sizeof(uint32_t)),
+        static_cast<int>(sizeof(uint16_t) + sizeof(int64_t) + sizeof(uint32_t) + 46),
         MessageReliability::kReliable,
         MessageUrgency::kImmediate};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
+    w.Write(owner.base_addr.Ip());
+    w.Write(owner.base_addr.Port());
+    w.Write(owner.app_id);
+    w.Write(owner.entity_id);
+    w.Write(owner.ownership_version);
+    w.Write(owner.process_instance);
     w.Write(type_id);
     w.Write(dbid);
     w.Write(request_id);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<DeleteEntity> {
+    auto operation = r.ReadBytes(16);
+    auto ip = r.Read<uint32_t>();
+    auto port = r.Read<uint16_t>();
+    auto app = r.Read<uint32_t>();
+    auto entity = r.Read<uint32_t>();
+    auto lease = r.Read<uint64_t>();
+    auto instance = r.Read<uint64_t>();
     auto ti = r.Read<uint16_t>();
     auto db = r.Read<int64_t>();
     auto rid = r.Read<uint32_t>();
-    if (!ti || !db || !rid) return Error{ErrorCode::kInvalidArgument, "DeleteEntity: truncated"};
+    if (!operation || !ip || !port || !app || !entity || !lease || !instance || !ti || !db || !rid)
+      return Error{ErrorCode::kInvalidArgument, "DeleteEntity: truncated"};
     DeleteEntity msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
+    msg.owner = CheckoutInfo{Address(*ip, *port), *app, *entity, *lease, *instance};
     msg.type_id = *ti;
     msg.dbid = *db;
     msg.request_id = *rid;
@@ -429,42 +579,69 @@ static_assert(NetworkMessage<LookupEntityAck>);
 // Cancel a previously issued CheckoutEntity request that is no longer needed.
 
 struct AbortCheckout {
+  std::array<std::byte, 16> operation_id{};
   uint32_t request_id{0};
   uint16_t type_id{0};
   DatabaseID dbid{kInvalidDBID};
+  LoadMode mode{LoadMode::kByDbid};
+  std::string identifier;
+  uint32_t entity_id{0};
+  uint32_t owner_app_id{0};
+  uint64_t owner_process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{
-        msg_id::Id(msg_id::DBApp::kAbortCheckout),
-        "dbapp::AbortCheckout",
-        MessageLengthStyle::kFixed,
-        static_cast<int>(sizeof(uint32_t) + sizeof(uint16_t) + sizeof(int64_t)),
-        MessageReliability::kReliable,
-        MessageUrgency::kImmediate};
+    static const MessageDesc kDesc{msg_id::Id(msg_id::DBApp::kAbortCheckout),
+                                   "dbapp::AbortCheckout",
+                                   MessageLengthStyle::kVariable,
+                                   -1,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
     w.Write(request_id);
     w.Write(type_id);
     w.Write(dbid);
+    w.Write(static_cast<uint8_t>(mode));
+    w.WriteString(identifier);
+    w.Write(entity_id);
+    w.Write(owner_app_id);
+    w.Write(owner_process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<AbortCheckout> {
+    auto operation = r.ReadBytes(16);
     auto rid = r.Read<uint32_t>();
     auto ti = r.Read<uint16_t>();
     auto db = r.Read<int64_t>();
-    if (!rid || !ti || !db) return Error{ErrorCode::kInvalidArgument, "AbortCheckout: truncated"};
+    auto mode = r.Read<uint8_t>();
+    auto identifier = r.ReadString();
+    auto entity = r.Read<uint32_t>();
+    auto app = r.Read<uint32_t>();
+    if (!operation || !rid || !ti || !db || !mode || !identifier || !entity || !app ||
+        *mode > static_cast<uint8_t>(LoadMode::kByName))
+      return Error{ErrorCode::kInvalidArgument, "AbortCheckout: truncated"};
     AbortCheckout msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
     msg.request_id = *rid;
     msg.type_id = *ti;
     msg.dbid = *db;
+    msg.mode = static_cast<LoadMode>(*mode);
+    msg.identifier = std::move(*identifier);
+    msg.entity_id = *entity;
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.owner_app_id = *app;
+    msg.owner_process_instance = *instance;
     return msg;
   }
 };
 static_assert(NetworkMessage<AbortCheckout>);
 
 struct AbortCheckoutAck {
+  std::array<std::byte, 16> operation_id{};
   uint32_t request_id{0};
   bool success{false};
 
@@ -472,22 +649,26 @@ struct AbortCheckoutAck {
     static const MessageDesc kDesc{msg_id::Id(msg_id::DBApp::kAbortCheckoutAck),
                                    "dbapp::AbortCheckoutAck",
                                    MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(uint32_t) + sizeof(uint8_t)),
+                                   static_cast<int>(16 + sizeof(uint32_t) + sizeof(uint8_t)),
                                    MessageReliability::kReliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.WriteBytes(operation_id);
     w.Write(request_id);
     w.Write(static_cast<uint8_t>(success ? 1 : 0));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<AbortCheckoutAck> {
+    auto operation = r.ReadBytes(16);
     auto rid = r.Read<uint32_t>();
     auto ok = r.Read<uint8_t>();
-    if (!rid || !ok) return Error{ErrorCode::kInvalidArgument, "AbortCheckoutAck: truncated"};
+    if (!operation || !rid || !ok || *ok > 1)
+      return Error{ErrorCode::kInvalidArgument, "AbortCheckoutAck: truncated or invalid"};
     AbortCheckoutAck msg;
+    std::copy(operation->begin(), operation->end(), msg.operation_id.begin());
     msg.request_id = *rid;
     msg.success = (*ok != 0);
     return msg;

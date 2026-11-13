@@ -3,6 +3,7 @@
 #include <mysql.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +35,14 @@ MysqlDatabase::~MysqlDatabase() {
 
 auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistry& entity_defs)
     -> Result<void> {
+  if (started_) return Error{ErrorCode::kAlreadyExists, "MysqlDatabase is already started"};
+  if (config.mysql_host.empty() || config.mysql_user.empty() || config.mysql_password.empty() ||
+      config.mysql_database.empty() || config.mysql_port == 0 || config.mysql_pool_size <= 0) {
+    return Error{ErrorCode::kInvalidArgument,
+                 "MySQL requires host, port, user, password, database and a positive pool size; "
+                 "configure MySQL explicitly; SQLite fallback is disabled"};
+  }
+  stopping_ = false;
   entity_defs_ = &entity_defs;
   config_ = config;
 
@@ -67,6 +76,7 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
 }
 
 void MysqlDatabase::Shutdown() {
+  stopping_ = true;
   for (auto& w : workers_) {
     {
       std::lock_guard<std::mutex> lock(w->mutex);
@@ -78,6 +88,12 @@ void MysqlDatabase::Shutdown() {
     if (w->thread.joinable()) w->thread.join();
   }
   workers_.clear();
+
+  for (;;) {
+    ProcessResults();
+    std::lock_guard<std::mutex> lock(results_mutex_);
+    if (results_.empty()) break;
+  }
 
   if (conn_ != nullptr) {
     mysql_close(conn_);
@@ -97,8 +113,12 @@ auto MysqlDatabase::OpenConnection() const -> st_mysql* {
   unsigned int connect_timeout = 10;
   mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
   mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
-  bool reconnect = true;  // let the connector recover an idle-dropped link
+  // Reconnecting within a transaction could turn a rolled-back COMMIT into success.
+  bool reconnect = false;
   mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+  unsigned int query_timeout = 5;
+  mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &query_timeout);
+  mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT, &query_timeout);
 
   if (mysql_real_connect(conn, config_.mysql_host.c_str(), config_.mysql_user.c_str(),
                          config_.mysql_password.c_str(), config_.mysql_database.c_str(),
@@ -127,6 +147,8 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
                           "checkout_port INT UNSIGNED NOT NULL DEFAULT 0,"
                           "checkout_app_id INT UNSIGNED NOT NULL DEFAULT 0,"
                           "checkout_eid INT UNSIGNED NOT NULL DEFAULT 0,"
+                          "checkout_version BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+                          "checkout_instance BIGINT UNSIGNED NOT NULL DEFAULT 0,"
                           "created_at_ms BIGINT NOT NULL DEFAULT 0,"
                           "updated_at_ms BIGINT NOT NULL DEFAULT 0,"
                           "PRIMARY KEY (dbid),"
@@ -136,6 +158,8 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
                           "KEY idx_entities_checkout_addr (checked_out, checkout_ip, checkout_port)"
                           ") ENGINE=InnoDB DEFAULT CHARSET=binary");
   if (!entities) return entities.Error();
+  auto columns = ExecSql(conn, "SELECT checkout_instance FROM entities LIMIT 0");
+  if (!columns) return columns.Error();
 
   auto meta = ExecSql(conn,
                       "CREATE TABLE IF NOT EXISTS meta ("
@@ -160,46 +184,92 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
                          ") ENGINE=InnoDB DEFAULT CHARSET=binary");
   if (!counter) return counter.Error();
 
-  auto seed = ExecSql(conn, "INSERT IGNORE INTO atlas_entity_id_counter(id, next_id) VALUES(1, 1)");
-  if (!seed) return seed.Error();
+  auto versions = ExecSql(conn,
+                          "CREATE TABLE IF NOT EXISTS atlas_checkout_versions ("
+                          "dbid BIGINT UNSIGNED NOT NULL, type_id INT UNSIGNED NOT NULL,"
+                          "version BIGINT UNSIGNED NOT NULL, PRIMARY KEY (dbid, type_id)"
+                          ") ENGINE=InnoDB DEFAULT CHARSET=binary");
+  if (!versions) return versions.Error();
 
-  return {};
+  auto processes =
+      ExecSql(conn,
+              "CREATE TABLE IF NOT EXISTS atlas_checkout_processes ("
+              "base_ip INT UNSIGNED NOT NULL, base_port INT UNSIGNED NOT NULL,"
+              "instance BIGINT UNSIGNED NOT NULL, retired TINYINT NOT NULL DEFAULT 0,"
+              "PRIMARY KEY(base_ip, base_port, instance)) ENGINE=InnoDB DEFAULT CHARSET=binary");
+  if (!processes) return processes.Error();
+
+  auto receipts = ExecSql(conn,
+                          "CREATE TABLE IF NOT EXISTS atlas_write_receipts ("
+                          "operation_id BINARY(16) NOT NULL PRIMARY KEY,"
+                          "request_hash BINARY(32) NOT NULL,"
+                          "result_dbid BIGINT UNSIGNED NULL,"
+                          "result_checkout_version BIGINT UNSIGNED NOT NULL DEFAULT 0"
+                          ") ENGINE=InnoDB DEFAULT CHARSET=binary");
+  if (!receipts) return receipts.Error();
+
+  auto begin = BeginTxn(conn);
+  if (!begin) return begin.Error();
+  // Serialize seeding before the meta read and counter insert acquire opposite locks.
+  auto serialized =
+      ExecSql(conn, "UPDATE meta SET `value` = `value` WHERE `key` = 'schema_version'");
+  if (!serialized) {
+    Rollback(conn);
+    return serialized.Error();
+  }
+  auto seed = ExecSql(conn,
+                      "INSERT IGNORE INTO atlas_entity_id_counter(id, next_id) "
+                      "SELECT 1, 1 WHERE NOT EXISTS "
+                      "(SELECT 1 FROM meta WHERE `key` = 'entity_id_counter_initialized')");
+  if (seed) {
+    seed = ExecSql(conn,
+                   "INSERT IGNORE INTO meta(`key`, `value`) "
+                   "VALUES('entity_id_counter_initialized', '1')");
+  }
+  if (!seed) {
+    Rollback(conn);
+    return seed.Error();
+  }
+  auto committed = Commit(conn);
+  if (!committed) Rollback(conn);
+  return committed;
 }
 
 // ── worker pool ─────────────────────────────────────────────────────────────
 
 void MysqlDatabase::WorkerLoop(Worker& worker) {
-  st_mysql* conn = OpenConnection();
-  int backoff_ms = 100;
-  while (conn == nullptr) {
-    {
-      std::unique_lock<std::mutex> lock(worker.mutex);
-      if (worker.stop) return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-    backoff_ms = std::min(backoff_ms * 2, 5000);
-    conn = OpenConnection();
-  }
-
+  st_mysql* conn = nullptr;
   for (;;) {
     std::function<void(st_mysql*)> job;
     {
       std::unique_lock<std::mutex> lock(worker.mutex);
       worker.cv.wait(lock, [&] { return worker.stop || !worker.jobs.empty(); });
-      if (worker.stop) break;
+      if (worker.stop && worker.jobs.empty()) break;
       job = std::move(worker.jobs.front());
       worker.jobs.pop_front();
     }
-    job(conn);  // MYSQL_OPT_RECONNECT recovers a dropped link on the next query
+    RefreshConnection(conn);
+    job(conn);
   }
 
-  mysql_close(conn);
+  if (conn != nullptr) mysql_close(conn);
+}
+
+void MysqlDatabase::RefreshConnection(st_mysql*& conn) const {
+  if (conn == nullptr || mysql_errno(conn) != 0) {
+    if (conn != nullptr) mysql_close(conn);
+    conn = OpenConnection();
+  }
 }
 
 void MysqlDatabase::EnqueueForEntity(uint16_t type_id, uint64_t key,
                                      std::function<void(st_mysql*)> job) {
+  if (stopping_) {
+    job(nullptr);
+    return;
+  }
   if (workers_.empty()) {
-    job(conn_);  // no pool (pre-Startup / post-Shutdown fallback)
+    job(conn_);
     return;
   }
   const std::size_t idx =
@@ -281,8 +351,11 @@ auto MysqlDatabase::ReadRow(char** row, const unsigned long* len) -> EntityRow {
   if (row[4] != nullptr) r.password_hash.assign(row[4], len[4]);
   r.auto_load = row[5] != nullptr && std::strtol(row[5], nullptr, 10) != 0;
   const bool checked_out = row[6] != nullptr && std::strtol(row[6], nullptr, 10) != 0;
+  r.checkout_version = std::strtoull(row[11], nullptr, 10);
   if (checked_out) {
     CheckoutInfo info;
+    info.ownership_version = r.checkout_version;
+    info.process_instance = std::strtoull(row[12], nullptr, 10);
     info.base_addr = Address(static_cast<uint32_t>(std::strtoul(row[7], nullptr, 10)),
                              static_cast<uint16_t>(std::strtoul(row[8], nullptr, 10)));
     info.app_id = static_cast<uint32_t>(std::strtoul(row[9], nullptr, 10));
@@ -292,22 +365,24 @@ auto MysqlDatabase::ReadRow(char** row, const unsigned long* len) -> EntityRow {
   return r;
 }
 
-auto MysqlDatabase::FetchByDbid(st_mysql* conn, DatabaseID dbid, uint16_t type_id)
+auto MysqlDatabase::FetchByDbid(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool for_update)
     -> Result<EntityRow> {
   return QueryRow(
       conn, std::format("SELECT dbid, type_id, `blob`, identifier, password_hash, auto_load, "
-                        "checked_out, checkout_ip, checkout_port, checkout_app_id, checkout_eid "
-                        "FROM entities WHERE dbid = {} AND type_id = {} LIMIT 1",
-                        static_cast<uint64_t>(dbid), type_id));
+                        "checked_out, checkout_ip, checkout_port, checkout_app_id, checkout_eid, "
+                        "checkout_version, checkout_instance "
+                        "FROM entities WHERE dbid = {} AND type_id = {} LIMIT 1 {}",
+                        static_cast<uint64_t>(dbid), type_id, for_update ? "FOR UPDATE" : ""));
 }
 
-auto MysqlDatabase::FetchByName(st_mysql* conn, uint16_t type_id, std::string_view identifier)
-    -> Result<EntityRow> {
+auto MysqlDatabase::FetchByName(st_mysql* conn, uint16_t type_id, std::string_view identifier,
+                                bool for_update) -> Result<EntityRow> {
   return QueryRow(
       conn, std::format("SELECT dbid, type_id, `blob`, identifier, password_hash, auto_load, "
-                        "checked_out, checkout_ip, checkout_port, checkout_app_id, checkout_eid "
-                        "FROM entities WHERE type_id = {} AND identifier = {} LIMIT 1",
-                        type_id, IdentifierLiteral(identifier)));
+                        "checked_out, checkout_ip, checkout_port, checkout_app_id, checkout_eid, "
+                        "checkout_version, checkout_instance "
+                        "FROM entities WHERE type_id = {} AND identifier = {} LIMIT 1 {}",
+                        type_id, IdentifierLiteral(identifier), for_update ? "FOR UPDATE" : ""));
 }
 
 auto MysqlDatabase::HexLiteral(std::span<const std::byte> data) -> std::string {
@@ -347,10 +422,10 @@ auto MysqlDatabase::BeginTxn(st_mysql* conn) -> Result<void> {
   return ExecSql(conn, "START TRANSACTION");
 }
 
-void MysqlDatabase::Commit(st_mysql* conn) {
-  if (auto r = ExecSql(conn, "COMMIT"); !r) {
-    ATLAS_LOG_ERROR("MysqlDatabase: COMMIT failed: {}", r.Error().Message());
-  }
+auto MysqlDatabase::Commit(st_mysql* conn) -> Result<void> {
+  auto result = ExecSql(conn, "COMMIT");
+  if (!result) return Error{ErrorCode::kCommitUnknown, std::string(result.Error().Message())};
+  return {};
 }
 
 void MysqlDatabase::Rollback(st_mysql* conn) {
@@ -366,6 +441,7 @@ auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, Wri
   if (HasFlag(flags, WriteFlags::kDelete)) {
     auto del = DoDel(conn, dbid, type_id);
     result.success = del.success;
+    result.dbid = dbid;
     result.error = std::move(del.error);
     return result;
   }
@@ -410,6 +486,7 @@ auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, Wri
   }
   auto row = std::move(*row_result);
   if (!row.found) {
+    result.error_kind = DatabaseErrorKind::kNotFound;
     result.error = std::format("entity ({},{}) not found", type_id, dbid);
     return result;
   }
@@ -446,6 +523,288 @@ auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, Wri
   return result;
 }
 
+auto MysqlDatabase::LockOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+                                         const Sha256Digest& hash)
+    -> Result<std::optional<DatabaseOperationReceipt>> {
+  const auto key = HexLiteral(id);
+  const auto digest = HexLiteral(hash);
+  auto inserted = ExecSql(
+      conn, std::format("INSERT INTO atlas_write_receipts(operation_id, request_hash) "
+                        "VALUES({}, {}) ON DUPLICATE KEY UPDATE operation_id = operation_id",
+                        key, digest));
+  if (!inserted) return inserted.Error();
+  const bool created = mysql_affected_rows(conn) == 1;
+  const auto query = std::format(
+      "SELECT request_hash = {}, result_dbid, result_checkout_version FROM atlas_write_receipts "
+      "WHERE operation_id = {} FOR UPDATE",
+      digest, key);
+  if (mysql_real_query(conn, query.data(), static_cast<unsigned long>(query.size())) != 0)
+    return MysqlErr(conn, "operation receipt query failed");
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(conn),
+                                                                mysql_free_result);
+  MYSQL_ROW row = rows ? mysql_fetch_row(rows.get()) : nullptr;
+  if (row == nullptr || row[0] == nullptr || row[2] == nullptr)
+    return Error{ErrorCode::kIoError, "operation receipt is missing or unreadable"};
+  if (std::string_view(row[0]) != "1")
+    return Error{ErrorCode::kAlreadyExists, "operation_id_reused"};
+  const std::string_view version(row[2]);
+  DatabaseOperationReceipt receipt;
+  receipt.request_hash = hash;
+  const auto parsed =
+      std::from_chars(version.data(), version.data() + version.size(), receipt.checkout_version);
+  if (parsed.ec != std::errc{} || parsed.ptr != version.data() + version.size())
+    return Error{ErrorCode::kIoError, "invalid operation receipt version"};
+  if (row[1] == nullptr) {
+    if (created && receipt.checkout_version == 0) return std::optional<DatabaseOperationReceipt>{};
+    return Error{ErrorCode::kIoError, "incomplete operation receipt"};
+  }
+  const std::string_view dbid(row[1]);
+  const auto parsed_dbid = std::from_chars(dbid.data(), dbid.data() + dbid.size(), receipt.dbid);
+  if (parsed_dbid.ec != std::errc{} || parsed_dbid.ptr != dbid.data() + dbid.size() ||
+      receipt.dbid <= kInvalidDBID)
+    return Error{ErrorCode::kIoError, "invalid operation receipt DBID"};
+  return std::optional{receipt};
+}
+
+auto MysqlDatabase::SaveOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+                                         const DatabaseOperationReceipt& receipt) -> Result<void> {
+  auto updated = ExecSql(conn, std::format("UPDATE atlas_write_receipts SET result_dbid = {}, "
+                                           "result_checkout_version = {} WHERE operation_id = {} "
+                                           "AND result_dbid IS NULL",
+                                           receipt.dbid, receipt.checkout_version, HexLiteral(id)));
+  if (!updated) return updated.Error();
+  if (mysql_affected_rows(conn) != 1)
+    return Error{ErrorCode::kIoError, "operation receipt was not recorded"};
+  return {};
+}
+
+auto MysqlDatabase::DoCheckoutWithOperation(st_mysql* conn,
+                                            const DatabaseCheckoutOperation& operation,
+                                            bool acquire) -> GetResult {
+  GetResult result;
+  if (!operation.IsValid()) {
+    result.error = "invalid_checkout_operation";
+    result.error_kind = DatabaseErrorKind::kOperationConflict;
+    return result;
+  }
+  auto hash = HashCheckoutOperation(operation);
+  if (!hash) {
+    result.error = hash.Error().Message();
+    return result;
+  }
+  if (auto begun = BeginTxn(conn); !begun) {
+    result.error = begun.Error().Message();
+    return result;
+  }
+  bool acquired = false;
+  auto execute = [&]() -> GetResult {
+    GetResult outcome;
+    auto previous = LockOperationReceipt(conn, operation.id, *hash);
+    if (!previous) {
+      outcome.error = previous.Error().Message();
+      outcome.error_kind = previous.Error().Code() == ErrorCode::kAlreadyExists
+                               ? DatabaseErrorKind::kOperationConflict
+                               : DatabaseErrorKind::kCommitUnknown;
+      return outcome;
+    }
+    if (!*previous && !acquire) {
+      outcome.error = "checkout_operation_unconfirmed";
+      outcome.error_kind = DatabaseErrorKind::kCommitUnknown;
+      return outcome;
+    }
+    if (*previous) {
+      if (auto valid = ValidateCheckoutReceipt(operation, **previous); !valid) {
+        outcome.error = valid.Error().Message();
+        outcome.error_kind = DatabaseErrorKind::kCommitUnknown;
+        return outcome;
+      }
+    }
+    if (!*previous) {
+      if (auto active = CheckCheckoutProcess(conn, operation.owner); !active) {
+        outcome.error = active.Error().Message();
+        outcome.error_kind = active.Error().Code() == ErrorCode::kPermissionDenied
+                                 ? DatabaseErrorKind::kOwnershipConflict
+                                 : DatabaseErrorKind::kNone;
+        return outcome;
+      }
+    }
+    auto row = *previous ? FetchByDbid(conn, (**previous).dbid, operation.type_id, true)
+                         : (operation.dbid == kInvalidDBID
+                                ? FetchByName(conn, operation.type_id, operation.identifier, true)
+                                : FetchByDbid(conn, operation.dbid, operation.type_id, true));
+    if (!row || !row->found) {
+      outcome.error = row ? "checkout entity not found" : std::string(row.Error().Message());
+      outcome.error_kind = row ? DatabaseErrorKind::kNotFound : DatabaseErrorKind::kNone;
+      if (*previous && row) {
+        outcome.data.dbid = (**previous).dbid;
+        outcome.checkout_version = (**previous).checkout_version;
+      }
+      return outcome;
+    }
+    outcome.success = true;
+    outcome.data = std::move(row->data);
+    outcome.checked_out_by = row->checked_out_by;
+    if (*previous) return ConfirmCheckoutReceipt(operation, **previous, std::move(outcome));
+    if (outcome.checked_out_by) return outcome;
+    auto version =
+        AcquireCheckout(conn, outcome.data.dbid, operation.type_id, operation.owner, UnixTimeMs());
+    if (!version) {
+      outcome = GetResult{};
+      outcome.error = version.Error().Message();
+      return outcome;
+    }
+    auto saved = SaveOperationReceipt(conn, operation.id, {*hash, outcome.data.dbid, *version});
+    if (!saved) {
+      outcome = GetResult{};
+      outcome.error = saved.Error().Message();
+      return outcome;
+    }
+    acquired = true;
+    outcome.checkout_version = *version;
+    return outcome;
+  };
+  result = execute();
+  if (acquired) {
+    if (auto committed = Commit(conn); !committed) {
+      Rollback(conn);
+      result = GetResult{};
+      result.error = committed.Error().Message();
+      result.error_kind = DatabaseErrorKind::kCommitUnknown;
+    }
+  } else {
+    Rollback(conn);
+  }
+  return result;
+}
+
+auto MysqlDatabase::DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperation& operation,
+                                       DatabaseID dbid, uint16_t type_id, WriteFlags flags,
+                                       std::span<const std::byte> blob,
+                                       const std::string& identifier) -> PutResult {
+  PutResult result;
+  const bool allocated_create = HasFlag(operation.requested_flags, WriteFlags::kCreateNew) &&
+                                operation.requested_dbid == kInvalidDBID;
+  if (!operation.IsValid() || (!allocated_create && dbid != operation.requested_dbid) ||
+      (flags != operation.requested_flags &&
+       !(allocated_create && flags == (operation.requested_flags | WriteFlags::kExplicitDbid)))) {
+    result.error = "invalid_write_operation";
+    result.error_kind = DatabaseErrorKind::kOperationConflict;
+    return result;
+  }
+  const bool creating = HasFlag(operation.requested_flags, WriteFlags::kCreateNew);
+  if (operation.create_owner &&
+      (!creating || operation.expected_owner || operation.create_owner->ownership_version != 0 ||
+       operation.create_owner->base_addr.Port() == 0 || operation.entity_id == 0 ||
+       operation.create_owner->entity_id != operation.entity_id ||
+       HasFlag(flags, WriteFlags::kLogOff))) {
+    result.error = "invalid_create_owner";
+    result.error_kind = DatabaseErrorKind::kOperationConflict;
+    return result;
+  }
+
+  auto digest = HashWriteOperation(operation, type_id, blob, identifier);
+  if (!digest) {
+    result.error = digest.Error().Message();
+    return result;
+  }
+  auto begin = BeginTxn(conn);
+  if (!begin) {
+    result.error = std::string(begin.Error().Message());
+    return result;
+  }
+  auto execute = [&]() -> PutResult {
+    PutResult outcome;
+    auto previous = LockOperationReceipt(conn, operation.id, *digest);
+    if (!previous) {
+      outcome.error = previous.Error().Message();
+      outcome.error_kind = previous.Error().Code() == ErrorCode::kAlreadyExists
+                               ? DatabaseErrorKind::kOperationConflict
+                               : DatabaseErrorKind::kCommitUnknown;
+      return outcome;
+    }
+    if (*previous) {
+      if (operation.create_owner.has_value() != ((**previous).checkout_version != 0)) {
+        outcome.error = "invalid write receipt ownership";
+        outcome.error_kind = DatabaseErrorKind::kCommitUnknown;
+        return outcome;
+      }
+      return RestoreWriteReceipt(operation, **previous);
+    }
+    if (operation.create_owner) {
+      if (auto active = CheckCheckoutProcess(conn, *operation.create_owner); !active) {
+        outcome.error = active.Error().Message();
+        outcome.error_kind = active.Error().Code() == ErrorCode::kPermissionDenied
+                                 ? DatabaseErrorKind::kOwnershipConflict
+                                 : DatabaseErrorKind::kNone;
+        return outcome;
+      }
+    }
+    if (!allocated_create) {
+      auto current = FetchByDbid(conn, dbid, type_id, true);
+      if (!current) {
+        outcome.error = std::string(current.Error().Message());
+        return outcome;
+      }
+      const auto& owner = current->checked_out_by;
+      if (!operation.expected_owner) {
+        if (owner) {
+          outcome.error = "missing_checkout_version";
+          outcome.error_kind = DatabaseErrorKind::kOwnershipConflict;
+          return outcome;
+        }
+      } else {
+        const auto& expected = *operation.expected_owner;
+        if (!owner || expected.ownership_version == 0 ||
+            owner->ownership_version != expected.ownership_version ||
+            owner->base_addr != expected.base_addr || owner->app_id != expected.app_id ||
+            owner->entity_id != expected.entity_id ||
+            owner->process_instance != expected.process_instance) {
+          outcome.error = "checkout_owner_mismatch";
+          outcome.error_kind = DatabaseErrorKind::kOwnershipConflict;
+          return outcome;
+        }
+      }
+    }
+    outcome = DoPut(conn, dbid, type_id, flags, blob, identifier, false, {});
+    if (!outcome.success) return outcome;
+    if (operation.create_owner) {
+      auto version =
+          AcquireCheckout(conn, outcome.dbid, type_id, *operation.create_owner, UnixTimeMs());
+      if (!version) {
+        outcome.success = false;
+        outcome.error = std::string(version.Error().Message());
+        return outcome;
+      }
+      outcome.checkout_owner = operation.create_owner;
+      outcome.checkout_owner->ownership_version = *version;
+    }
+    auto recorded = SaveOperationReceipt(
+        conn, operation.id,
+        {*digest, outcome.dbid,
+         outcome.checkout_owner ? outcome.checkout_owner->ownership_version : 0});
+    if (!recorded) {
+      outcome.success = false;
+      outcome.error = std::string(recorded.Error().Message());
+    }
+    return outcome;
+  };
+  result = execute();
+  if (!result.success) {
+    result.checkout_owner.reset();
+    Rollback(conn);
+    return result;
+  }
+  auto committed = Commit(conn);
+  if (!committed) {
+    Rollback(conn);
+    result.success = false;
+    result.checkout_owner.reset();
+    result.error = std::string(committed.Error().Message());
+    result.error_kind = DatabaseErrorKind::kCommitUnknown;
+  }
+  return result;
+}
+
 auto MysqlDatabase::DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> GetResult {
   GetResult result;
   auto row_result = FetchByDbid(conn, dbid, type_id);
@@ -455,6 +814,7 @@ auto MysqlDatabase::DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> 
   }
   auto row = std::move(*row_result);
   if (!row.found) {
+    result.error_kind = DatabaseErrorKind::kNotFound;
     result.error = std::format("entity ({},{}) not found", type_id, dbid);
     return result;
   }
@@ -497,38 +857,59 @@ auto MysqlDatabase::DoLookup(st_mysql* conn, uint16_t type_id, const std::string
   return result;
 }
 
+auto MysqlDatabase::AcquireCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+                                    const CheckoutInfo& new_owner, int64_t now_ms)
+    -> Result<uint64_t> {
+  auto next = ExecSql(
+      conn,
+      std::format("INSERT INTO atlas_checkout_versions(dbid, type_id, version) VALUES({}, {}, 1) "
+                  "ON DUPLICATE KEY UPDATE version = version + 1",
+                  static_cast<uint64_t>(dbid), type_id));
+  if (!next) {
+    return next.Error();
+  }
+  auto upd = ExecSql(
+      conn,
+      std::format(
+          "UPDATE entities SET checked_out = 1, checkout_ip = {}, checkout_port = {}, "
+          "checkout_app_id = {}, checkout_eid = {}, checkout_instance = {}, updated_at_ms = {}, "
+          "checkout_version = (SELECT version FROM atlas_checkout_versions "
+          "WHERE dbid = {} AND type_id = {}) "
+          "WHERE dbid = {} AND type_id = {} AND checked_out = 0",
+          new_owner.base_addr.Ip(), new_owner.base_addr.Port(), new_owner.app_id,
+          new_owner.entity_id, new_owner.process_instance, now_ms, static_cast<uint64_t>(dbid),
+          type_id, static_cast<uint64_t>(dbid), type_id));
+  if (!upd) {
+    return upd.Error();
+  }
+  if (mysql_affected_rows(conn) != 1) {
+    return Error{ErrorCode::kPermissionDenied, "checkout conflict"};
+  }
+  auto acquired = FetchByDbid(conn, dbid, type_id);
+  if (!acquired || !acquired->checked_out_by) {
+    return Error{ErrorCode::kIoError, "checkout owner readback failed"};
+  }
+  return acquired->checkout_version;
+}
+
 auto MysqlDatabase::CheckoutTail(st_mysql* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
                                  const CheckoutInfo& new_owner, int64_t now_ms) -> GetResult {
   GetResult result;
-  // Conditional on checked_out = 0; a concurrent checkout that already flipped
-  // it leaves 0 rows changed, which we treat as a conflict and re-fetch.
-  auto upd = ExecSql(
-      conn,
-      std::format("UPDATE entities SET checked_out = 1, checkout_ip = {}, checkout_port = {}, "
-                  "checkout_app_id = {}, checkout_eid = {}, updated_at_ms = {} "
-                  "WHERE dbid = {} AND type_id = {} AND checked_out = 0",
-                  new_owner.base_addr.Ip(), new_owner.base_addr.Port(), new_owner.app_id,
-                  new_owner.entity_id, now_ms, static_cast<uint64_t>(dbid), type_id));
-  if (!upd) {
+  auto acquired = AcquireCheckout(conn, dbid, type_id, new_owner, now_ms);
+  if (!acquired) {
     Rollback(conn);
-    result.error = std::string(upd.Error().Message());
+    result.error = std::string(acquired.Error().Message());
     return result;
   }
-  if (mysql_affected_rows(conn) != 1) {
+  if (auto committed = Commit(conn); !committed) {
     Rollback(conn);
-    auto refreshed = FetchByDbid(conn, dbid, type_id);
-    if (refreshed && refreshed->found && refreshed->checked_out_by.has_value()) {
-      result.success = true;
-      result.data = std::move(refreshed->data);
-      result.checked_out_by = refreshed->checked_out_by;
-    } else {
-      result.error = "checkout conflict";
-    }
+    result.error = std::string(committed.Error().Message());
+    result.error_kind = DatabaseErrorKind::kCommitUnknown;
     return result;
   }
-  Commit(conn);
   result.success = true;
   result.data = std::move(row.data);
+  result.checkout_version = *acquired;
   return result;
 }
 
@@ -540,7 +921,15 @@ auto MysqlDatabase::DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id
     result.error = std::string(begin.Error().Message());
     return result;
   }
-  auto row_result = FetchByDbid(conn, dbid, type_id);
+  if (auto active = CheckCheckoutProcess(conn, new_owner); !active) {
+    Rollback(conn);
+    result.error = active.Error().Message();
+    result.error_kind = active.Error().Code() == ErrorCode::kPermissionDenied
+                            ? DatabaseErrorKind::kOwnershipConflict
+                            : DatabaseErrorKind::kNone;
+    return result;
+  }
+  auto row_result = FetchByDbid(conn, dbid, type_id, true);
   if (!row_result) {
     Rollback(conn);
     result.error = std::string(row_result.Error().Message());
@@ -549,6 +938,7 @@ auto MysqlDatabase::DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id
   auto row = std::move(*row_result);
   if (!row.found) {
     Rollback(conn);
+    result.error_kind = DatabaseErrorKind::kNotFound;
     result.error = std::format("checkout: entity ({},{}) not found", type_id, dbid);
     return result;
   }
@@ -571,7 +961,15 @@ auto MysqlDatabase::DoCheckoutByName(st_mysql* conn, uint16_t type_id,
     result.error = std::string(begin.Error().Message());
     return result;
   }
-  auto lookup = FetchByName(conn, type_id, identifier);
+  if (auto active = CheckCheckoutProcess(conn, new_owner); !active) {
+    Rollback(conn);
+    result.error = active.Error().Message();
+    result.error_kind = active.Error().Code() == ErrorCode::kPermissionDenied
+                            ? DatabaseErrorKind::kOwnershipConflict
+                            : DatabaseErrorKind::kNone;
+    return result;
+  }
+  auto lookup = FetchByName(conn, type_id, identifier, true);
   if (!lookup) {
     Rollback(conn);
     result.error = std::string(lookup.Error().Message());
@@ -580,6 +978,7 @@ auto MysqlDatabase::DoCheckoutByName(st_mysql* conn, uint16_t type_id,
   auto row = std::move(*lookup);
   if (!row.found) {
     Rollback(conn);
+    result.error_kind = DatabaseErrorKind::kNotFound;
     result.error = std::format("checkout_by_name: '{}' not found", identifier);
     return result;
   }
@@ -654,8 +1053,13 @@ auto MysqlDatabase::DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high
     result.success = true;
     return result;
   }
-  auto sql = std::format("SELECT MAX(dbid) FROM entities WHERE dbid >= {} AND dbid < {}",
-                         static_cast<uint64_t>(low), static_cast<uint64_t>(high));
+  auto sql = std::format(
+      "SELECT MAX(dbid) FROM ("
+      "SELECT MAX(dbid) AS dbid FROM entities WHERE dbid >= {0} AND dbid < {1} UNION ALL "
+      "SELECT MAX(dbid) FROM atlas_checkout_versions WHERE dbid >= {0} AND dbid < {1} UNION ALL "
+      "SELECT MAX(result_dbid) FROM atlas_write_receipts "
+      "WHERE result_dbid >= {0} AND result_dbid < {1}) AS allocated",
+      static_cast<uint64_t>(low), static_cast<uint64_t>(high));
   if (conn == nullptr ||
       mysql_real_query(conn, sql.data(), static_cast<unsigned long>(sql.size())) != 0) {
     result.error = std::string(MysqlErr(conn, "MysqlDatabase: max dbid query failed").Message());
@@ -675,29 +1079,50 @@ auto MysqlDatabase::DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high
   return result;
 }
 
-auto MysqlDatabase::DoLoadCounter(st_mysql* conn) -> EntityID {
-  EntityID next_id = 1;
-  static constexpr std::string_view kSql =
-      "SELECT next_id FROM atlas_entity_id_counter WHERE id = 1";
-  if (conn != nullptr &&
-      mysql_real_query(conn, kSql.data(), static_cast<unsigned long>(kSql.size())) == 0) {
-    if (MYSQL_RES* res = mysql_store_result(conn); res != nullptr) {
-      if (MYSQL_ROW row = mysql_fetch_row(res); row != nullptr && row[0] != nullptr) {
-        next_id = static_cast<EntityID>(std::strtoull(row[0], nullptr, 10));
-      }
-      mysql_free_result(res);
-    }
+auto MysqlDatabase::DoReserveEntityIds(st_mysql* conn, uint32_t count) -> Result<EntityIdRange> {
+  if (count == 0 || count >= kFirstLocalEntityID) {
+    return Error{ErrorCode::kOutOfRange, "invalid EntityID reservation count"};
   }
-  return next_id;
-}
-
-auto MysqlDatabase::DoSaveCounter(st_mysql* conn, EntityID next_id) -> bool {
-  // The counter row is seeded in EnsureSchema, so a successful UPDATE means it
-  // was applied; MySQL reports 0 changed rows when the value is unchanged, so
-  // affected_rows can't be the success signal.
-  return ExecSql(conn, std::format("UPDATE atlas_entity_id_counter SET next_id = {} WHERE id = 1",
-                                   static_cast<uint64_t>(next_id)))
-      .HasValue();
+  auto begin = BeginTxn(conn);
+  if (!begin) return begin.Error();
+  auto reserve = [&]() -> Result<EntityIdRange> {
+    constexpr std::string_view query =
+        "SELECT next_id FROM atlas_entity_id_counter WHERE id = 1 FOR UPDATE";
+    if (mysql_real_query(conn, query.data(), static_cast<unsigned long>(query.size())) != 0) {
+      return MysqlErr(conn, "EntityID reservation read failed");
+    }
+    std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(conn),
+                                                                  mysql_free_result);
+    if (!rows) return MysqlErr(conn, "EntityID reservation result failed");
+    MYSQL_ROW row = mysql_fetch_row(rows.get());
+    if (row == nullptr || row[0] == nullptr) {
+      return Error{ErrorCode::kIoError, "EntityID counter row is missing"};
+    }
+    const std::string_view text(row[0]);
+    uint64_t next = 0;
+    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), next);
+    if (error != std::errc{} || end != text.data() + text.size() || next == 0 ||
+        next > kFirstLocalEntityID || count > kFirstLocalEntityID - next) {
+      return Error{ErrorCode::kOutOfRange, "EntityID counter is invalid or exhausted"};
+    }
+    rows.reset();
+    auto update = ExecSql(
+        conn,
+        std::format("UPDATE atlas_entity_id_counter SET next_id = {} WHERE id = 1", next + count));
+    if (!update) return update.Error();
+    return EntityIdRange{static_cast<EntityID>(next), static_cast<EntityID>(next + count - 1)};
+  };
+  auto result = reserve();
+  if (!result) {
+    Rollback(conn);
+    return result;
+  }
+  auto committed = Commit(conn);
+  if (!committed) {
+    Rollback(conn);
+    return committed.Error();
+  }
+  return result;
 }
 
 // ── public API: dispatch onto the pool (or run inline when synchronous) ─────
@@ -710,6 +1135,20 @@ void MysqlDatabase::PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flag
       type_id, dbid,
       [dbid, type_id, flags, b = std::move(owned), id = identifier](st_mysql* conn) {
         return DoPut(conn, dbid, type_id, flags, b, id, false, {});
+      },
+      std::move(callback));
+}
+
+void MysqlDatabase::PutEntityWithOperation(const DatabaseWriteOperation& operation, DatabaseID dbid,
+                                           uint16_t type_id, WriteFlags flags,
+                                           std::span<const std::byte> blob,
+                                           const std::string& identifier,
+                                           std::function<void(PutResult)> callback) {
+  std::vector<std::byte> owned(blob.begin(), blob.end());
+  Dispatch<PutResult>(
+      type_id, dbid,
+      [operation, dbid, type_id, flags, data = std::move(owned), identifier](st_mysql* conn) {
+        return DoPutWithOperation(conn, operation, dbid, type_id, flags, data, identifier);
       },
       std::move(callback));
 }
@@ -759,6 +1198,22 @@ void MysqlDatabase::CheckoutEntity(DatabaseID dbid, uint16_t type_id, const Chec
       std::move(callback));
 }
 
+void MysqlDatabase::CheckoutWithOperation(const DatabaseCheckoutOperation& operation,
+                                          std::function<void(GetResult)> callback) {
+  Dispatch<GetResult>(
+      operation.type_id, operation.dbid,
+      [operation](st_mysql* conn) { return DoCheckoutWithOperation(conn, operation, true); },
+      std::move(callback));
+}
+
+void MysqlDatabase::ResolveCheckoutOperation(const DatabaseCheckoutOperation& operation,
+                                             std::function<void(GetResult)> callback) {
+  Dispatch<GetResult>(
+      operation.type_id, operation.dbid,
+      [operation](st_mysql* conn) { return DoCheckoutWithOperation(conn, operation, false); },
+      std::move(callback));
+}
+
 void MysqlDatabase::CheckoutEntityByName(uint16_t type_id, const std::string& identifier,
                                          const CheckoutInfo& new_owner,
                                          std::function<void(GetResult)> callback) {
@@ -766,6 +1221,102 @@ void MysqlDatabase::CheckoutEntityByName(uint16_t type_id, const std::string& id
       type_id, std::hash<std::string>{}(identifier),
       [type_id, id = identifier, new_owner](st_mysql* conn) {
         return DoCheckoutByName(conn, type_id, id, new_owner);
+      },
+      std::move(callback));
+}
+
+void MysqlDatabase::ReleaseCheckout(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner,
+                                    std::function<void(Result<void>)> callback) {
+  Dispatch<Result<void>>(
+      type_id, dbid,
+      [dbid, type_id, owner](st_mysql* conn) -> Result<void> {
+        if (owner.ownership_version == 0) {
+          return Error{ErrorCode::kPermissionDenied, "missing checkout version"};
+        }
+        auto update = ExecSql(
+            conn,
+            std::format("UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
+                        "checkout_app_id = 0, checkout_eid = 0 WHERE dbid = {} AND type_id = {} "
+                        "AND checked_out = 1 AND checkout_ip = {} AND checkout_port = {} "
+                        "AND checkout_app_id = {} AND checkout_eid = {} AND checkout_version = {} "
+                        "AND checkout_instance = {}",
+                        static_cast<uint64_t>(dbid), type_id, owner.base_addr.Ip(),
+                        owner.base_addr.Port(), owner.app_id, owner.entity_id,
+                        owner.ownership_version, owner.process_instance));
+        if (!update) return update.Error();
+        if (mysql_affected_rows(conn) != 1) {
+          return Error{ErrorCode::kPermissionDenied, "checkout owner mismatch"};
+        }
+        return {};
+      },
+      std::move(callback));
+}
+
+auto MysqlDatabase::CheckCheckoutProcess(st_mysql* conn, const CheckoutInfo& owner)
+    -> Result<void> {
+  if (owner.process_instance == 0) return {};
+  if (owner.process_instance > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
+    return Error{ErrorCode::kInvalidArgument, "invalid checkout process instance"};
+  auto inserted = ExecSql(
+      conn,
+      std::format(
+          "INSERT INTO atlas_checkout_processes(base_ip, base_port, instance) VALUES({}, {}, {}) "
+          "ON DUPLICATE KEY UPDATE retired = retired",
+          owner.base_addr.Ip(), owner.base_addr.Port(), owner.process_instance));
+  if (!inserted) return inserted.Error();
+  auto sql = std::format(
+      "SELECT retired FROM atlas_checkout_processes "
+      "WHERE base_ip = {} AND base_port = {} AND instance = {} FOR UPDATE",
+      owner.base_addr.Ip(), owner.base_addr.Port(), owner.process_instance);
+  if (mysql_real_query(conn, sql.data(), static_cast<unsigned long>(sql.size())) != 0)
+    return MysqlErr(conn, "checkout process lookup failed");
+  auto* rows = mysql_store_result(conn);
+  if (!rows) return MysqlErr(conn, "checkout process result missing");
+  auto row = mysql_fetch_row(rows);
+  const bool active = row && row[0] && std::string_view(row[0]) == "0";
+  mysql_free_result(rows);
+  if (!active) return Error{ErrorCode::kPermissionDenied, "checkout process retired"};
+  return {};
+}
+
+void MysqlDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t instance,
+                                          std::function<void(Result<int>)> callback) {
+  Dispatch<Result<int>>(
+      0, 0,
+      [base_addr, instance](st_mysql* conn) -> Result<int> {
+        if (instance == 0 ||
+            instance > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
+          return Error{ErrorCode::kInvalidArgument, "invalid checkout process instance"};
+        if (auto begun = BeginTxn(conn); !begun) return begun.Error();
+        auto retire = [&]() -> Result<int> {
+          auto marked = ExecSql(
+              conn,
+              std::format(
+                  "INSERT INTO atlas_checkout_processes(base_ip, base_port, instance, retired) "
+                  "VALUES({}, {}, {}, 1) ON DUPLICATE KEY UPDATE retired = 1",
+                  base_addr.Ip(), base_addr.Port(), instance));
+          if (!marked) return marked.Error();
+          auto cleared = ExecSql(
+              conn, std::format(
+                        "UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
+                        "checkout_app_id = 0, checkout_eid = 0, checkout_instance = 0 "
+                        "WHERE checked_out = 1 AND checkout_ip = {} AND checkout_port = {} "
+                        "AND checkout_instance = {}",
+                        base_addr.Ip(), base_addr.Port(), instance));
+          if (!cleared) return cleared.Error();
+          return static_cast<int>(mysql_affected_rows(conn));
+        };
+        auto result = retire();
+        if (!result) {
+          Rollback(conn);
+          return result.Error();
+        }
+        auto committed = Commit(conn);
+        if (!committed) {
+          Rollback(conn);
+          return committed.Error();
+        }
+        return result;
       },
       std::move(callback));
 }
@@ -803,14 +1354,10 @@ void MysqlDatabase::GetMaxDbidInRange(DatabaseID low, DatabaseID high,
       std::move(callback));
 }
 
-void MysqlDatabase::LoadEntityIdCounter(std::function<void(EntityID next_id)> callback) {
-  Dispatch<EntityID>(0, 0, [](st_mysql* conn) { return DoLoadCounter(conn); }, std::move(callback));
-}
-
-void MysqlDatabase::SaveEntityIdCounter(EntityID next_id,
-                                        std::function<void(bool success)> callback) {
-  Dispatch<bool>(
-      0, 0, [next_id](st_mysql* conn) { return DoSaveCounter(conn, next_id); },
+void MysqlDatabase::ReserveEntityIds(uint32_t count,
+                                     std::function<void(Result<EntityIdRange>)> callback) {
+  Dispatch<Result<EntityIdRange>>(
+      0, 0, [count](st_mysql* conn) { return DoReserveEntityIds(conn, count); },
       std::move(callback));
 }
 

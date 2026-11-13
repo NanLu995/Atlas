@@ -123,6 +123,7 @@ class MachinedClient {
     std::string name;
     uint16_t internal_port;
     uint16_t external_port;
+    uint64_t process_instance;
   };
   std::optional<RegistrationInfo> cached_reg_;
 

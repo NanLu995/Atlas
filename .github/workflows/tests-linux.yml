@@ -1,4 +1,4 @@
-name: Linux Tests
+name: Linux SQLite Smoke Tests
 
 # Runs after a successful Linux Build and rebuilds debug for test binaries.
 # sccache should make the rebuild incremental instead of a full compile.
@@ -31,7 +31,7 @@ jobs:
       - name: Install GCC 13 + Ninja
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 ninja-build
+          sudo apt-get install -y g++-13 ninja-build libssl-dev
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100
 
@@ -72,6 +72,7 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DATLAS_BUILD_NET_CLIENT=ON
+          -DATLAS_DB_MYSQL=OFF
 
       - name: Build
         env:
@@ -148,9 +149,13 @@ jobs:
             exit "$status"
           fi
 
+      - name: C# Unit Tests
+        run: ctest --test-dir build/debug -C Debug --label-regex managed --output-on-failure --no-tests=error
+
       - name: C# IntegrationTests
         env:
           ATLAS_BIN_DIR: ${{ github.workspace }}/bin/debug
+          ATLAS_TEST_DB_BACKEND: sqlite
         shell: bash
         run: |
           set +e

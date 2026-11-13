@@ -26,7 +26,12 @@ class CheckoutManager {
   [[nodiscard]] auto TryCheckout(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& new_owner)
       -> CheckoutResult;
 
-  void ConfirmCheckout(DatabaseID dbid, uint16_t type_id);
+  void ConfirmCheckout(DatabaseID dbid, uint16_t type_id, uint64_t ownership_version = 0);
+
+  auto ConfirmCheckoutIfOwner(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner,
+                              uint64_t ownership_version) -> bool;
+
+  auto CheckinIfOwner(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner) -> bool;
 
   void ReleaseCheckout(DatabaseID dbid, uint16_t type_id);
 
@@ -35,7 +40,7 @@ class CheckoutManager {
   [[nodiscard]] auto GetOwner(DatabaseID dbid, uint16_t type_id) const
       -> std::optional<CheckoutInfo>;
 
-  auto ClearAllFor(const Address& base_addr) -> int;
+  auto ClearAllFor(const Address& base_addr, uint64_t process_instance) -> int;
 
   [[nodiscard]] auto size() const -> std::size_t { return entries_.size(); }
 

@@ -147,7 +147,7 @@ TEST(CheckoutManager, ClearAllForRemovesCorrectEntries) {
 
   EXPECT_EQ(mgr.size(), 3u);
 
-  int cleared = mgr.ClearAllFor(dead_app);
+  int cleared = mgr.ClearAllFor(dead_app, dead_owner.process_instance);
   EXPECT_EQ(cleared, 2);
   EXPECT_EQ(mgr.size(), 1u);
   EXPECT_TRUE(mgr.GetOwner(20, 1).has_value());
@@ -162,7 +162,53 @@ TEST(CheckoutManager, ClearAllForNoMatchReturnsZero) {
   mgr.ConfirmCheckout(1, 1);
 
   Address other(0x7F000099, 7100);
-  int cleared = mgr.ClearAllFor(other);
+  int cleared = mgr.ClearAllFor(other, owner.process_instance);
   EXPECT_EQ(cleared, 0);
   EXPECT_EQ(mgr.size(), 1u);
+}
+
+TEST(CheckoutManager, OldVersionCannotRemoveNewOwner) {
+  CheckoutManager manager;
+  auto owner = make_owner(0x7F000001, 7100, 3, 9);
+  (void)manager.TryCheckout(42, 1, owner);
+  manager.ConfirmCheckout(42, 1, 12);
+  owner.ownership_version = 11;
+  EXPECT_FALSE(manager.CheckinIfOwner(42, 1, owner));
+  ASSERT_TRUE(manager.GetOwner(42, 1).has_value());
+  EXPECT_EQ(manager.GetOwner(42, 1)->ownership_version, 12u);
+  owner.ownership_version = 12;
+  EXPECT_TRUE(manager.CheckinIfOwner(42, 1, owner));
+  EXPECT_FALSE(manager.GetOwner(42, 1).has_value());
+}
+
+TEST(CheckoutManager, OldCompletionCannotOverwriteConfirmedOwner) {
+  CheckoutManager manager;
+  auto first = make_owner(0x7F000001, 7100, 1, 2);
+  auto next = make_owner(0x7F000001, 7101, 2, 3);
+  (void)manager.TryCheckout(42, 1, first);
+  manager.ReleaseCheckout(42, 1);
+  (void)manager.TryCheckout(42, 1, next);
+  EXPECT_FALSE(manager.ConfirmCheckoutIfOwner(42, 1, first, 11));
+  EXPECT_TRUE(manager.ConfirmCheckoutIfOwner(42, 1, next, 12));
+  EXPECT_FALSE(manager.ConfirmCheckoutIfOwner(42, 1, next, 11));
+  EXPECT_FALSE(manager.CheckinIfOwner(42, 1, first));
+  ASSERT_TRUE(manager.GetOwner(42, 1).has_value());
+  EXPECT_EQ(manager.GetOwner(42, 1)->ownership_version, 12u);
+}
+
+TEST(CheckoutManager, ReusedAddressProcessSurvivesOldDeathAndCompletion) {
+  CheckoutManager manager;
+  auto old = make_owner(0x7F000001, 7100, 1, 2);
+  old.process_instance = 111;
+  auto current = old;
+  current.process_instance = 222;
+  (void)manager.TryCheckout(42, 1, current);
+  EXPECT_EQ(manager.ClearAllFor(old.base_addr, old.process_instance), 0);
+  EXPECT_FALSE(manager.ConfirmCheckoutIfOwner(42, 1, old, 10));
+  EXPECT_FALSE(manager.CheckinIfOwner(42, 1, old));
+  EXPECT_TRUE(manager.ConfirmCheckoutIfOwner(42, 1, current, 11));
+  EXPECT_EQ(manager.ClearAllFor(old.base_addr, old.process_instance), 0);
+  ASSERT_TRUE(manager.GetOwner(42, 1));
+  EXPECT_EQ(manager.GetOwner(42, 1)->process_instance, 222u);
+  EXPECT_EQ(manager.ClearAllFor(current.base_addr, current.process_instance), 1);
 }

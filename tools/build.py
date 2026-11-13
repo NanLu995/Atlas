@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wipe build/<preset> before configuring.",
     )
+    p.add_argument("--build-dir", type=Path,
+                   help="Isolated build directory directly under build/ (relative to repo root).")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--config-only", action="store_true",
                    help="Run cmake configure, skip build.")
@@ -154,40 +156,52 @@ def run_cmake(args: list[str], env: dict[str, str]) -> None:
     subprocess.run(args, env=env, cwd=REPO_ROOT, check=True)
 
 
+def resolve_cmake(env: dict[str, str]) -> str:
+    cmake = shutil.which("cmake", path=env.get("PATH", ""))
+    if cmake:
+        return cmake
+    if platform.system() == "Windows":
+        vs_dir = env.get("VSINSTALLDIR")
+        vs_path = Path(vs_dir) if vs_dir else detect_vs_install()[0]
+        bundled = vs_path / "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+        if bundled.is_file():
+            return str(bundled)
+    raise RuntimeError("CMake not found; install CMake 3.28+ and add its bin directory to PATH")
+
+
 def main() -> int:
     args = parse_args()
     config = PRESET_CONFIGS[args.preset]
+    build_dir = (REPO_ROOT / (args.build_dir or Path("build") / args.preset)).resolve()
+    if (build_dir.parent != (REPO_ROOT / "build").resolve() or
+            not build_dir.is_relative_to(REPO_ROOT.resolve())):
+        raise RuntimeError("--build-dir must be a directory directly under the repository build/")
 
     if platform.system() == "Windows":
         env, vs_major = load_msvc_env()
-        # Pin CMAKE_GENERATOR to the VS we just loaded vcvars from, so cmake
-        # doesn't fall back to vswhere -latest (which skips Insiders) and
-        # pick a different VS than the one supplying our toolchain.
+        # Use the generator matching the selected compiler installation.
         if vs_major is not None and vs_major in VS_GENERATOR:
             env["CMAKE_GENERATOR"] = VS_GENERATOR[vs_major]
             log(f"CMAKE_GENERATOR={env['CMAKE_GENERATOR']}")
     else:
         env = os.environ.copy()
 
-    # Only the debug preset uses Ninja Multi-Config; profile/release stay on
-    # the default generator (VS solution on Windows, Make on Linux).
+    cmake = resolve_cmake(env)
     if args.preset == "debug":
         ensure_ninja(env)
 
-    build_dir = REPO_ROOT / "build" / args.preset
-
     if args.clean and build_dir.exists():
-        log(f"Wiping build/{args.preset}")
+        log(f"Wiping {build_dir}")
         shutil.rmtree(build_dir)
 
     t_start = time.monotonic()
 
     if not args.build_only:
-        run_cmake(["cmake", "--preset", args.preset], env)
+        run_cmake([cmake, "--preset", args.preset, "-B", str(build_dir)], env)
 
     if not args.config_only:
         run_cmake(
-            ["cmake", "--build", str(build_dir), "--config", config],
+            [cmake, "--build", str(build_dir), "--config", config],
             env,
         )
 

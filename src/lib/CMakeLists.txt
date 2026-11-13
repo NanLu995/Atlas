@@ -22,7 +22,6 @@ add_subdirectory(coro)
 add_subdirectory(server)
 add_subdirectory(db)
 add_subdirectory(db_sqlite)
-add_subdirectory(db_xml)
 add_subdirectory(db_mysql)
 add_subdirectory(clrscript)
 

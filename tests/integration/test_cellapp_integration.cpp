@@ -488,27 +488,9 @@ auto ExecutablePathInteg() -> std::filesystem::path {
   return std::filesystem::path(buffer);
 }
 
-auto BuildRootInteg() -> std::filesystem::path {
-  auto current = ExecutablePathInteg().parent_path();
-  for (int i = 0; i < 10 && !current.empty(); ++i) {
-    if (std::filesystem::exists(current / "src" / "server" / "machined" / "Debug" /
-                                "machined.exe")) {
-      return current;
-    }
-    current = current.parent_path();
-  }
-  return {};
-}
-
-auto ResolveServerExeInteg(const std::wstring& subdir, const std::wstring& filename)
-    -> std::filesystem::path {
-  auto root = BuildRootInteg();
-  if (root.empty()) return {};
-  auto p1 = root / "bin" / "Debug" / filename;
-  if (std::filesystem::exists(p1)) return p1;
-  auto p2 = root / "src" / "server" / subdir / "Debug" / filename;
-  if (std::filesystem::exists(p2)) return p2;
-  return {};
+auto ResolveServerExeInteg(const std::wstring& filename) -> std::filesystem::path {
+  auto path = ExecutablePathInteg().parent_path() / filename;
+  return std::filesystem::exists(path) ? path : std::filesystem::path{};
 }
 
 auto QuoteArgInteg(const std::wstring& arg) -> std::wstring {
@@ -667,11 +649,11 @@ TEST(CellAppIntegration, AllProcessesStartAndRegister) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExeInteg(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExeInteg(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto cellapp_exe = ResolveServerExeInteg(L"cellapp", L"atlas_cellapp.exe");
+  const auto machined_exe = ResolveServerExeInteg(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExeInteg(L"atlas_cellappmgr.exe");
+  const auto cellapp_exe = ResolveServerExeInteg(L"atlas_cellapp.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || cellapp_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRootInteg();
+    FAIL() << "server binaries not found; bin_dir=" << ExecutablePathInteg().parent_path();
   }
 
   uint16_t machined_port = 0;

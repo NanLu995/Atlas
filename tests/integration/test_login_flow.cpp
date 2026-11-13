@@ -69,54 +69,23 @@ auto executable_path() -> std::filesystem::path {
   return std::filesystem::path(buffer);
 }
 
-auto build_root() -> std::filesystem::path {
-  auto current = executable_path().parent_path();
-  for (int i = 0; i < 8 && !current.empty(); ++i) {
-    if (std::filesystem::exists(current / "csharp") && std::filesystem::exists(current / "bin")) {
-      return current;
-    }
-    current = current.parent_path();
-  }
-  return {};
-}
-
-auto repo_root() -> std::filesystem::path {
-  auto current = build_root();
-  for (int i = 0; i < 8 && !current.empty(); ++i) {
-    if (std::filesystem::exists(current / "src" / "server" / "baseapp" / "baseapp.cpp") &&
-        std::filesystem::exists(current / "tests" / "csharp" / "Atlas.Runtime.Tests" /
-                                "Atlas.Runtime.Tests.csproj")) {
-      return current;
-    }
-    current = current.parent_path();
-  }
-  return {};
-}
-
 auto server_bin_dir() -> std::filesystem::path {
-  return build_root() / "bin" / "Debug";
+  return executable_path().parent_path();
 }
 
 auto runtime_config_path() -> std::filesystem::path {
-  // bin/Debug/<tfm>/ — pick the single net*/ subdirectory so a runtime
-  // bump (net10 → net11) doesn't require touching this file.
-  const auto cfg_dir = repo_root() / "tests" / "csharp" / "Atlas.Runtime.Tests" / "bin" / "Debug";
-  std::filesystem::path tfm_dir;
-  if (std::filesystem::is_directory(cfg_dir)) {
-    for (const auto& entry : std::filesystem::directory_iterator(cfg_dir)) {
-      if (!entry.is_directory()) continue;
-      const auto name = entry.path().filename().string();
-      if (name.starts_with("net")) {
-        tfm_dir = entry.path();
-        break;
-      }
-    }
-  }
-  return (tfm_dir.empty() ? cfg_dir : tfm_dir) / "Atlas.Tests.runtimeconfig.json";
+  const auto size = ::GetEnvironmentVariableW(L"ATLAS_RUNTIME_CONFIG_RLOC", nullptr, 0);
+  if (size == 0) return std::filesystem::path("runtime/atlas_server.runtimeconfig.json");
+  std::wstring configured(size, L'\0');
+  const auto length =
+      ::GetEnvironmentVariableW(L"ATLAS_RUNTIME_CONFIG_RLOC", configured.data(), size);
+  if (length == 0 || length >= size) return {};
+  configured.resize(length);
+  return std::filesystem::path(configured);
 }
 
 auto runtime_assembly_path() -> std::filesystem::path {
-  return build_root() / "csharp" / "src" / "csharp" / "Atlas.Runtime" / "Atlas.Runtime.dll";
+  return server_bin_dir() / "Atlas.Runtime.dll";
 }
 
 auto quote_arg(const std::wstring& arg) -> std::wstring {
@@ -385,7 +354,7 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   const auto runtime_cfg = runtime_config_path();
   const auto runtime_dll = runtime_assembly_path();
   if (!std::filesystem::exists(runtime_cfg) || !std::filesystem::exists(runtime_dll)) {
-    GTEST_SKIP() << "runtime prerequisites missing: " << runtime_cfg << " / " << runtime_dll;
+    FAIL() << "runtime prerequisites missing: " << runtime_cfg << " / " << runtime_dll;
   }
 
   const auto machined_exe = server_bin_dir() / "machined.exe";
@@ -396,7 +365,7 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   if (!std::filesystem::exists(machined_exe) || !std::filesystem::exists(dbapp_exe) ||
       !std::filesystem::exists(baseappmgr_exe) || !std::filesystem::exists(baseapp_exe) ||
       !std::filesystem::exists(loginapp_exe)) {
-    GTEST_SKIP() << "server binaries missing under " << server_bin_dir();
+    FAIL() << "server binaries missing under " << server_bin_dir();
   }
 
   const auto entity_defs = write_entity_defs_bin();
@@ -431,9 +400,11 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
 
   EventDispatcher machined_dispatcher{"login_flow_machined_bootstrap"};
   machined_dispatcher.SetMaxPollWait(Milliseconds(1));
-  NetworkInterface machined_network(machined_dispatcher);
-  MachinedClient machined_client(machined_dispatcher, machined_network);
-  ASSERT_TRUE(machined_client.Connect(Address("127.0.0.1", machined_port)));
+  ASSERT_TRUE(poll_until(machined_dispatcher, [&] {
+    auto socket = Socket::CreateTcp();
+    return socket && socket->SetNonBlocking(false) &&
+           socket->Connect(Address("127.0.0.1", machined_port)).HasValue();
+  })) << machined.diagnostic();
 
   ChildProcess dbapp = ChildProcess::launch(dbapp_exe,
                                             {L"--type",

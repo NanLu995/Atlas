@@ -19,9 +19,10 @@ struct ProcessInfo {
   Address external_addr;
   uint32_t pid{0};
   float load{0.0f};
+  uint64_t process_instance{0};
 };
 
-inline constexpr uint8_t kProtocolVersion = 1;
+inline constexpr uint8_t kProtocolVersion = 2;
 
 struct RegisterMessage {
   uint8_t protocol_version{kProtocolVersion};
@@ -30,6 +31,7 @@ struct RegisterMessage {
   uint16_t internal_port{0};
   uint16_t external_port{0};  // 0 = none
   uint32_t pid{0};
+  uint64_t process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{
@@ -46,6 +48,7 @@ struct RegisterMessage {
     w.Write<uint16_t>(internal_port);
     w.Write<uint16_t>(external_port);
     w.Write<uint32_t>(pid);
+    w.Write(process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<RegisterMessage> {
@@ -68,6 +71,9 @@ struct RegisterMessage {
     auto pid = r.Read<uint32_t>();
     if (!pid) return pid.Error();
     msg.pid = *pid;
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.process_instance = *instance;
     return msg;
   }
 };
@@ -117,6 +123,7 @@ struct DeregisterMessage {
   ProcessType process_type{ProcessType::kBaseApp};
   std::string name;
   uint32_t pid{0};
+  uint64_t process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::Machined::kDeregister),
@@ -132,6 +139,7 @@ struct DeregisterMessage {
     w.Write<uint8_t>(static_cast<uint8_t>(process_type));
     w.WriteString(name);
     w.Write<uint32_t>(pid);
+    w.Write(process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<DeregisterMessage> {
@@ -145,6 +153,9 @@ struct DeregisterMessage {
     auto pid = r.Read<uint32_t>();
     if (!pid) return pid.Error();
     msg.pid = *pid;
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.process_instance = *instance;
     return msg;
   }
 };
@@ -195,6 +206,7 @@ struct QueryResponse {
       w.Write<uint16_t>(p.external_addr.Port());
       w.Write<uint32_t>(p.pid);
       w.Write<float>(p.load);
+      w.Write(p.process_instance);
     }
   }
 
@@ -233,6 +245,9 @@ struct QueryResponse {
       auto load = r.Read<float>();
       if (!load) return load.Error();
       p.load = *load;
+      auto instance = r.Read<uint64_t>();
+      if (!instance) return instance.Error();
+      p.process_instance = *instance;
       resp.processes.push_back(std::move(p));
     }
     return resp;
@@ -304,6 +319,7 @@ struct BirthNotification {
   Address internal_addr;
   Address external_addr;
   uint32_t pid{0};
+  uint64_t process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::Machined::kBirthNotification),
@@ -323,6 +339,7 @@ struct BirthNotification {
     w.Write<uint32_t>(external_addr.Ip());
     w.Write<uint16_t>(external_addr.Port());
     w.Write<uint32_t>(pid);
+    w.Write(process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<BirthNotification> {
@@ -346,6 +363,9 @@ struct BirthNotification {
     auto pid = r.Read<uint32_t>();
     if (!pid) return pid.Error();
     msg.pid = *pid;
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.process_instance = *instance;
     return msg;
   }
 };
@@ -355,6 +375,7 @@ struct DeathNotification {
   std::string name;
   Address internal_addr;
   uint8_t reason{0};  // 0=normal, 1=connection_lost, 2=timeout
+  uint64_t process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::Machined::kDeathNotification),
@@ -372,6 +393,7 @@ struct DeathNotification {
     w.Write<uint32_t>(internal_addr.Ip());
     w.Write<uint16_t>(internal_addr.Port());
     w.Write<uint8_t>(reason);
+    w.Write(process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<DeathNotification> {
@@ -390,6 +412,9 @@ struct DeathNotification {
     auto reason = r.Read<uint8_t>();
     if (!reason) return reason.Error();
     msg.reason = *reason;
+    auto instance = r.Read<uint64_t>();
+    if (!instance) return instance.Error();
+    msg.process_instance = *instance;
     return msg;
   }
 };

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <format>
 
+#include "db/write_operation.h"
 #include "foundation/clock.h"
 #include "foundation/log.h"
 #include "loginapp/login_messages.h"
@@ -19,6 +20,12 @@ namespace {
 
 constexpr Duration kDbAppMgrLoadReportInterval = std::chrono::seconds(1);
 constexpr int kCreateDbidDuplicateRetryLimit = 16;
+
+auto SameCheckoutRequest(const dbapp::CheckoutEntity& a, const dbapp::CheckoutEntity& b) -> bool {
+  return a.operation_id == b.operation_id && a.mode == b.mode && a.type_id == b.type_id &&
+         a.dbid == b.dbid && a.identifier == b.identifier && a.entity_id == b.entity_id &&
+         a.owner_app_id == b.owner_app_id && a.owner_process_instance == b.owner_process_instance;
+}
 
 }  // namespace
 
@@ -127,7 +134,7 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
   GetMachinedClient().Subscribe(machined::ListenerType::kDeath, ProcessType::kBaseApp,
                                 nullptr,  // no birth callback needed
                                 [this](const machined::DeathNotification& notif) {
-                                  OnBaseappDeath(notif.internal_addr, notif.name, notif.reason);
+                                  OnBaseappDeath(notif.internal_addr, notif.process_instance);
                                 });
   GetMachinedClient().Subscribe(
       machined::ListenerType::kBoth, ProcessType::kDbAppMgr,
@@ -138,12 +145,6 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
   account_type_id_ = cfg.account_type_id;
 
   id_allocator_ = std::make_unique<EntityIdAllocator>(*database_);
-  id_allocator_->Startup([](bool ok) {
-    if (!ok)
-      ATLAS_LOG_ERROR("DBApp: EntityIdAllocator startup failed");
-    else
-      ATLAS_LOG_INFO("DBApp: EntityIdAllocator ready");
-  });
 
   ATLAS_LOG_INFO("DBApp: initialised (backend={}, auto_create={}, account_type={})", db_cfg.type,
                  auto_create_accounts_, account_type_id_);
@@ -151,21 +152,12 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
 }
 
 void DBApp::Fini() {
-  if (id_allocator_ && database_) {
-    id_allocator_->Persist([](bool ok) {
-      if (!ok)
-        ATLAS_LOG_WARNING(
-            "DBApp: final EntityIdAllocator persist "
-            "failed");
-    });
-    // Flush the deferred persist callback before shutting down the DB
-    database_->ProcessResults();
-    id_allocator_.reset();
-  }
   if (database_) {
     database_->EndBatch();
+    database_->ProcessResults();
     database_->Shutdown();
     database_.reset();
+    id_allocator_.reset();
   }
   ManagerApp::Fini();
 }
@@ -177,7 +169,12 @@ void DBApp::OnTickComplete() {
     database_->ProcessResults();  // Pump deferred callbacks
     database_->BeginBatch();      // Open batch for next tick
   }
-  if (id_allocator_) id_allocator_->PersistIfNeeded([](bool) {});
+  std::vector<std::pair<Address, uint64_t>> ready;
+  for (const auto& process : process_retirements_) {
+    if (!process.in_flight && Clock::now() >= process.next_attempt)
+      ready.emplace_back(process.addr, process.instance);
+  }
+  for (const auto& [addr, instance] : ready) RetireBaseappProcess(addr, instance);
   ReportLoadToDbAppMgr();
 }
 
@@ -209,9 +206,6 @@ void DBApp::RegisterWatchers() {
   reg.Add<uint64_t>("dbapp/abort_checkout_late_hit_total",
                     std::function<uint64_t()>([this] { return abort_checkout_late_hit_total_; }));
 
-  reg.Add<std::string>("dbapp/next_entity_id", std::function<std::string()>{[this]() {
-                         return std::to_string(id_allocator_ ? id_allocator_->next_id() : 0u);
-                       }});
   reg.Add<uint32_t>("dbapp/dbapp_id", std::function<uint32_t()>([this] { return dbapp_id_; }));
   reg.Add<uint32_t>("dbapp/shard_table_version",
                     std::function<uint32_t()>([this] { return shard_table_version_; }));
@@ -225,7 +219,6 @@ auto DBApp::BuildDbConfig() const -> DatabaseConfig {
   const auto& cfg = Config();
   DatabaseConfig db_cfg;
   db_cfg.type = cfg.db_type;
-  db_cfg.xml_dir = cfg.db_xml_dir;
   db_cfg.sqlite_path = cfg.db_sqlite_path;
   db_cfg.sqlite_wal = cfg.db_sqlite_wal;
   db_cfg.sqlite_busy_timeout_ms = cfg.db_sqlite_busy_timeout_ms;
@@ -258,6 +251,7 @@ auto DBApp::RequestCacheKeyHash::operator()(const RequestCacheKey& key) const no
   auto h = std::hash<Address>{}(key.reply_addr);
   h ^= static_cast<std::size_t>(key.request_id) + std::size_t{0x9E3779B97F4A7C15ULL} + (h << 6) +
        (h >> 2);
+  for (auto byte : key.operation_id) h = (h ^ std::to_integer<uint8_t>(byte)) * 1099511628211ULL;
   return h;
 }
 
@@ -290,23 +284,11 @@ auto DBApp::SendCheckoutAck(const RequestCacheKey& key, const dbapp::CheckoutEnt
   return true;
 }
 
-void DBApp::RememberWriteAck(const RequestCacheKey& key, const dbapp::WriteEntityAck& ack) {
-  auto [it, inserted] = write_ack_cache_.try_emplace(key, ack);
+void DBApp::RememberCheckoutAck(const RequestCacheKey& key, const dbapp::CheckoutEntity& request,
+                                const dbapp::CheckoutEntityAck& ack) {
+  auto [it, inserted] = checkout_ack_cache_.try_emplace(key, CachedCheckoutReply{request, ack});
   if (!inserted) {
-    it->second = ack;
-    return;
-  }
-  write_ack_order_.push_back(key);
-  while (write_ack_cache_.size() > kRequestAckCacheLimit && !write_ack_order_.empty()) {
-    write_ack_cache_.erase(write_ack_order_.front());
-    write_ack_order_.pop_front();
-  }
-}
-
-void DBApp::RememberCheckoutAck(const RequestCacheKey& key, const dbapp::CheckoutEntityAck& ack) {
-  auto [it, inserted] = checkout_ack_cache_.try_emplace(key, ack);
-  if (!inserted) {
-    it->second = ack;
+    it->second = CachedCheckoutReply{request, ack};
     return;
   }
   checkout_ack_order_.push_back(key);
@@ -579,14 +561,15 @@ void DBApp::PutCreateEntityWithRetry(const dbappmgr::ShardEntry& shard, Database
                                      uint16_t type_id, WriteFlags flags,
                                      std::vector<std::byte> blob, std::string identifier,
                                      std::optional<std::string> password_hash,
-                                     std::function<void(PutResult)> callback) {
+                                     std::function<void(PutResult)> callback,
+                                     DatabaseWriteOperation operation) {
   auto final_callback = std::make_shared<std::function<void(PutResult)>>(std::move(callback));
   auto attempt = std::make_shared<std::function<void(DatabaseID, int)>>();
   std::weak_ptr<std::function<void(DatabaseID, int)>> weak_attempt = attempt;
 
   *attempt = [this, weak_attempt, shard, type_id, flags, blob = std::move(blob),
               identifier = std::move(identifier), password_hash = std::move(password_hash),
-              final_callback](DatabaseID attempt_dbid, int retries_left) {
+              final_callback, operation](DatabaseID attempt_dbid, int retries_left) {
     auto attempt_keepalive = weak_attempt.lock();
     auto on_put = [this, weak_attempt, attempt_keepalive, shard, retries_left,
                    final_callback](PutResult result) {
@@ -609,7 +592,8 @@ void DBApp::PutCreateEntityWithRetry(const dbappmgr::ShardEntry& shard, Database
       database_->PutEntityWithPassword(attempt_dbid, type_id, flags, blob, identifier,
                                        *password_hash, std::move(on_put));
     } else {
-      database_->PutEntity(attempt_dbid, type_id, flags, blob, identifier, std::move(on_put));
+      database_->PutEntityWithOperation(operation, attempt_dbid, type_id, flags, blob, identifier,
+                                        std::move(on_put));
     }
   };
 
@@ -620,33 +604,73 @@ void DBApp::OnWriteEntity(const Address& src, Channel* ch, const dbapp::WriteEnt
   if (ch == nullptr) return;
 
   TimePoint t0 = Clock::now();
-  const RequestCacheKey key{src, msg.request_id};
-  if (auto cached = write_ack_cache_.find(key); cached != write_ack_cache_.end()) {
+  const RequestCacheKey key{src, msg.request_id, msg.operation_id};
+  DatabaseWriteOperation operation{msg.operation_id, msg.dbid, msg.flags, msg.entity_id};
+  if (msg.owner.ownership_version != 0) {
+    operation.expected_owner = msg.owner;
+  }
+  if (HasFlag(msg.flags, WriteFlags::kCreateNew)) {
+    operation.create_owner =
+        CheckoutInfo{src, msg.owner.app_id, msg.entity_id, 0, msg.owner.process_instance};
+  }
+  auto reject = [this, key, t0, &msg, ch](std::string error, DatabaseErrorKind kind) {
+    dbapp::WriteEntityAck ack;
+    ack.operation_id = msg.operation_id;
+    ack.request_id = msg.request_id;
+    ack.dbid = msg.dbid;
+    ack.error_kind = kind;
+    ack.error = std::move(error);
+    ack.current_shard_table_version = shard_table_version_;
     write_reply_latency_.Record(Clock::now() - t0);
-    (void)SendWriteAck(key, cached->second, ch);
+    (void)SendWriteAck(key, ack, ch);
+  };
+  if (operation.expected_owner && msg.owner.base_addr != src) {
+    reject("checkout_owner_channel_mismatch", DatabaseErrorKind::kOwnershipConflict);
     return;
   }
-  if (pending_write_requests_.contains(key)) {
-    ATLAS_LOG_DEBUG("DBApp: duplicate in-flight WriteEntity request_id={} from {}", msg.request_id,
-                    src.ToString());
+  if (!operation.IsValid()) {
+    reject("missing_operation_id", DatabaseErrorKind::kOperationConflict);
+    return;
+  }
+  if (msg.owner.process_instance == 0 || msg.owner.process_instance > (UINT64_MAX >> 1)) {
+    reject("invalid_checkout_process_instance", DatabaseErrorKind::kOwnershipConflict);
+    return;
+  }
+  auto hash = HashWriteOperation(operation, msg.type_id, msg.blob, msg.identifier);
+  if (!hash) {
+    reject(std::string(hash.Error().Message()), DatabaseErrorKind::kNone);
+    return;
+  }
+  if (auto pending = pending_write_requests_.find(key); pending != pending_write_requests_.end()) {
+    if (pending->second != *hash)
+      reject("operation_id_reused", DatabaseErrorKind::kOperationConflict);
     return;
   }
 
-  auto send_ack = [this, key, t0](PutResult result) {
+  auto send_ack = [this, key, t0, dbid = msg.dbid, type_id = msg.type_id, owner = msg.owner,
+                   logoff = HasFlag(msg.flags, WriteFlags::kLogOff)](PutResult result) {
+    if (result.success && logoff) {
+      (void)checkout_mgr_.CheckinIfOwner(dbid, type_id, owner);
+    }
     dbapp::WriteEntityAck ack;
+    ack.operation_id = key.operation_id;
     ack.request_id = key.request_id;
     ack.success = result.success;
+    ack.error_kind = result.error_kind;
     ack.dbid = result.dbid;
+    if (result.success && result.checkout_owner) {
+      ack.owner = *result.checkout_owner;
+    }
     ack.current_shard_table_version = shard_table_version_;
     ack.error = std::move(result.error);
     pending_write_requests_.erase(key);
-    RememberWriteAck(key, ack);
     write_reply_latency_.Record(Clock::now() - t0);
     (void)SendWriteAck(key, ack, nullptr);
   };
 
   if (!AcceptsShardTableVersion(msg.shard_table_version)) {
     dbapp::WriteEntityAck ack;
+    ack.operation_id = msg.operation_id;
     ack.request_id = msg.request_id;
     ack.success = false;
     ack.dbid = msg.dbid;
@@ -656,9 +680,6 @@ void DBApp::OnWriteEntity(const Address& src, Channel* ch, const dbapp::WriteEnt
     (void)SendWriteAck(key, ack, ch);
     return;
   }
-
-  // Checkin path: LogOff flag means entity is going offline - clear checkout
-  if (HasFlag(msg.flags, WriteFlags::kLogOff)) checkout_mgr_.Checkin(msg.dbid, msg.type_id);
 
   DatabaseID write_dbid = msg.dbid;
   WriteFlags write_flags = msg.flags;
@@ -675,59 +696,128 @@ void DBApp::OnWriteEntity(const Address& src, Channel* ch, const dbapp::WriteEnt
     if (const auto* shard = FindShard(write_dbid); shard != nullptr) create_shard = *shard;
   }
 
-  pending_write_requests_.insert(key);
+  pending_write_requests_.emplace(key, *hash);
   if (create_shard.has_value()) {
     PutCreateEntityWithRetry(*create_shard, write_dbid, msg.type_id, write_flags, msg.blob,
-                             msg.identifier, std::nullopt, std::move(send_ack));
+                             msg.identifier, std::nullopt, std::move(send_ack), operation);
   } else {
-    database_->PutEntity(write_dbid, msg.type_id, write_flags, msg.blob, msg.identifier,
-                         std::move(send_ack));
+    database_->PutEntityWithOperation(operation, write_dbid, msg.type_id, write_flags, msg.blob,
+                                      msg.identifier, std::move(send_ack));
   }
 }
 
 void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::CheckoutEntity& msg) {
   if (ch == nullptr) return;
 
+  DatabaseCheckoutOperation operation;
+  operation.id = msg.operation_id;
+  operation.dbid = msg.mode == dbapp::LoadMode::kByName ? kInvalidDBID : msg.dbid;
+  operation.type_id = msg.type_id;
+  operation.identifier = msg.identifier;
+  operation.owner =
+      CheckoutInfo{src, msg.owner_app_id, msg.entity_id, 0, msg.owner_process_instance};
+  if (!operation.IsValid() || msg.owner_process_instance == 0 ||
+      msg.owner_process_instance > (UINT64_MAX >> 1) ||
+      (msg.mode != dbapp::LoadMode::kByName && msg.mode != dbapp::LoadMode::kByDbid) ||
+      (msg.mode == dbapp::LoadMode::kByDbid && msg.dbid == kInvalidDBID)) {
+    dbapp::CheckoutEntityAck ack;
+    ack.operation_id = msg.operation_id;
+    ack.request_id = msg.request_id;
+    ack.status = dbapp::CheckoutStatus::kDbError;
+    ack.error = "invalid_checkout_operation";
+    ack.error_kind = DatabaseErrorKind::kOperationConflict;
+    (void)SendCheckoutAck({src, msg.request_id, msg.operation_id}, ack, ch);
+    return;
+  }
+
   ATLAS_LOG_DEBUG("DBApp: checkout request_id={} dbid={} type_id={} from {}:{}", msg.request_id,
                   msg.dbid, msg.type_id, src.Ip(), src.Port());
 
   TimePoint t0 = Clock::now();
-  const RequestCacheKey key{src, msg.request_id};
+  const RequestCacheKey key{src, msg.request_id, msg.operation_id};
   if (auto cached = checkout_ack_cache_.find(key); cached != checkout_ack_cache_.end()) {
+    const auto& request = cached->second.request;
+    if (!SameCheckoutRequest(request, msg)) {
+      dbapp::CheckoutEntityAck ack;
+      ack.operation_id = msg.operation_id;
+      ack.request_id = msg.request_id;
+      ack.status = dbapp::CheckoutStatus::kDbError;
+      ack.error = "checkout_request_conflict";
+      ack.error_kind = DatabaseErrorKind::kOperationConflict;
+      (void)SendCheckoutAck(key, ack, ch);
+      return;
+    }
+    if (cached->second.ack.status == dbapp::CheckoutStatus::kSuccess) {
+      auto ack = cached->second.ack;
+      database_->GetEntity(
+          ack.dbid, msg.type_id, [this, key, t0, ack = std::move(ack)](GetResult result) mutable {
+            const auto& held = result.checked_out_by;
+            if (!result.success || !held || held->ownership_version != ack.checkout_version ||
+                held->base_addr != ack.holder_addr || held->app_id != ack.holder_app_id ||
+                held->entity_id != ack.holder_entity_id ||
+                held->process_instance != ack.holder_process_instance) {
+              ack.status = dbapp::CheckoutStatus::kDbError;
+              ack.blob.clear();
+              ack.error_kind = !result.success && result.error_kind != DatabaseErrorKind::kNotFound
+                                   ? DatabaseErrorKind::kCommitUnknown
+                                   : DatabaseErrorKind::kOwnershipConflict;
+              ack.error = result.error.empty() ? "checkout_lease_expired" : std::move(result.error);
+            }
+            checkout_reply_latency_.Record(Clock::now() - t0);
+            (void)SendCheckoutAck(key, ack, nullptr);
+          });
+      return;
+    }
     checkout_reply_latency_.Record(Clock::now() - t0);
-    (void)SendCheckoutAck(key, cached->second, ch);
+    (void)SendCheckoutAck(key, cached->second.ack, ch);
     return;
   }
 
   CheckoutInfo owner;
-  owner.base_addr = (msg.owner_addr.Port() != 0) ? msg.owner_addr : src;
+  owner.base_addr = src;
+  owner.app_id = msg.owner_app_id;
   owner.entity_id = msg.entity_id;
+  owner.process_instance = msg.owner_process_instance;
 
-  auto send_ack = [this, key, t0](GetResult result) {
+  auto send_ack = [this, key, t0, owner, msg](GetResult result) {
     dbapp::CheckoutEntityAck ack;
+    ack.operation_id = msg.operation_id;
     ack.request_id = key.request_id;
     ack.dbid = result.data.dbid;
     ack.current_shard_table_version = shard_table_version_;
+    ack.error_kind = result.error_kind;
 
     if (!result.success) {
-      ack.status = dbapp::CheckoutStatus::kNotFound;
+      ack.status = result.error_kind == DatabaseErrorKind::kNotFound
+                       ? dbapp::CheckoutStatus::kNotFound
+                       : dbapp::CheckoutStatus::kDbError;
       ack.error = std::move(result.error);
     } else if (result.checked_out_by.has_value()) {
       ack.status = dbapp::CheckoutStatus::kAlreadyCheckedOut;
       ack.holder_addr = result.checked_out_by->base_addr;
       ack.holder_app_id = result.checked_out_by->app_id;
       ack.holder_entity_id = result.checked_out_by->entity_id;
+      ack.holder_process_instance = result.checked_out_by->process_instance;
     } else {
       ack.status = dbapp::CheckoutStatus::kSuccess;
+      ack.checkout_version = result.checkout_version;
+      ack.holder_addr = owner.base_addr;
+      ack.holder_app_id = owner.app_id;
+      ack.holder_entity_id = owner.entity_id;
+      ack.holder_process_instance = owner.process_instance;
       ack.blob = std::move(result.data.blob);
     }
-    RememberCheckoutAck(key, ack);
+    if (ack.error_kind != DatabaseErrorKind::kCommitUnknown &&
+        (!database_->SupportsMultiDbapp() || ack.status == dbapp::CheckoutStatus::kSuccess)) {
+      RememberCheckoutAck(key, msg, ack);
+    }
     checkout_reply_latency_.Record(Clock::now() - t0);
     (void)SendCheckoutAck(key, ack, nullptr);
   };
 
   if (!AcceptsShardTableVersion(msg.shard_table_version)) {
     dbapp::CheckoutEntityAck ack;
+    ack.operation_id = msg.operation_id;
     ack.request_id = msg.request_id;
     ack.status = dbapp::CheckoutStatus::kDbError;
     ack.dbid = msg.dbid;
@@ -738,7 +828,18 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
     return;
   }
 
-  if (pending_checkout_requests_.contains(key)) {
+  if (auto pending = pending_checkout_requests_.find(key);
+      pending != pending_checkout_requests_.end()) {
+    if (!SameCheckoutRequest(pending->second.request, msg)) {
+      dbapp::CheckoutEntityAck ack;
+      ack.operation_id = msg.operation_id;
+      ack.request_id = msg.request_id;
+      ack.status = dbapp::CheckoutStatus::kDbError;
+      ack.error = "checkout_request_conflict";
+      ack.error_kind = DatabaseErrorKind::kOperationConflict;
+      (void)SendCheckoutAck(key, ack, ch);
+      return;
+    }
     ATLAS_LOG_DEBUG("DBApp: duplicate in-flight CheckoutEntity request_id={} from {}",
                     msg.request_id, src.ToString());
     return;
@@ -747,8 +848,13 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
   auto co_result = checkout_mgr_.TryCheckout(
       msg.mode == dbapp::LoadMode::kByDbid ? msg.dbid : kInvalidDBID, msg.type_id, owner);
 
-  if (co_result.status == CheckoutManager::CheckoutStatus::kAlreadyCheckedOut ||
-      co_result.status == CheckoutManager::CheckoutStatus::kPendingCheckout) {
+  const auto& held = co_result.current_owner;
+  const bool same_holder = held.base_addr == owner.base_addr && held.app_id == owner.app_id &&
+                           held.entity_id == owner.entity_id &&
+                           held.process_instance == owner.process_instance;
+  if (!same_holder && ((co_result.status == CheckoutManager::CheckoutStatus::kAlreadyCheckedOut &&
+                        !database_->SupportsMultiDbapp()) ||
+                       co_result.status == CheckoutManager::CheckoutStatus::kPendingCheckout)) {
     ATLAS_LOG_DEBUG(
         "DBApp: checkout conflict request_id={} dbid={} type_id={} owner={}:{} app_id={} "
         "entity_id={} state={}",
@@ -758,6 +864,7 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
         co_result.status == CheckoutManager::CheckoutStatus::kAlreadyCheckedOut ? "confirmed"
                                                                                 : "pending");
     dbapp::CheckoutEntityAck ack;
+    ack.operation_id = msg.operation_id;
     ack.request_id = msg.request_id;
     ack.status = dbapp::CheckoutStatus::kAlreadyCheckedOut;
     ack.dbid = msg.dbid;
@@ -765,7 +872,11 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
     ack.holder_addr = co_result.current_owner.base_addr;
     ack.holder_app_id = co_result.current_owner.app_id;
     ack.holder_entity_id = co_result.current_owner.entity_id;
-    RememberCheckoutAck(key, ack);
+    ack.holder_process_instance = co_result.current_owner.process_instance;
+    if (ack.error_kind != DatabaseErrorKind::kCommitUnknown &&
+        (!database_->SupportsMultiDbapp() || ack.status == dbapp::CheckoutStatus::kSuccess)) {
+      RememberCheckoutAck(key, msg, ack);
+    }
     checkout_reply_latency_.Record(Clock::now() - t0);
     (void)SendCheckoutAck(key, ack, ch);
     return;
@@ -773,103 +884,193 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
 
   auto dbid = msg.dbid;
   auto type_id = msg.type_id;
-  pending_checkout_requests_[key] = PendingCheckoutRequest{dbid, type_id, src, false, kInvalidDBID};
+  pending_checkout_requests_[key] = PendingCheckoutRequest{msg, false};
 
-  auto on_db_done = [this, key, dbid, type_id,
+  auto on_db_done = [this, key, dbid, type_id, owner, msg,
+                     by_name = msg.mode == dbapp::LoadMode::kByName,
                      send_ack = std::move(send_ack)](GetResult result) mutable {
     bool canceled = false;
+    bool retired = false;
     DatabaseID cleanup_dbid = dbid;
-    DatabaseID cleared_dbid = kInvalidDBID;
     if (auto pending_it = pending_checkout_requests_.find(key);
         pending_it != pending_checkout_requests_.end()) {
       canceled = pending_it->second.canceled;
-      if (pending_it->second.dbid != kInvalidDBID) {
-        cleanup_dbid = pending_it->second.dbid;
+      retired = pending_it->second.retired;
+      if (pending_it->second.request.dbid != kInvalidDBID) {
+        cleanup_dbid = pending_it->second.request.dbid;
       }
-      cleared_dbid = pending_it->second.cleared_dbid;
       pending_checkout_requests_.erase(pending_it);
     }
 
     if (result.success && result.data.dbid != kInvalidDBID) {
       cleanup_dbid = result.data.dbid;
     }
+    if (result.success && !result.checked_out_by &&
+        (result.data.dbid == kInvalidDBID || result.checkout_version == 0)) {
+      result.success = false;
+      result.error = "invalid_checkout_lease";
+      result.error_kind = DatabaseErrorKind::kCommitUnknown;
+    }
 
-    if (canceled) {
-      if (cleanup_dbid != cleared_dbid) {
-        checkout_mgr_.ReleaseCheckout(cleanup_dbid, type_id);
-        if (cleanup_dbid != kInvalidDBID) {
-          database_->MarkCheckoutCleared(cleanup_dbid, type_id);
-        }
+    if (retired) {
+      (void)checkout_mgr_.CheckinIfOwner(by_name ? kInvalidDBID : dbid, type_id, owner);
+      if (result.success && !result.checked_out_by && result.checkout_version != 0) {
+        auto acquired = owner;
+        acquired.ownership_version = result.checkout_version;
+        database_->ReleaseCheckout(cleanup_dbid, type_id, acquired, [](Result<void>) {});
       }
-      ATLAS_LOG_DEBUG("DBApp: checkout request_id={} canceled before reply", key.request_id);
       return;
     }
-
-    if (!result.success || result.checked_out_by.has_value()) {
-      checkout_mgr_.ReleaseCheckout(cleanup_dbid, type_id);
-    } else {
-      checkout_mgr_.ConfirmCheckout(result.data.dbid, type_id);
+    if (by_name) {
+      (void)checkout_mgr_.CheckinIfOwner(kInvalidDBID, type_id, owner);
+      if (result.success && !result.checked_out_by) {
+        (void)checkout_mgr_.TryCheckout(cleanup_dbid, type_id, owner);
+      }
     }
+
+    if (result.success && !result.checked_out_by) {
+      if (auto current = checkout_mgr_.GetOwner(result.data.dbid, type_id);
+          current && current->ownership_version != 0 &&
+          current->ownership_version < result.checkout_version) {
+        (void)checkout_mgr_.CheckinIfOwner(result.data.dbid, type_id, *current);
+        (void)checkout_mgr_.TryCheckout(result.data.dbid, type_id, owner);
+      }
+      (void)checkout_mgr_.ConfirmCheckoutIfOwner(result.data.dbid, type_id, owner,
+                                                 result.checkout_version);
+    }
+    if (!result.success || result.checked_out_by) {
+      (void)checkout_mgr_.CheckinIfOwner(cleanup_dbid, type_id, owner);
+    }
+    if (canceled) return;
     send_ack(std::move(result));
   };
 
-  if (msg.mode == dbapp::LoadMode::kByName) {
-    database_->CheckoutEntityByName(msg.type_id, msg.identifier, owner, std::move(on_db_done));
-  } else {
-    database_->CheckoutEntity(msg.dbid, msg.type_id, owner, std::move(on_db_done));
-  }
+  database_->CheckoutWithOperation(operation, std::move(on_db_done));
 }
 
 void DBApp::OnAbortCheckout(const Address& src, Channel* ch, const dbapp::AbortCheckout& msg) {
   if (ch == nullptr) return;
-
   ++abort_checkout_total_;
-  const RequestCacheKey key{src, msg.request_id};
-  auto it = pending_checkout_requests_.find(key);
-  if (it != pending_checkout_requests_.end()) {
-    ++abort_checkout_pending_hit_total_;
-    it->second.canceled = true;
-    if (it->second.dbid != kInvalidDBID && it->second.cleared_dbid != it->second.dbid) {
-      checkout_mgr_.ReleaseCheckout(it->second.dbid, it->second.type_id);
-      database_->MarkCheckoutCleared(it->second.dbid, it->second.type_id);
-      it->second.cleared_dbid = it->second.dbid;
+  const RequestCacheKey key{src, msg.request_id, msg.operation_id};
+  dbapp::CheckoutEntity request;
+  request.operation_id = msg.operation_id;
+  request.request_id = msg.request_id;
+  request.dbid = msg.dbid;
+  request.type_id = msg.type_id;
+  request.mode = msg.mode;
+  request.identifier = msg.identifier;
+  request.entity_id = msg.entity_id;
+  request.owner_app_id = msg.owner_app_id;
+  request.owner_process_instance = msg.owner_process_instance;
+  DatabaseCheckoutOperation operation;
+  operation.id = msg.operation_id;
+  operation.dbid = msg.mode == dbapp::LoadMode::kByName ? kInvalidDBID : msg.dbid;
+  operation.type_id = msg.type_id;
+  operation.identifier = msg.identifier;
+  operation.owner =
+      CheckoutInfo{src, msg.owner_app_id, msg.entity_id, 0, msg.owner_process_instance};
+  auto reply = [this, key](bool success) {
+    dbapp::AbortCheckoutAck ack;
+    ack.operation_id = key.operation_id;
+    ack.request_id = key.request_id;
+    ack.success = success;
+    if (auto* channel = ResolveReplyChannel(key.reply_addr)) (void)channel->SendMessage(ack);
+  };
+  if (!operation.IsValid() || msg.owner_process_instance == 0 ||
+      msg.owner_process_instance > (UINT64_MAX >> 1) ||
+      (msg.mode != dbapp::LoadMode::kByDbid && msg.mode != dbapp::LoadMode::kByName) ||
+      (msg.mode == dbapp::LoadMode::kByDbid && msg.dbid == kInvalidDBID)) {
+    reply(false);
+    return;
+  }
+  auto pending = pending_checkout_requests_.find(key);
+  if (pending != pending_checkout_requests_.end()) {
+    if (!SameCheckoutRequest(pending->second.request, request)) {
+      reply(false);
+      return;
     }
+    ++abort_checkout_pending_hit_total_;
+    if (pending->second.canceled) return;
+    pending->second.canceled = true;
   } else {
     ++abort_checkout_late_hit_total_;
-    checkout_mgr_.Checkin(msg.dbid, msg.type_id);
-    if (msg.dbid != kInvalidDBID) {
-      database_->MarkCheckoutCleared(msg.dbid, msg.type_id);
-    }
   }
-
-  dbapp::AbortCheckoutAck ack;
-  ack.request_id = msg.request_id;
-  ack.success = true;
-  if (auto* reply_ch = this->ResolveReplyChannel(src)) {
-    (void)reply_ch->SendMessage(ack);
-  }
+  database_->ResolveCheckoutOperation(
+      operation, [this, operation, reply = std::move(reply)](GetResult result) mutable {
+        auto owner = operation.owner;
+        owner.ownership_version = result.checkout_version;
+        const auto dbid = result.data.dbid;
+        auto finish = [this, dbid, type_id = operation.type_id, owner,
+                       reply = std::move(reply)](Result<void> released) mutable {
+          if (released) (void)checkout_mgr_.CheckinIfOwner(dbid, type_id, owner);
+          reply(released.HasValue());
+        };
+        if (result.success && dbid != kInvalidDBID && owner.ownership_version != 0 &&
+            !result.checked_out_by) {
+          database_->ReleaseCheckout(dbid, operation.type_id, owner, std::move(finish));
+        } else if ((result.error_kind == DatabaseErrorKind::kOwnershipConflict ||
+                    result.error_kind == DatabaseErrorKind::kNotFound) &&
+                   dbid != kInvalidDBID && owner.ownership_version != 0) {
+          finish(Result<void>{});
+        } else {
+          finish(Error{ErrorCode::kCommitUnknown, "checkout cancellation is not confirmed"});
+        }
+      });
 }
 
-void DBApp::OnCheckinEntity(const Address& /*src*/, Channel* /*ch*/,
-                            const dbapp::CheckinEntity& msg) {
-  ATLAS_LOG_DEBUG("DBApp: checkin dbid={} type_id={}", msg.dbid, msg.type_id);
-  checkout_mgr_.Checkin(msg.dbid, msg.type_id);
-  database_->MarkCheckoutCleared(msg.dbid, msg.type_id);
+void DBApp::OnCheckinEntity(const Address& src, Channel* /*ch*/, const dbapp::CheckinEntity& msg) {
+  auto reply = [this, src, msg](bool success, std::string error) {
+    if (success) (void)checkout_mgr_.CheckinIfOwner(msg.dbid, msg.type_id, msg.owner);
+    if (auto* channel = ResolveReplyChannel(src))
+      (void)channel->SendMessage(dbapp::CheckinEntityAck{msg, success, std::move(error)});
+  };
+  if (msg.owner.base_addr != src || msg.owner.ownership_version == 0 ||
+      msg.owner.process_instance == 0 || msg.dbid <= 0 || msg.type_id == 0) {
+    reply(false, "invalid_checkout_owner");
+    return;
+  }
+  database_->ReleaseCheckout(
+      msg.dbid, msg.type_id, msg.owner,
+      [this, msg, reply = std::move(reply)](Result<void> result) mutable {
+        if (result) {
+          reply(true, {});
+          return;
+        }
+        database_->GetEntity(
+            msg.dbid, msg.type_id, [msg, reply = std::move(reply)](GetResult current) mutable {
+              const bool inactive =
+                  current.success
+                      ? !current.checked_out_by ||
+                            current.checked_out_by->ownership_version > msg.owner.ownership_version
+                      : current.error_kind == DatabaseErrorKind::kNotFound;
+              reply(inactive, inactive ? "" : "checkout_release_unconfirmed");
+            });
+      });
 }
 
 void DBApp::OnDeleteEntity(const Address& src, Channel* ch, const dbapp::DeleteEntity& msg) {
   if (ch == nullptr) return;
-
-  database_->DelEntity(msg.dbid, msg.type_id,
-                       [this, reply_addr = src, request_id = msg.request_id](DelResult result) {
-                         dbapp::DeleteEntityAck ack;
-                         ack.request_id = request_id;
-                         ack.success = result.success;
-                         ack.error = std::move(result.error);
-                         if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-                           (void)reply_ch->SendMessage(ack);
-                         }
-                       });
+  DatabaseWriteOperation operation{msg.operation_id, msg.dbid, WriteFlags::kDelete,
+                                   msg.owner.entity_id, msg.owner};
+  if (!operation.IsValid() || msg.owner.ownership_version == 0 || msg.owner.base_addr != src) {
+    dbapp::DeleteEntityAck ack;
+    ack.request_id = msg.request_id;
+    ack.error = "missing_or_invalid_checkout_owner";
+    (void)ch->SendMessage(ack);
+    return;
+  }
+  database_->PutEntityWithOperation(operation, msg.dbid, msg.type_id, WriteFlags::kDelete, {}, "",
+                                    [this, src, msg](PutResult result) {
+                                      if (result.success)
+                                        (void)checkout_mgr_.CheckinIfOwner(msg.dbid, msg.type_id,
+                                                                           msg.owner);
+                                      dbapp::DeleteEntityAck ack;
+                                      ack.request_id = msg.request_id;
+                                      ack.success = result.success;
+                                      ack.error = std::move(result.error);
+                                      if (auto* reply = ResolveReplyChannel(src))
+                                        (void)reply->SendMessage(ack);
+                                    });
 }
 
 void DBApp::OnLookupEntity(const Address& src, Channel* ch, const dbapp::LookupEntity& msg) {
@@ -896,17 +1097,19 @@ void DBApp::OnGetEntityIds(const Address& src, Channel* ch, const dbapp::GetEnti
     return;
   }
 
-  auto [start, end] = id_allocator_->Allocate(msg.count);
-  ATLAS_LOG_DEBUG("DBApp: allocated entity IDs [{}, {}] (count={}) for {}:{}", start, end,
-                  msg.count, src.Ip(), src.Port());
-
-  dbapp::GetEntityIdsAck ack;
-  ack.start = start;
-  ack.end = end;
-  ack.count = msg.count;
-  if (auto* reply_ch = ResolveReplyChannel(src)) {
-    (void)reply_ch->SendMessage(ack);
-  }
+  id_allocator_->Allocate(msg.count, [this, reply_addr = src](Result<EntityIdRange> range) {
+    dbapp::GetEntityIdsAck ack;
+    if (range) {
+      ack.start = range->first;
+      ack.end = range->last;
+      ack.count = range->last - range->first + 1;
+    } else {
+      ATLAS_LOG_ERROR("DBApp: EntityID reservation failed: {}", range.Error().Message());
+    }
+    if (auto* reply_ch = ResolveReplyChannel(reply_addr)) {
+      (void)reply_ch->SendMessage(ack);
+    }
+  });
 }
 
 void DBApp::OnPutEntityIds(const Address& src, Channel* ch, const dbapp::PutEntityIds& msg) {
@@ -922,37 +1125,65 @@ void DBApp::OnPutEntityIds(const Address& src, Channel* ch, const dbapp::PutEnti
   }
 }
 
-void DBApp::OnBaseappDeath(const Address& internal_addr, std::string_view name, uint8_t reason) {
-  int cleared_memory = checkout_mgr_.ClearAllFor(internal_addr);
-  const bool normal = reason == 0;
-  if (normal) {
-    ATLAS_LOG_INFO("DBApp: BaseApp '{}' deregistered — cleared {} memory checkouts",
-                   std::string(name), cleared_memory);
-  } else {
-    ATLAS_LOG_WARNING("DBApp: BaseApp '{}' died — cleared {} memory checkouts", std::string(name),
-                      cleared_memory);
+void DBApp::OnBaseappDeath(const Address& internal_addr, uint64_t process_instance) {
+  if (process_instance == 0 || process_instance > (UINT64_MAX >> 1)) {
+    ATLAS_LOG_ERROR("DBApp: cannot retire BaseApp without a valid process instance");
+    return;
   }
+  for (auto& [key, pending] : pending_checkout_requests_) {
+    if (key.reply_addr == internal_addr &&
+        pending.request.owner_process_instance == process_instance)
+      pending.retired = true;
+  }
+  std::erase_if(checkout_ack_cache_, [&](const auto& entry) {
+    return entry.first.reply_addr == internal_addr &&
+           entry.second.request.owner_process_instance == process_instance;
+  });
+  for (const auto& process : process_retirements_) {
+    if (process.addr == internal_addr && process.instance == process_instance) return;
+  }
+  process_retirements_.push_back({internal_addr, process_instance});
+  RetireBaseappProcess(internal_addr, process_instance);
+}
 
-  database_->ClearCheckoutsForAddress(
-      internal_addr, [name_str = std::string(name), normal](int cleared_db) {
-        if (normal) {
-          ATLAS_LOG_INFO("DBApp: cleared {} DB checkouts for deregistered BaseApp '{}'", cleared_db,
-                         name_str);
-        } else {
-          ATLAS_LOG_WARNING("DBApp: cleared {} DB checkouts for dead BaseApp '{}'", cleared_db,
-                            name_str);
+void DBApp::RetireBaseappProcess(const Address& internal_addr, uint64_t process_instance) {
+  auto find = [&] {
+    return std::find_if(
+        process_retirements_.begin(), process_retirements_.end(),
+        [&](const auto& p) { return p.addr == internal_addr && p.instance == process_instance; });
+  };
+  auto pending = find();
+  if (pending == process_retirements_.end() || pending->in_flight) return;
+  pending->in_flight = true;
+  database_->RetireCheckoutProcess(
+      internal_addr, process_instance, [this, internal_addr, process_instance](Result<int> result) {
+        auto pending = std::find_if(
+            process_retirements_.begin(), process_retirements_.end(), [&](const auto& p) {
+              return p.addr == internal_addr && p.instance == process_instance;
+            });
+        if (pending == process_retirements_.end()) return;
+        if (!result) {
+          pending->in_flight = false;
+          pending->next_attempt = Clock::now() + std::chrono::seconds(1);
+          ATLAS_LOG_ERROR("DBApp: checkout process retirement unconfirmed: {}",
+                          result.Error().Message());
+          return;
         }
+        checkout_mgr_.ClearAllFor(internal_addr, process_instance);
+        process_retirements_.erase(pending);
+        ATLAS_LOG_INFO("DBApp: retired BaseApp process instance; cleared {} DB checkouts", *result);
       });
 }
 
 void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin& msg) {
   ATLAS_LOG_DEBUG("DBApp: auth login request_id={} user='{}' from {}:{}", msg.request_id,
                   msg.username, src.Ip(), src.Port());
-  if (!database_) {
+  if (!database_ || msg.username.empty() || msg.password_hash.empty()) {
     login::AuthLoginResult reply;
     reply.request_id = msg.request_id;
     reply.success = false;
-    reply.status = login::LoginStatus::kInternalError;
+    reply.status =
+        database_ ? login::LoginStatus::kInvalidCredentials : login::LoginStatus::kInternalError;
     if (auto* reply_ch = this->ResolveReplyChannel(src)) {
       (void)reply_ch->SendMessage(reply);
     }
@@ -966,6 +1197,26 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
        reply_addr = src](LookupResult result) {
         login::AuthLoginResult reply;
         reply.request_id = request_id;
+
+        auto complete_lookup = [this, reply_addr, request_id, password_hash,
+                                type_id = account_type_id_](LookupResult account) {
+          login::AuthLoginResult response;
+          response.request_id = request_id;
+          response.status = login::LoginStatus::kInternalError;
+          if (account.error.empty() && account.found && account.dbid != kInvalidDBID) {
+            if (!account.password_hash.empty() && account.password_hash == password_hash) {
+              response.success = true;
+              response.status = login::LoginStatus::kSuccess;
+              response.dbid = account.dbid;
+              response.type_id = type_id;
+            } else {
+              response.status = login::LoginStatus::kInvalidCredentials;
+            }
+          }
+          if (auto* reply_ch = ResolveReplyChannel(reply_addr)) {
+            (void)reply_ch->SendMessage(response);
+          }
+        };
 
         // A backend error (e.g. transient SQLite failure) must not be
         // mistaken for "account does not exist" - surface it immediately.
@@ -1004,8 +1255,13 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
                 create_shard = *shard;
               }
             }
-            auto on_put = [this, reply_addr, request_id,
+            auto on_put = [this, reply_addr, request_id, username, complete_lookup,
                            type_id = account_type_id_](PutResult put) {
+              if (!put.success && (put.error_kind == DatabaseErrorKind::kDuplicateIdentifier ||
+                                   put.error_kind == DatabaseErrorKind::kCommitUnknown)) {
+                database_->LookupByName(type_id, username, complete_lookup);
+                return;
+              }
               login::AuthLoginResult r;
               r.request_id = request_id;
               if (put.success) {
@@ -1035,19 +1291,8 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
           reply.success = false;
           reply.status = login::LoginStatus::kInvalidCredentials;
         } else {
-          bool pw_match = true;
-          if (!password_hash.empty() && !result.password_hash.empty())
-            pw_match = (result.password_hash == password_hash);
-
-          if (!pw_match) {
-            reply.success = false;
-            reply.status = login::LoginStatus::kInvalidCredentials;
-          } else {
-            reply.success = true;
-            reply.status = login::LoginStatus::kSuccess;
-            reply.dbid = result.dbid;
-            reply.type_id = account_type_id_;
-          }
+          complete_lookup(std::move(result));
+          return;
         }
         if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
           (void)reply_ch->SendMessage(reply);

@@ -86,7 +86,9 @@ TEST(EntityManager, FindProxyBySessionUsesSecondaryIndex) {
   auto* ent = f.mgr.Create(9, true);
   ASSERT_NE(ent, nullptr);
 
-  auto key = SessionKey::Generate();
+  auto generated = SessionKey::Generate();
+  ASSERT_TRUE(generated.HasValue());
+  auto key = *generated;
   EXPECT_EQ(f.mgr.FindProxyBySession(key), nullptr);
   EXPECT_TRUE(f.mgr.AssignSessionKey(ent->EntityId(), key));
   EXPECT_EQ(f.mgr.FindProxyBySession(key), f.mgr.FindProxy(ent->EntityId()));

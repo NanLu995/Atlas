@@ -40,6 +40,8 @@ class ScopedFileLock {
 [[nodiscard]] auto WriteFile(const stdfs::path& path, std::span<const std::byte> data)
     -> Result<void>;
 [[nodiscard]] auto WriteTextFile(const stdfs::path& path, std::string_view content) -> Result<void>;
+// Same-volume namespace replacement; success does not guarantee crash-durable storage.
+// Windows preserves existing target metadata and requires a closed source for replacement.
 [[nodiscard]] auto AtomicReplaceFile(const stdfs::path& source, const stdfs::path& target)
     -> Result<void>;
 

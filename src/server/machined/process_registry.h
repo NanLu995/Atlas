@@ -23,6 +23,7 @@ struct ProcessEntry {
 
   // Dispatcher-thread backpointer to the live TCP registration channel.
   Channel* channel{nullptr};
+  uint64_t process_instance{0};
 };
 
 class ProcessRegistry {

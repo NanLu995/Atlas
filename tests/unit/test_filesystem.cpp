@@ -1,11 +1,16 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <string>
 
 #include <gtest/gtest.h>
 
 #include "platform/filesystem.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace fs = atlas::fs;
 
@@ -74,6 +79,114 @@ TEST(Filesystem, ScopedFileLockRejectsSecondHolderAndAllowsReacquire) {
 
   (void)fs::RemoveFile(path);
 }
+
+TEST(Filesystem, AtomicReplaceCreatesMissingTarget) {
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto target = fs::TempDirectory() / std::format("atlas_atomic_new_{}.txt", stamp);
+  auto source = target;
+  source += ".tmp";
+  ASSERT_TRUE(fs::WriteTextFile(source, "new"));
+  ASSERT_TRUE(fs::AtomicReplaceFile(source, target));
+  auto content = fs::ReadTextFile(target);
+  ASSERT_TRUE(content);
+  EXPECT_EQ(*content, "new");
+  EXPECT_FALSE(fs::Exists(source));
+  (void)fs::RemoveFile(target);
+}
+
+TEST(Filesystem, AtomicReplaceMissingSourcePreservesTarget) {
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto target = fs::TempDirectory() / std::format("atlas_atomic_missing_{}.txt", stamp);
+  auto source = target;
+  source += ".tmp";
+  ASSERT_TRUE(fs::WriteTextFile(target, "old"));
+  auto result = fs::AtomicReplaceFile(source, target);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), atlas::ErrorCode::kIoError);
+  auto content = fs::ReadTextFile(target);
+  ASSERT_TRUE(content);
+  EXPECT_EQ(*content, "old");
+  EXPECT_FALSE(fs::Exists(source));
+  (void)fs::RemoveFile(target);
+}
+
+TEST(Filesystem, AtomicReplaceRejectsEmptyPaths) {
+  const auto result = fs::AtomicReplaceFile({}, "target");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), atlas::ErrorCode::kInvalidArgument);
+  const auto missing_target = fs::AtomicReplaceFile("source", {});
+  ASSERT_FALSE(missing_target);
+  EXPECT_EQ(missing_target.Error().Code(), atlas::ErrorCode::kInvalidArgument);
+}
+
+#if defined(_WIN32)
+TEST(Filesystem, AtomicReplaceAllowsDeleteSharedTargetReader) {
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto target = fs::TempDirectory() / std::format("atlas_atomic_reader_{}.txt", stamp);
+  auto source = target;
+  source += ".tmp";
+  ASSERT_TRUE(fs::WriteTextFile(target, "old"));
+  ASSERT_TRUE(fs::WriteTextFile(source, "new"));
+  {
+    std::unique_ptr<void, decltype(&::CloseHandle)> reader(
+        ::CreateFileW(target.c_str(), GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr),
+        ::CloseHandle);
+    ASSERT_NE(reader.get(), INVALID_HANDLE_VALUE);
+    WIN32_FILE_ATTRIBUTE_DATA before{};
+    ASSERT_TRUE(::GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &before));
+    auto result = fs::AtomicReplaceFile(source, target);
+    ASSERT_TRUE(result) << result.Error().Message();
+    char previous[3]{};
+    DWORD read = 0;
+    ASSERT_TRUE(::ReadFile(reader.get(), previous, sizeof(previous), &read, nullptr));
+    EXPECT_EQ(read, 3u);
+    EXPECT_EQ(std::string(previous, read), "old");
+    auto content = fs::ReadTextFile(target);
+    ASSERT_TRUE(content);
+    EXPECT_EQ(*content, "new");
+    EXPECT_FALSE(fs::Exists(source));
+    WIN32_FILE_ATTRIBUTE_DATA after{};
+    ASSERT_TRUE(::GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &after));
+    EXPECT_EQ(after.ftCreationTime.dwLowDateTime, before.ftCreationTime.dwLowDateTime);
+    EXPECT_EQ(after.ftCreationTime.dwHighDateTime, before.ftCreationTime.dwHighDateTime);
+  }
+  (void)fs::RemoveFile(target);
+}
+
+TEST(Filesystem, AtomicReplaceRejectsBlockedTargetAndOpenSource) {
+  for (bool hold_source : {false, true}) {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto target = fs::TempDirectory() / std::format("atlas_atomic_blocked_{}.txt", stamp);
+    auto source = target;
+    source += ".tmp";
+    ASSERT_TRUE(fs::WriteTextFile(target, "old"));
+    ASSERT_TRUE(fs::WriteTextFile(source, "new"));
+    {
+      const auto& held = hold_source ? source : target;
+      const DWORD sharing =
+          FILE_SHARE_READ | FILE_SHARE_WRITE | (hold_source ? FILE_SHARE_DELETE : 0);
+      std::unique_ptr<void, decltype(&::CloseHandle)> reader(
+          ::CreateFileW(held.c_str(), GENERIC_READ, sharing, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, nullptr),
+          ::CloseHandle);
+      ASSERT_NE(reader.get(), INVALID_HANDLE_VALUE);
+      auto result = fs::AtomicReplaceFile(source, target);
+      ASSERT_FALSE(result);
+      EXPECT_EQ(result.Error().Code(), atlas::ErrorCode::kIoError);
+      auto old_content = fs::ReadTextFile(target);
+      auto new_content = fs::ReadTextFile(source);
+      ASSERT_TRUE(old_content);
+      ASSERT_TRUE(new_content);
+      EXPECT_EQ(*old_content, "old");
+      EXPECT_EQ(*new_content, "new");
+    }
+    (void)fs::RemoveFile(source);
+    (void)fs::RemoveFile(target);
+  }
+}
+#endif
 
 TEST(Filesystem, FileSizeCorrect) {
   auto tmp = fs::TempDirectory() / "atlas_test_size.txt";

@@ -29,13 +29,16 @@ auto IDClient::AllocateId() -> EntityID {
 }
 
 void IDClient::AddIds(EntityID start, EntityID end) {
-  if (start == kInvalidEntityID || end == kInvalidEntityID || start > end) {
+  // Discarding a late range wastes IDs; accepting overlapping IDs could reuse live identities.
+  if (!IsServerEntityId(start) || !IsServerEntityId(end) || start > end ||
+      start <= highest_received_id_) {
     ATLAS_LOG_WARNING("IDClient: ignoring invalid range [{}, {}]", start, end);
     return;
   }
 
   uint64_t count = static_cast<uint64_t>(end) - start + 1;
   ranges_.push_back({start, end});
+  highest_received_id_ = end;
   total_available_ += count;
   ever_received_ = true;
   ATLAS_LOG_DEBUG("IDClient: added range [{}, {}] ({} IDs), total_available={}", start, end, count,

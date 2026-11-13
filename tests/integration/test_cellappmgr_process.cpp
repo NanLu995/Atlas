@@ -81,33 +81,13 @@ auto ExecutablePath() -> std::filesystem::path {
   return std::filesystem::path(buffer);
 }
 
-auto BuildRoot() -> std::filesystem::path {
-  // The machined output is a stable marker for the CMake build root. Accept
-  // both the VS-solution layout (src/server/.../Debug) and the Ninja
-  // Multi-Config layout (bin/Debug) so the process tests run under either.
-  auto current = ExecutablePath().parent_path();
-  for (int i = 0; i < 10 && !current.empty(); ++i) {
-    if (std::filesystem::exists(current / "src" / "server" / "machined" / "Debug" /
-                                "machined.exe") ||
-        std::filesystem::exists(current / "bin" / "Debug" / "machined.exe")) {
-      return current;
-    }
-    current = current.parent_path();
-  }
-  return {};
-}
-
 auto ServerBinDir() -> std::filesystem::path {
-  return BuildRoot() / "bin" / "Debug";
+  return ExecutablePath().parent_path();
 }
 
-auto ResolveServerExe(const std::wstring& subdir, const std::wstring& filename)
-    -> std::filesystem::path {
-  auto p1 = ServerBinDir() / filename;
-  if (std::filesystem::exists(p1)) return std::filesystem::absolute(p1);
-  auto p2 = BuildRoot() / "src" / "server" / subdir / "Debug" / filename;
-  if (std::filesystem::exists(p2)) return std::filesystem::absolute(p2);
-  return {};
+auto ResolveServerExe(const std::wstring& filename) -> std::filesystem::path {
+  auto path = ServerBinDir() / filename;
+  return std::filesystem::exists(path) ? path : std::filesystem::path{};
 }
 
 auto QuoteArg(const std::wstring& arg) -> std::wstring {
@@ -514,10 +494,10 @@ TEST(CellAppMgrProcess, MachinedAndCellAppMgrBootAndRegister) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -581,10 +561,10 @@ TEST(CellAppMgrProcess, SyntheticCellAppRegistersWithRealCellAppMgrBinary) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -641,11 +621,11 @@ TEST(CellAppMgrProcess, ReviverColdStartsAndRestartsCellAppMgr) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -886,11 +866,11 @@ TEST(CellAppMgrProcess, ReviverAttachesToExistingCellAppMgrWithoutColdStart) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -997,11 +977,11 @@ TEST(CellAppMgrProcess, ReviverStartsNewCellAppMgrAfterTargetDiedBeforeSubscribe
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -1101,11 +1081,11 @@ TEST(CellAppMgrProcess, ReviverRestartsCellAppMgrWhenDirectHeartbeatDoesNotAck) 
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -1235,10 +1215,10 @@ TEST(CellAppMgrProcess, ReviverTimesOutPendingManagerHealthWatcher) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -1330,10 +1310,10 @@ TEST(CellAppMgrProcess, ReviverStopsAfterRestartLimitWithoutHeartbeatAck) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -1423,11 +1403,11 @@ TEST(CellAppMgrProcess, ReviverStopsAfterLaunchedProcessDoesNotRegister) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto atlas_tool_exe = ResolveServerExe(L"atlas_tool", L"atlas_tool.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto atlas_tool_exe = ResolveServerExe(L"atlas_tool.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || atlas_tool_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;
@@ -1502,11 +1482,11 @@ TEST(CellAppMgrProcess, ReviverPriorityArbitrationPicksOneActiveMonitor) {
 #if !defined(_WIN32)
   GTEST_SKIP() << "Windows-only process harness";
 #else
-  const auto machined_exe = ResolveServerExe(L"machined", L"machined.exe");
-  const auto cellappmgr_exe = ResolveServerExe(L"cellappmgr", L"atlas_cellappmgr.exe");
-  const auto reviver_exe = ResolveServerExe(L"reviver", L"atlas_reviver.exe");
+  const auto machined_exe = ResolveServerExe(L"machined.exe");
+  const auto cellappmgr_exe = ResolveServerExe(L"atlas_cellappmgr.exe");
+  const auto reviver_exe = ResolveServerExe(L"atlas_reviver.exe");
   if (machined_exe.empty() || cellappmgr_exe.empty() || reviver_exe.empty()) {
-    GTEST_SKIP() << "server binaries not found; build_root=" << BuildRoot();
+    FAIL() << "server binaries not found; bin_dir=" << ServerBinDir();
   }
 
   uint16_t machined_port = 0;

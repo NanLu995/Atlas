@@ -93,6 +93,7 @@ TEST(MeshGossip, RegistryMsgRoundTrip) {
   a.external_addr = Address("10.0.0.7", 40001);
   a.pid = 1234;
   a.load = 0.25f;
+  a.process_instance = 111;
   sent.processes.push_back(a);
   ProcessInfo b;
   b.process_type = ProcessType::kBaseApp;
@@ -111,6 +112,7 @@ TEST(MeshGossip, RegistryMsgRoundTrip) {
   EXPECT_EQ(got->processes[0].name, "cellapp-1");
   EXPECT_EQ(got->processes[0].pid, 1234u);
   EXPECT_FLOAT_EQ(got->processes[0].load, 0.25f);
+  EXPECT_EQ(got->processes[0].process_instance, 111u);
   EXPECT_EQ(got->processes[1].name, "baseapp-1");
   EXPECT_EQ(r.Remaining(), 0u);
 }

@@ -418,7 +418,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
 void BaseApp::Fini() {
   rpc_registry_.CancelAll();
   entity_mgr_.ForEach([this](const BaseEntity& ent) {
-    if (ent.Dbid() != kInvalidDBID) ReleaseCheckout(ent.Dbid(), ent.TypeId());
+    if (ent.Dbid() != kInvalidDBID) ReleaseCheckout(ent.Dbid(), ent.TypeId(), ent.CheckoutOwner());
   });
   entity_mgr_.FlushDestroyed();
   SweepMovementAckRelayState();
@@ -460,6 +460,8 @@ auto BaseApp::CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> {
 void BaseApp::RegisterWatchers() {
   EntityApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();
+  wr.Add<std::size_t>("baseapp/pending_checkin_count",
+                      std::function<std::size_t()>([this] { return pending_checkins_.size(); }));
   wr.Add<float>("baseapp/load",
                 std::function<float()>([this] { return load_tracker_.CurrentLoad(); }));
   wr.Add<std::size_t>("baseapp/entity_count",
@@ -483,6 +485,14 @@ void BaseApp::RegisterWatchers() {
                    std::function<uint64_t()>([this] { return detached_relogin_total_; }));
   wr.Add<std::size_t>("baseapp/pending_prepare_count",
                       std::function<std::size_t()>([this] { return pending_logins_.size(); }));
+  wr.Add<std::size_t>("baseapp/pending_entity_checkout_count", std::function<std::size_t()>([this] {
+                        return pending_entity_checkouts_.size();
+                      }));
+  wr.Add<std::size_t>("baseapp/stalled_checkout_count", std::function<std::size_t()>([this] {
+                        return std::count_if(
+                            canceled_checkouts_.begin(), canceled_checkouts_.end(),
+                            [](const auto& entry) { return entry.second.stalled; });
+                      }));
   wr.Add<std::size_t>("baseapp/pending_force_logoff_count", std::function<std::size_t()>([this] {
                         return pending_force_logoffs_.size();
                       }));
@@ -568,9 +578,8 @@ void BaseApp::RegisterWatchers() {
   wr.Add<std::size_t>("baseapp/logoff_in_flight_count", std::function<std::size_t()>([this] {
                         return logoff_entities_in_flight_.size();
                       }));
-  wr.Add<std::size_t>("baseapp/canceled_checkout_count", std::function<std::size_t()>([this] {
-                        return canceled_login_checkouts_.size();
-                      }));
+  wr.Add<std::size_t>("baseapp/canceled_checkout_count",
+                      std::function<std::size_t()>([this] { return canceled_checkouts_.size(); }));
   wr.Add<uint64_t>("baseapp/canceled_checkout_total",
                    std::function<uint64_t()>([this] { return canceled_checkout_total_; }));
   wr.Add<uint64_t>("baseapp/prepared_login_timeout_total",
@@ -742,6 +751,16 @@ void BaseApp::RegisterInternalHandlers() {
         }
         auto logoff_it = pending_logoff_writes_.find(msg.request_id);
         if (logoff_it != pending_logoff_writes_.end()) {
+          if (msg.operation_id != logoff_it->second.message.operation_id) return;
+          if (!msg.success && (msg.error_kind == DatabaseErrorKind::kCommitUnknown ||
+                               logoff_it->second.outcome_unknown)) {
+            logoff_it->second.outcome_unknown = true;
+            logoff_it->second.awaiting_ack = false;
+            logoff_it->second.retry_pending = true;
+            logoff_it->second.next_retry_at = Clock::now() + std::chrono::seconds(1);
+            RetryDisconnectedDbappLogoffWrites();
+            return;
+          }
           if (!msg.success && std::string_view(msg.error) == dbapp::kInvalidShardTableError) {
             logoff_it->second.awaiting_ack = false;
             logoff_it->second.retry_pending = true;
@@ -759,6 +778,16 @@ void BaseApp::RegisterInternalHandlers() {
         if (write_it == pending_write_to_db_.end()) {
           return;
         }
+        if (msg.operation_id != write_it->second.message.operation_id) return;
+        if (!msg.success && (msg.error_kind == DatabaseErrorKind::kCommitUnknown ||
+                             write_it->second.outcome_unknown ||
+                             std::string_view(msg.error) == dbapp::kInvalidShardTableError)) {
+          write_it->second.outcome_unknown |= msg.error_kind == DatabaseErrorKind::kCommitUnknown;
+          write_it->second.awaiting_ack = false;
+          write_it->second.next_retry_at = Clock::now() + std::chrono::seconds(1);
+          RetryDisconnectedDbappWriteRequests();
+          return;
+        }
         const PendingWriteToDb kPendingWrite = write_it->second;
         pending_write_to_db_.erase(write_it);
 
@@ -766,8 +795,15 @@ void BaseApp::RegisterInternalHandlers() {
         if (ent) {
           if (msg.success && msg.dbid != kInvalidDBID) {
             (void)entity_mgr_.AssignDbid(ent->EntityId(), msg.dbid);
+            if (HasFlag(kPendingWrite.message.flags, WriteFlags::kCreateNew) &&
+                msg.owner.ownership_version != 0) {
+              ent->SetCheckoutOwner(msg.owner);
+            }
           }
           ent->OnWriteAck(msg.dbid, msg.success);
+          if (msg.success && kPendingWrite.logoff_after_write) {
+            StartDisconnectLogoff(ent->EntityId());
+          }
         }
       });
 
@@ -782,88 +818,218 @@ void BaseApp::RegisterInternalHandlers() {
       });
 
   (void)table.RegisterTypedHandler<dbapp::CheckoutEntityAck>(
-      [this](const Address& /*src*/, Channel* /*ch*/, const dbapp::CheckoutEntityAck& msg) {
-        if (msg.status == dbapp::CheckoutStatus::kDbError &&
-            std::string_view(msg.error) == dbapp::kInvalidShardTableError) {
-          RequestDbAppShardTable();
-        }
-        if (auto canceled_it = canceled_login_checkouts_.find(msg.request_id);
-            canceled_it != canceled_login_checkouts_.end()) {
-          if (msg.status == dbapp::CheckoutStatus::kSuccess && msg.dbid != kInvalidDBID) {
-            ReleaseCheckout(msg.dbid, canceled_it->second.type_id);
-          }
-          canceled_login_checkouts_.erase(canceled_it);
-          return;
-        }
-
-        // Login-flow checkout (request_id is a pending key).
-        auto login_it = pending_logins_.find(msg.request_id);
-        if (login_it != pending_logins_.end()) {
-          PendingLogin pending = login_it->second;
-          pending_logins_.erase(login_it);
-
-          if (msg.status != dbapp::CheckoutStatus::kSuccess) {
-            if (msg.status == dbapp::CheckoutStatus::kAlreadyCheckedOut &&
-                RetryLoginAfterCheckoutConflict(std::move(pending), msg.dbid, msg.holder_addr)) {
-              return;
-            }
-
-            login::PrepareLoginResult reply;
-            reply.request_id = pending.login_request_id;
-            ATLAS_LOG_ERROR("BaseApp: login checkout failed (request_id={} status={} holder={}:{})",
-                            msg.request_id, static_cast<int>(msg.status), msg.holder_addr.Ip(),
-                            msg.holder_addr.Port());
-            reply.success = false;
-            reply.error = (msg.status == dbapp::CheckoutStatus::kAlreadyCheckedOut)
-                              ? "already_checked_out"
-                              : (msg.error.empty() ? "checkout_failed" : msg.error);
-            if (!pending.reply_sent) {
-              SendPrepareLoginResult(pending.loginapp_addr, reply);
-            }
-            FinishLoginFlow(pending.dbid);
-            return;
-          }
-
-          CompletePrepareLoginFromCheckout(
-              std::move(pending), msg.dbid, pending.type_id,
-              std::span<const std::byte>(reinterpret_cast<const std::byte*>(msg.blob.data()),
-                                         msg.blob.size()));
-          return;
-        }
-
-        // CreateBaseFromDB checkout - request_id == entity_id.
-        const EntityID kEid = msg.request_id;
-        if (msg.status != dbapp::CheckoutStatus::kSuccess) {
-          ATLAS_LOG_ERROR("BaseApp: checkout failed (entity_id={} status={})", kEid,
-                          static_cast<int>(msg.status));
-          entity_mgr_.Destroy(kEid);
-          return;
-        }
-        auto* ent = entity_mgr_.Find(kEid);
-        if (!ent) return;
-        // Split into base/cell halves; base feeds RestoreEntity, cell is
-        // stashed for the next CreateCellEntity's script_init_data.
-        std::span<const std::byte> base_span, cell_span;
-        if (!DecodeDbBlob(std::span<const std::byte>(msg.blob.data(), msg.blob.size()), base_span,
-                          cell_span)) {
-          ATLAS_LOG_ERROR("BaseApp: checkout blob corrupt (entity_id={} dbid={})", kEid, msg.dbid);
-          entity_mgr_.Destroy(kEid);
-          ReleaseCheckout(msg.dbid, ent->TypeId());
-          return;
-        }
-        ent->SetEntityData(std::vector<std::byte>(base_span.begin(), base_span.end()));
-        ent->SetCellBackupData(std::vector<std::byte>(cell_span.begin(), cell_span.end()));
-        if (!RestoreManagedEntity(kEid, ent->TypeId(), msg.dbid, base_span)) {
-          (void)NotifyManagedEntityDestroyed(kEid, "CreateBaseFromDB rollback");
-          entity_mgr_.Destroy(kEid);
-          ReleaseCheckout(msg.dbid, ent->TypeId());
-        }
+      [this](const Address& src, Channel*, const dbapp::CheckoutEntityAck& msg) {
+        OnCheckoutEntityAck(src, msg);
       });
-
   (void)table.RegisterTypedHandler<dbapp::AbortCheckoutAck>(
-      [this](const Address& /*src*/, Channel* /*ch*/, const dbapp::AbortCheckoutAck& msg) {
-        canceled_login_checkouts_.erase(msg.request_id);
+      [this](const Address& src, Channel*, const dbapp::AbortCheckoutAck& msg) {
+        OnAbortCheckoutAck(src, msg);
       });
+  (void)table.RegisterTypedHandler<dbapp::CheckinEntityAck>(
+      [this](const Address& src, Channel*, const dbapp::CheckinEntityAck& msg) {
+        OnCheckinEntityAck(src, msg);
+      });
+}
+
+auto BaseApp::AllocatePrepareRequestId() -> uint32_t {
+  const auto occupied = pending_logins_.size() + pending_force_logoffs_.size() +
+                        pending_entity_checkouts_.size() + canceled_checkouts_.size() +
+                        pending_write_to_db_.size() + pending_logoff_writes_.size() +
+                        pending_checkins_.size();
+  for (std::size_t attempt = 0; attempt <= occupied + 1; ++attempt) {
+    const uint32_t id = next_prepare_request_id_++;
+    if (id != 0 && !pending_logins_.contains(id) && !pending_force_logoffs_.contains(id) &&
+        !pending_entity_checkouts_.contains(id) && !canceled_checkouts_.contains(id) &&
+        !pending_write_to_db_.contains(id) && !pending_logoff_writes_.contains(id) &&
+        !pending_checkins_.contains(id))
+      return id;
+  }
+  return 0;
+}
+
+void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntityAck& msg) {
+  auto canceled = canceled_checkouts_.find(msg.request_id);
+  if (canceled != canceled_checkouts_.end() &&
+      canceled->second.request.operation_id == msg.operation_id &&
+      canceled->second.target_addr == src) {
+    if (msg.status == dbapp::CheckoutStatus::kSuccess) {
+      auto& pending = canceled->second;
+      pending.awaiting_ack = false;
+      pending.stalled = false;
+      pending.retry_count = 0;
+      pending.next_retry_at = Clock::now();
+      if (SendAbortCheckout(pending)) ++pending.retry_count;
+    }
+    return;
+  }
+  auto login = pending_logins_.find(msg.request_id);
+  if (login != pending_logins_.end() && login->second.checkout_operation_id == msg.operation_id &&
+      login->second.checkout_target_addr == src) {
+    auto& waiting = login->second;
+    const bool invalid_owner =
+        msg.status == dbapp::CheckoutStatus::kSuccess &&
+        (msg.dbid != waiting.dbid || msg.holder_app_id != waiting.checkout_app_id ||
+         msg.holder_entity_id != 0 || msg.holder_process_instance != Config().process_instance);
+    if (msg.error_kind == DatabaseErrorKind::kCommitUnknown || invalid_owner) {
+      waiting.checkout_outcome_unknown = true;
+      waiting.checkout_awaiting_ack = false;
+      waiting.checkout_retry_pending = true;
+      waiting.next_checkout_retry_at = Clock::now() + std::chrono::seconds(1);
+      return;
+    }
+    PendingLogin pending = std::move(waiting);
+    pending_logins_.erase(login);
+    if (msg.status == dbapp::CheckoutStatus::kDbError &&
+        std::string_view(msg.error) == dbapp::kInvalidShardTableError)
+      RequestDbAppShardTable();
+    if (msg.status != dbapp::CheckoutStatus::kSuccess) {
+      if (pending.checkout_outcome_unknown) {
+        FailPendingPrepareLogin(pending, "checkout_unresolved");
+        CancelInflightCheckout(msg.request_id, pending);
+      } else if (msg.status == dbapp::CheckoutStatus::kAlreadyCheckedOut &&
+                 RetryLoginAfterCheckoutConflict(std::move(pending), msg.dbid, msg.holder_addr)) {
+        return;
+      } else {
+        FailPendingPrepareLogin(pending, msg.error.empty() ? "checkout_failed" : msg.error);
+      }
+      FinishLoginFlow(pending.dbid);
+      return;
+    }
+    pending.checkout_owner = CheckoutInfo{msg.holder_addr, msg.holder_app_id, msg.holder_entity_id,
+                                          msg.checkout_version, msg.holder_process_instance};
+    CompletePrepareLoginFromCheckout(std::move(pending), msg.dbid, pending.type_id, msg.blob);
+    return;
+  }
+  auto found = pending_entity_checkouts_.find(msg.request_id);
+  if (found == pending_entity_checkouts_.end() ||
+      found->second.request.operation_id != msg.operation_id || found->second.target_addr != src)
+    return;
+  auto& waiting = found->second;
+  const auto& request = waiting.request;
+  const bool invalid_owner =
+      msg.status == dbapp::CheckoutStatus::kSuccess &&
+      (msg.holder_app_id != request.owner_app_id || msg.holder_entity_id != request.entity_id ||
+       msg.holder_process_instance != request.owner_process_instance ||
+       (request.mode == dbapp::LoadMode::kByDbid && msg.dbid != request.dbid));
+  if (msg.error_kind == DatabaseErrorKind::kCommitUnknown || invalid_owner) {
+    waiting.outcome_unknown = true;
+    waiting.awaiting_ack = false;
+    waiting.next_retry_at = Clock::now() + std::chrono::seconds(1);
+    return;
+  }
+  auto pending = std::move(waiting);
+  pending_entity_checkouts_.erase(found);
+  if (msg.status == dbapp::CheckoutStatus::kSuccess) pending.resolved_dbid = msg.dbid;
+  const auto entity_id = pending.request.entity_id;
+  auto cancel_load = [&] {
+    entity_mgr_.Destroy(entity_id);
+    pending.awaiting_ack = false;
+    pending.outcome_unknown = true;
+    pending.retry_count = 0;
+    pending.next_retry_at = Clock::now();
+    if (pending.resolved_dbid != kInvalidDBID) active_login_dbids_.insert(pending.resolved_dbid);
+    auto [entry, inserted] = canceled_checkouts_.emplace(msg.request_id, std::move(pending));
+    (void)inserted;
+    if (SendAbortCheckout(entry->second)) ++entry->second.retry_count;
+  };
+  if (msg.status != dbapp::CheckoutStatus::kSuccess) {
+    if (pending.outcome_unknown)
+      cancel_load();
+    else
+      entity_mgr_.Destroy(entity_id);
+    FinishLoginFlow(pending.resolved_dbid);
+    ATLAS_LOG_ERROR("BaseApp: database load failed, entity={} status={}", entity_id,
+                    static_cast<int>(msg.status));
+    return;
+  }
+  auto* entity = entity_mgr_.Find(entity_id);
+  if (!entity) {
+    cancel_load();
+    return;
+  }
+  entity->SetCheckoutOwner(CheckoutInfo{msg.holder_addr, msg.holder_app_id, msg.holder_entity_id,
+                                        msg.checkout_version, msg.holder_process_instance});
+  if (!entity_mgr_.AssignDbid(entity_id, msg.dbid)) {
+    cancel_load();
+    return;
+  }
+  std::span<const std::byte> base_span, cell_span;
+  if (!DecodeDbBlob(msg.blob, base_span, cell_span)) {
+    ATLAS_LOG_ERROR("BaseApp: corrupt database load, entity={} dbid={}", entity_id, msg.dbid);
+    cancel_load();
+    return;
+  }
+  entity->SetEntityData({base_span.begin(), base_span.end()});
+  entity->SetCellBackupData({cell_span.begin(), cell_span.end()});
+  if (!RestoreManagedEntity(entity_id, entity->TypeId(), msg.dbid, base_span)) {
+    (void)NotifyManagedEntityDestroyed(entity_id, "CreateBaseFromDB rollback");
+    cancel_load();
+  }
+  FinishLoginFlow(msg.dbid);
+}
+
+void BaseApp::OnAbortCheckoutAck(const Address& src, const dbapp::AbortCheckoutAck& msg) {
+  auto found = canceled_checkouts_.find(msg.request_id);
+  if (found == canceled_checkouts_.end() ||
+      found->second.request.operation_id != msg.operation_id || found->second.target_addr != src)
+    return;
+  found->second.awaiting_ack = false;
+  if (!msg.success) {
+    found->second.next_retry_at = Clock::now() + std::chrono::seconds(1);
+    return;
+  }
+  const auto dbid = found->second.resolved_dbid;
+  canceled_checkouts_.erase(found);
+  FinishLoginFlow(dbid);
+}
+
+bool BaseApp::SendEntityCheckout(PendingDbCheckout& pending) {
+  pending.next_retry_at = Clock::now() + std::chrono::seconds(1);
+  auto* channel = ResolveDbAppChannel(pending.request.dbid);
+  if (!channel) return false;
+  pending.request.shard_table_version = dbapp_shard_table_version_;
+  pending.target_addr = channel->RemoteAddress();
+  pending.awaiting_ack = channel->SendMessage(pending.request).HasValue();
+  return pending.awaiting_ack;
+}
+
+void BaseApp::RetryEntityCheckouts() {
+  for (auto it = pending_entity_checkouts_.begin(); it != pending_entity_checkouts_.end();) {
+    auto& pending = it->second;
+    const bool expired = Clock::now() - pending.created_at > kPendingTimeout;
+    if (expired || !entity_mgr_.Find(pending.request.entity_id) ||
+        (!pending.awaiting_ack && pending.retry_count >= kDbappCheckoutRetryLimit)) {
+      entity_mgr_.Destroy(pending.request.entity_id);
+      if (pending.awaiting_ack || pending.outcome_unknown) {
+        pending.awaiting_ack = false;
+        pending.outcome_unknown = true;
+        pending.retry_count = 0;
+        pending.next_retry_at = Clock::now();
+        canceled_checkouts_.emplace(it->first, std::move(pending));
+      }
+      FinishLoginFlow(pending.resolved_dbid);
+      it = pending_entity_checkouts_.erase(it);
+      continue;
+    }
+    if (!pending.awaiting_ack && Clock::now() >= pending.next_retry_at) {
+      if (SendEntityCheckout(pending)) ++pending.retry_count;
+    }
+    ++it;
+  }
+}
+
+void BaseApp::RetryCanceledCheckouts() {
+  for (auto& [request_id, pending] : canceled_checkouts_) {
+    if (pending.stalled || Clock::now() < pending.next_retry_at) continue;
+    if (pending.retry_count >= kDbappCheckoutRetryLimit) {
+      pending.stalled = true;
+      ATLAS_LOG_ERROR("BaseApp: checkout cancellation unconfirmed; request={} dbid={} fenced",
+                      request_id, pending.request.dbid);
+      continue;
+    }
+    ++pending.retry_count;
+    (void)SendAbortCheckout(pending);
+  }
 }
 
 void BaseApp::OnCreateBase(Channel& /*ch*/, const baseapp::CreateBase& msg) {
@@ -889,6 +1055,10 @@ void BaseApp::OnCreateBaseFromDb(Channel& /*ch*/, const baseapp::CreateBaseFromD
     ATLAS_LOG_ERROR("BaseApp: CreateBaseFromDB: no DBApp connection");
     return;
   }
+  if (msg.dbid != kInvalidDBID && active_login_dbids_.contains(msg.dbid)) {
+    ATLAS_LOG_ERROR("BaseApp: database identity {} already has a pending operation", msg.dbid);
+    return;
+  }
   const auto& defs = EntityDefs();
   auto* type = defs.FindById(msg.type_id);
   bool has_client = type ? type->has_client : false;
@@ -899,14 +1069,35 @@ void BaseApp::OnCreateBaseFromDb(Channel& /*ch*/, const baseapp::CreateBaseFromD
     return;
   }
 
-  dbapp::CheckoutEntity req;
+  PendingDbCheckout pending;
+  auto& req = pending.request;
+  if (auto generated = FillSecureRandom(req.operation_id); !generated) {
+    entity_mgr_.Destroy(ent->EntityId());
+    ATLAS_LOG_ERROR("BaseApp: cannot generate checkout operation ID");
+    return;
+  }
+  req.request_id = AllocatePrepareRequestId();
+  if (req.request_id == 0) {
+    entity_mgr_.Destroy(ent->EntityId());
+    ATLAS_LOG_ERROR("BaseApp: checkout request IDs exhausted");
+    return;
+  }
+  req.owner_app_id = app_id_;
+  req.owner_process_instance = Config().process_instance;
   req.mode = msg.identifier.empty() ? dbapp::LoadMode::kByDbid : dbapp::LoadMode::kByName;
   req.type_id = msg.type_id;
   req.dbid = msg.dbid;
   req.identifier = msg.identifier;
   req.entity_id = ent->EntityId();
-  req.shard_table_version = dbapp_shard_table_version_;
-  (void)db_ch->SendMessage(req);
+  pending.created_at = Clock::now();
+  pending.resolved_dbid = msg.dbid;
+  if (!SendEntityCheckout(pending)) {
+    entity_mgr_.Destroy(ent->EntityId());
+    ATLAS_LOG_ERROR("BaseApp: database load could not be queued");
+    return;
+  }
+  if (msg.dbid != kInvalidDBID) active_login_dbids_.insert(msg.dbid);
+  pending_entity_checkouts_.emplace(req.request_id, std::move(pending));
 }
 
 void BaseApp::OnAcceptClient(Channel& /*ch*/, const baseapp::AcceptClient& msg) {
@@ -1426,6 +1617,18 @@ void BaseApp::EmitBaselineSnapshots() {
 void BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len) {
   auto* ent = entity_mgr_.Find(entity_id);
   if (!ent) return;
+  if (std::any_of(
+          pending_entity_checkouts_.begin(), pending_entity_checkouts_.end(),
+          [entity_id](const auto& entry) { return entry.second.request.entity_id == entity_id; })) {
+    ent->OnWriteAck(ent->Dbid(), false);
+    return;
+  }
+  if (logoff_entities_in_flight_.contains(entity_id) ||
+      std::any_of(pending_write_to_db_.begin(), pending_write_to_db_.end(),
+                  [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; })) {
+    ATLAS_LOG_WARNING("BaseApp: persistence is already pending for entity={}", entity_id);
+    return;
+  }
 
   auto* db_ch = ResolveDbAppChannel(ent->Dbid());
   if (db_ch == nullptr) {
@@ -1434,11 +1637,21 @@ void BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len
   }
 
   dbapp::WriteEntity msg;
+  if (auto generated = FillSecureRandom(msg.operation_id); !generated) {
+    ATLAS_LOG_ERROR("BaseApp: cannot generate persistence operation ID");
+    ent->OnWriteAck(ent->Dbid(), false);
+    return;
+  }
   msg.flags = (ent->Dbid() == kInvalidDBID) ? WriteFlags::kCreateNew : WriteFlags::kExplicitDbid;
   msg.type_id = ent->TypeId();
   msg.dbid = ent->Dbid();
   msg.entity_id = entity_id;
-  msg.request_id = next_prepare_request_id_++;
+  msg.owner = ent->CheckoutOwner().value_or(CheckoutInfo{});
+  if (HasFlag(msg.flags, WriteFlags::kCreateNew)) {
+    msg.owner.app_id = app_id_;
+    msg.owner.process_instance = Config().process_instance;
+  }
+  msg.request_id = AllocatePrepareRequestId();
   msg.shard_table_version = dbapp_shard_table_version_;
   msg.blob.assign(data, data + len);
   const uint32_t kRequestId = msg.request_id;
@@ -1606,8 +1819,8 @@ auto BaseApp::TryCompleteLocalRelogin(PendingLogin pending) -> bool {
   // Mirror CompletePrepareLoginFromCheckout for fast relogin.
   // Otherwise username mapping stays empty after same-name reconnect.
   prepared_login_entities_[pending.login_request_id] =
-      PreparedLoginEntity{proxy->EntityId(), pending.dbid, proxy->TypeId(), Clock::now(),
-                          pending.username};
+      PreparedLoginEntity{proxy->EntityId(), pending.dbid,     proxy->TypeId(),
+                          Clock::now(),      pending.username, proxy->CheckoutOwner()};
   prepared_login_requests_by_entity_[proxy->EntityId()] = pending.login_request_id;
 
   login::PrepareLoginResult reply;
@@ -1634,13 +1847,13 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
   reply.request_id = pending.login_request_id;
 
   if (pending.reply_sent) {
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     FinishLoginFlow(pending.dbid);
     return;
   }
 
   if (queued_logins_.contains(pending.dbid)) {
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     FailPendingPrepareLogin(pending, "superseded_by_newer_login");
     FinishLoginFlow(pending.dbid);
     return;
@@ -1657,7 +1870,7 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
   if (!ent) {
     ATLAS_LOG_ERROR("BaseApp: failed to allocate EntityID for login entity type={} dbid={}",
                     type_id, dbid);
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
     reply.error = "entity_id_exhausted";
     SendPrepareLoginResult(pending.loginapp_addr, reply);
@@ -1665,13 +1878,15 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
     return;
   }
 
+  ent->SetCheckoutOwner(pending.checkout_owner);
+
   // Same split as CreateBaseFromDB: base -> Base.Deserialize, cell parked
   // for the next CreateCellEntity's script_init_data.
   std::span<const std::byte> base_span, cell_span;
   if (!DecodeDbBlob(blob, base_span, cell_span)) {
     ATLAS_LOG_ERROR("BaseApp: login checkout blob corrupt (dbid={} type={})", dbid, type_id);
     entity_mgr_.Destroy(ent->EntityId());
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
     reply.error = "blob_corrupt";
     SendPrepareLoginResult(pending.loginapp_addr, reply);
@@ -1690,7 +1905,7 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
     }
 
     entity_mgr_.Destroy(ent->EntityId());
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
     reply.error = "dbid_conflict";
     SendPrepareLoginResult(pending.loginapp_addr, reply);
@@ -1701,7 +1916,7 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
   auto* proxy = entity_mgr_.FindProxy(ent->EntityId());
   if (proxy && !RotateProxySession(proxy->EntityId(), pending.session_key)) {
     entity_mgr_.Destroy(ent->EntityId());
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
     reply.error = "session_conflict";
     SendPrepareLoginResult(pending.loginapp_addr, reply);
@@ -1712,7 +1927,7 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
   if (!RestoreManagedEntity(ent->EntityId(), type_id, dbid, base_span)) {
     (void)NotifyManagedEntityDestroyed(ent->EntityId(), "login rollback");
     entity_mgr_.Destroy(ent->EntityId());
-    ReleaseCheckout(dbid, type_id);
+    ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
     reply.error = "restore_entity_failed";
     SendPrepareLoginResult(pending.loginapp_addr, reply);
@@ -1720,8 +1935,8 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
     return;
   }
 
-  prepared_login_entities_[pending.login_request_id] =
-      PreparedLoginEntity{ent->EntityId(), dbid, type_id, Clock::now(), pending.username};
+  prepared_login_entities_[pending.login_request_id] = PreparedLoginEntity{
+      ent->EntityId(), dbid, type_id, Clock::now(), pending.username, pending.checkout_owner};
   prepared_login_requests_by_entity_[ent->EntityId()] = pending.login_request_id;
 
   reply.success = true;
@@ -1756,7 +1971,7 @@ void BaseApp::FailDeferredPrepareLogins(EntityID blocking_entity_id, std::string
   std::vector<DatabaseID> local_finished_dbids;
   auto* completion_dbids = finished_dbids != nullptr ? finished_dbids : &local_finished_dbids;
   for (auto& entry : deferred) {
-    ReleaseCheckout(entry.dbid, entry.type_id);
+    ReleaseLoginCheckout(entry.dbid, entry.type_id, entry.pending);
     FailPendingPrepareLogin(entry.pending, reason);
     completion_dbids->push_back(entry.pending.dbid);
   }
@@ -1833,7 +2048,7 @@ void BaseApp::DispatchPrepareLogin(PendingLogin pending) {
 
   const bool kAlreadyOnline = entity_mgr_.FindByDbid(pending.dbid) != nullptr;
   if (kAlreadyOnline) {
-    const uint32_t kRid = next_prepare_request_id_++;
+    const uint32_t kRid = AllocatePrepareRequestId();
     pending_force_logoffs_[kRid] = std::move(pending);
 
     baseapp::ForceLogoff fo;
@@ -1852,7 +2067,7 @@ void BaseApp::DispatchPrepareLogin(PendingLogin pending) {
     return;
   }
 
-  const uint32_t kRid = next_prepare_request_id_++;
+  const uint32_t kRid = AllocatePrepareRequestId();
   const DatabaseID kDbid = pending.dbid;
   pending_logins_[kRid] = std::move(pending);
 
@@ -1866,6 +2081,15 @@ void BaseApp::DispatchPrepareLogin(PendingLogin pending) {
 void BaseApp::FinishLoginFlow(DatabaseID dbid) {
   if (dbid == kInvalidDBID) {
     return;
+  }
+
+  for (const auto& [request_id, pending] : canceled_checkouts_) {
+    (void)request_id;
+    if (pending.resolved_dbid == dbid) return;
+  }
+  for (const auto& [request_id, pending] : pending_checkins_) {
+    (void)request_id;
+    if (pending.request.dbid == dbid) return;
   }
 
   active_login_dbids_.erase(dbid);
@@ -1941,6 +2165,18 @@ void BaseApp::FlushAllRemoteForceLogoffAcks(bool success) {
 
 void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t type_id,
                                  uint32_t continuation_request_id) {
+  auto write =
+      std::find_if(pending_write_to_db_.begin(), pending_write_to_db_.end(),
+                   [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; });
+  if (write != pending_write_to_db_.end()) write->second.logoff_after_write = true;
+  if (logoff_entities_in_flight_.contains(entity_id) || write != pending_write_to_db_.end()) {
+    ATLAS_LOG_WARNING("BaseApp: logoff blocked by pending persistence for entity={}", entity_id);
+    if (continuation_request_id != 0) {
+      FailPendingForceLogoff(continuation_request_id, "persistence_pending");
+    }
+    FlushRemoteForceLogoffAcks(entity_id, false);
+    return;
+  }
   if (entity_id == kInvalidEntityID) {
     if (continuation_request_id != 0)
       ContinueLoginAfterForceLogoff(continuation_request_id);
@@ -1967,16 +2203,21 @@ void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t t
     return;
   }
 
-  // Optimistic checkin: a subsequent CheckoutEntity for the same DBID can
-  // proceed without waiting for the write to complete.
-  ReleaseCheckout(dbid, type_id);
-
   dbapp::WriteEntity msg;
-  msg.flags = WriteFlags::kExplicitDbid;
+  if (auto generated = FillSecureRandom(msg.operation_id); !generated) {
+    if (continuation_request_id != 0)
+      FailPendingForceLogoff(continuation_request_id, "operation_id_generation_failed");
+    FailDeferredPrepareLogins(entity_id, "operation_id_generation_failed");
+    FlushRemoteForceLogoffAcks(entity_id, false);
+    FinishLoginFlow(dbid);
+    return;
+  }
+  msg.flags = WriteFlags::kExplicitDbid | WriteFlags::kLogOff;
   msg.type_id = type_id;
   msg.dbid = dbid;
   msg.entity_id = entity_id;
-  msg.request_id = next_prepare_request_id_++;
+  msg.owner = ent->CheckoutOwner().value_or(CheckoutInfo{});
+  msg.request_id = AllocatePrepareRequestId();
   msg.shard_table_version = dbapp_shard_table_version_;
   msg.blob = std::move(blob);
 
@@ -2055,7 +2296,7 @@ void BaseApp::ContinueLoginAfterForceLogoff(uint32_t force_request_id) {
     return;
   }
 
-  uint32_t new_rid = next_prepare_request_id_++;
+  uint32_t new_rid = AllocatePrepareRequestId();
   pending_logins_[new_rid] = pending;
 
   std::string_view failure_reason;
@@ -2067,6 +2308,14 @@ void BaseApp::ContinueLoginAfterForceLogoff(uint32_t force_request_id) {
 }
 
 auto BaseApp::FinalizeForceLogoff(EntityID entity_id, uint32_t cell_ack_request_id) -> bool {
+  auto write =
+      std::find_if(pending_write_to_db_.begin(), pending_write_to_db_.end(),
+                   [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; });
+  if (write != pending_write_to_db_.end()) {
+    write->second.logoff_after_write = true;
+    ATLAS_LOG_WARNING("BaseApp: destroy blocked by pending persistence for entity={}", entity_id);
+    return false;
+  }
   auto* ent = entity_mgr_.Find(entity_id);
   if (!ent) {
     return true;
@@ -2714,6 +2963,9 @@ void BaseApp::ApplyDbAppShardTable(uint32_t version, std::vector<dbappmgr::Shard
   dbapp_shard_table_ = std::move(entries);
   for (const auto& entry : dbapp_shard_table_) (void)ConnectDbAppChannel(entry.dbapp_addr);
   RetryDisconnectedDbappLoginCheckouts();
+  RetryEntityCheckouts();
+  RetryCanceledCheckouts();
+  RetryCheckins();
   RetryDisconnectedDbappLogoffWrites();
   RetryDisconnectedDbappWriteRequests();
   ATLAS_LOG_INFO("BaseApp: DBApp shard table version={} shards={}", dbapp_shard_table_version_,
@@ -2726,7 +2978,16 @@ void BaseApp::MarkDbappLoginCheckoutsDisconnected(const Address& dbapp_addr) {
     if (pending.checkout_awaiting_ack && pending.checkout_target_addr == dbapp_addr) {
       pending.checkout_awaiting_ack = false;
       pending.checkout_retry_pending = true;
+      pending.checkout_outcome_unknown = true;
       pending.checkout_target_addr = Address{};
+    }
+  }
+  for (auto& [request_id, pending] : pending_entity_checkouts_) {
+    (void)request_id;
+    if (pending.awaiting_ack && pending.target_addr == dbapp_addr) {
+      pending.awaiting_ack = false;
+      pending.outcome_unknown = true;
+      pending.next_retry_at = Clock::now();
     }
   }
 }
@@ -2737,6 +2998,7 @@ void BaseApp::MarkDbappLogoffWritesDisconnected(const Address& dbapp_addr) {
     if (pending.awaiting_ack && pending.target_addr == dbapp_addr) {
       pending.awaiting_ack = false;
       pending.retry_pending = true;
+      pending.outcome_unknown = true;
       pending.target_addr = Address{};
     }
   }
@@ -2747,6 +3009,7 @@ void BaseApp::MarkDbappWriteRequestsDisconnected(const Address& dbapp_addr) {
     (void)request_id;
     if (pending.awaiting_ack && pending.target_addr == dbapp_addr) {
       pending.awaiting_ack = false;
+      pending.outcome_unknown = true;
       pending.target_addr = Address{};
     }
   }
@@ -2756,21 +3019,19 @@ void BaseApp::RetryDisconnectedDbappLoginCheckouts() {
   std::vector<DatabaseID> failed_dbids;
   for (auto it = pending_logins_.begin(); it != pending_logins_.end();) {
     auto& pending = it->second;
-    if (!pending.checkout_retry_pending) {
+    if (!pending.checkout_retry_pending || Clock::now() < pending.next_checkout_retry_at) {
       ++it;
       continue;
     }
     if (pending.checkout_retry_count >= kDbappCheckoutRetryLimit) {
-      ATLAS_LOG_ERROR("BaseApp: prepare-login checkout request_id={} dbid={} retry limit exceeded",
-                      it->first, pending.dbid);
-      FailPendingPrepareLogin(pending, "checkout_retry_exceeded");
+      FailPendingPrepareLogin(pending, "checkout_unresolved");
+      CancelInflightCheckout(it->first, pending);
       failed_dbids.push_back(pending.dbid);
       it = pending_logins_.erase(it);
       continue;
     }
-    if (SendPendingLoginCheckout(it->first, pending)) {
-      ++pending.checkout_retry_count;
-    }
+    pending.next_checkout_retry_at = Clock::now() + std::chrono::seconds(1);
+    if (SendPendingLoginCheckout(it->first, pending)) ++pending.checkout_retry_count;
     ++it;
   }
   DrainFinishedLoginFlows(std::move(failed_dbids));
@@ -2779,11 +3040,20 @@ void BaseApp::RetryDisconnectedDbappLoginCheckouts() {
 void BaseApp::RetryDisconnectedDbappLogoffWrites() {
   for (auto it = pending_logoff_writes_.begin(); it != pending_logoff_writes_.end();) {
     auto& pending = it->second;
-    if (!pending.retry_pending) {
+    if (!pending.retry_pending || Clock::now() < pending.next_retry_at) {
       ++it;
       continue;
     }
     if (pending.retry_count >= kDbappLogoffWriteRetryLimit) {
+      if (pending.outcome_unknown) {
+        if (!pending.resolution_stalled) {
+          ATLAS_LOG_ERROR("BaseApp: logoff outcome unresolved; entity={} dbid={} fenced",
+                          pending.entity_id, pending.dbid);
+          pending.resolution_stalled = true;
+        }
+        ++it;
+        continue;
+      }
       ATLAS_LOG_ERROR("BaseApp: logoff write request_id={} entity_id={} retry limit exceeded",
                       it->first, pending.entity_id);
       PendingLogoffWrite failed = std::move(pending);
@@ -2802,11 +3072,20 @@ void BaseApp::RetryDisconnectedDbappLogoffWrites() {
 void BaseApp::RetryDisconnectedDbappWriteRequests() {
   for (auto it = pending_write_to_db_.begin(); it != pending_write_to_db_.end();) {
     auto& pending = it->second;
-    if (pending.awaiting_ack) {
+    if (pending.awaiting_ack || Clock::now() < pending.next_retry_at) {
       ++it;
       continue;
     }
     if (pending.retry_count >= kDbappWriteRetryLimit) {
+      if (pending.outcome_unknown) {
+        if (!pending.resolution_stalled) {
+          ATLAS_LOG_ERROR("BaseApp: write outcome unresolved; entity={} dbid={} fenced",
+                          pending.entity_id, pending.dbid);
+          pending.resolution_stalled = true;
+        }
+        ++it;
+        continue;
+      }
       ATLAS_LOG_ERROR("BaseApp: write_to_db request_id={} entity_id={} retry limit exceeded",
                       it->first, pending.entity_id);
       if (auto* ent = entity_mgr_.Find(pending.entity_id)) {
@@ -2824,6 +3103,14 @@ void BaseApp::RetryDisconnectedDbappWriteRequests() {
 
 auto BaseApp::SendPendingLoginCheckout(uint32_t request_id, PendingLogin& pending,
                                        std::string_view* failure_reason) -> bool {
+  if (std::all_of(pending.checkout_operation_id.begin(), pending.checkout_operation_id.end(),
+                  [](std::byte value) { return value == std::byte{0}; })) {
+    if (auto generated = FillSecureRandom(pending.checkout_operation_id); !generated) {
+      if (failure_reason) *failure_reason = "checkout_operation_id_failed";
+      return false;
+    }
+    pending.checkout_app_id = app_id_;
+  }
   auto* db_ch = ResolveDbAppChannel(pending.dbid);
   if (db_ch == nullptr) {
     ATLAS_LOG_WARNING("BaseApp: prepare-login checkout request_id={} dbid={} has no DBApp route",
@@ -2835,10 +3122,14 @@ auto BaseApp::SendPendingLoginCheckout(uint32_t request_id, PendingLogin& pendin
   }
 
   dbapp::CheckoutEntity co;
+  pending.checkout_request_id = request_id;
+  co.operation_id = pending.checkout_operation_id;
   co.request_id = request_id;
   co.dbid = pending.dbid;
   co.type_id = pending.type_id;
   co.shard_table_version = dbapp_shard_table_version_;
+  co.owner_app_id = pending.checkout_app_id;
+  co.owner_process_instance = Config().process_instance;
 
   pending.checkout_target_addr = db_ch->RemoteAddress();
   auto send_result = db_ch->SendMessage(co);
@@ -2857,6 +3148,7 @@ auto BaseApp::SendPendingLoginCheckout(uint32_t request_id, PendingLogin& pendin
 }
 
 auto BaseApp::SendPendingLogoffWriteToDb(uint32_t request_id, PendingLogoffWrite& pending) -> bool {
+  pending.next_retry_at = Clock::now() + std::chrono::seconds(1);
   auto* db_ch = ResolveDbAppChannel(pending.message.dbid);
   if (db_ch == nullptr) {
     ATLAS_LOG_WARNING("BaseApp: logoff write request_id={} entity_id={} has no DBApp route",
@@ -2881,10 +3173,13 @@ auto BaseApp::SendPendingLogoffWriteToDb(uint32_t request_id, PendingLogoffWrite
 
   pending.awaiting_ack = true;
   pending.retry_pending = false;
+  pending.created_at = Clock::now();
+  pending.next_retry_at = TimePoint{};
   return true;
 }
 
 auto BaseApp::SendPendingWriteToDb(uint32_t request_id, PendingWriteToDb& pending) -> bool {
+  pending.next_retry_at = Clock::now() + std::chrono::seconds(1);
   auto* db_ch = ResolveDbAppChannel(pending.message.dbid);
   if (db_ch == nullptr) {
     ATLAS_LOG_WARNING("BaseApp: write_to_db request_id={} entity_id={} has no DBApp route",
@@ -2905,6 +3200,8 @@ auto BaseApp::SendPendingWriteToDb(uint32_t request_id, PendingWriteToDb& pendin
     return false;
   }
   pending.awaiting_ack = true;
+  pending.created_at = Clock::now();
+  pending.next_retry_at = TimePoint{};
   return true;
 }
 
@@ -3211,10 +3508,6 @@ void BaseApp::CleanupExpiredPendingRequests() {
   std::vector<DatabaseID> finished_login_dbids;
   std::unordered_set<uint32_t> expired_force_logoff_request_ids;
 
-  std::erase_if(canceled_login_checkouts_, [kNow](const auto& entry) {
-    return kNow - entry.second.canceled_at > kCanceledCheckoutRetention;
-  });
-
   for (auto& [request_id, pending] : pending_logins_) {
     if (!pending.reply_sent && kNow - pending.created_at > kPendingTimeout) {
       ATLAS_LOG_WARNING("BaseApp: prepare-login request_id={} timed out", request_id);
@@ -3244,6 +3537,15 @@ void BaseApp::CleanupExpiredPendingRequests() {
         (!pending_force_logoffs_.contains(it->second.continuation_request_id) ||
          expired_force_logoff_request_ids.contains(it->second.continuation_request_id));
     if (kTimedOut || kOrphaned) {
+      if (it->second.awaiting_ack || it->second.outcome_unknown) {
+        auto& pending = it->second;
+        pending.outcome_unknown = true;
+        pending.awaiting_ack = false;
+        pending.retry_pending = true;
+        if (kOrphaned) pending.continuation_request_id = 0;
+        ++it;
+        continue;
+      }
       if (kTimedOut) {
         ATLAS_LOG_WARNING("BaseApp: logoff write request_id={} entity_id={} timed out", it->first,
                           it->second.entity_id);
@@ -3268,6 +3570,12 @@ void BaseApp::CleanupExpiredPendingRequests() {
 
   for (auto it = pending_write_to_db_.begin(); it != pending_write_to_db_.end();) {
     if (kNow - it->second.created_at > kPendingTimeout) {
+      if (it->second.awaiting_ack || it->second.outcome_unknown) {
+        it->second.outcome_unknown = true;
+        it->second.awaiting_ack = false;
+        ++it;
+        continue;
+      }
       ATLAS_LOG_WARNING("BaseApp: write_to_db request_id={} entity_id={} timed out", it->first,
                         it->second.entity_id);
       if (auto* ent = entity_mgr_.Find(it->second.entity_id)) {
@@ -3279,11 +3587,18 @@ void BaseApp::CleanupExpiredPendingRequests() {
     }
   }
 
+  RetryDisconnectedDbappLoginCheckouts();
+  RetryEntityCheckouts();
+  RetryCanceledCheckouts();
+  RetryCheckins();
+  RetryDisconnectedDbappLogoffWrites();
+  RetryDisconnectedDbappWriteRequests();
+
   for (auto it = deferred_login_checkouts_.begin(); it != deferred_login_checkouts_.end();) {
     auto& deferred = it->second;
     for (auto entry_it = deferred.begin(); entry_it != deferred.end();) {
       if (!entry_it->pending.reply_sent && kNow - entry_it->pending.created_at > kPendingTimeout) {
-        ReleaseCheckout(entry_it->dbid, entry_it->type_id);
+        ReleaseLoginCheckout(entry_it->dbid, entry_it->type_id, entry_it->pending);
         FailPendingPrepareLogin(entry_it->pending, "timeout");
         finished_login_dbids.push_back(entry_it->pending.dbid);
         entry_it = deferred.erase(entry_it);
@@ -3409,8 +3724,22 @@ void BaseApp::FailAllDbappPendingRequests(std::string_view reason, bool fail_wri
                                           bool preserve_disconnected_logins,
                                           bool preserve_disconnected_logoffs) {
   std::vector<DatabaseID> preserved_dbids;
+  for (const auto& [request_id, pending] : pending_checkins_) {
+    (void)request_id;
+    preserved_dbids.push_back(pending.request.dbid);
+  }
   std::vector<EntityID> preserved_logoff_entities;
   std::vector<uint32_t> preserved_force_logoff_requests;
+  if (!fail_write_to_db) {
+    for (const auto& [request_id, pending] : canceled_checkouts_) {
+      (void)request_id;
+      if (pending.resolved_dbid != kInvalidDBID) preserved_dbids.push_back(pending.resolved_dbid);
+    }
+    for (const auto& [request_id, pending] : pending_entity_checkouts_) {
+      (void)request_id;
+      if (pending.resolved_dbid != kInvalidDBID) preserved_dbids.push_back(pending.resolved_dbid);
+    }
+  }
 
   for (auto it = pending_logins_.begin(); it != pending_logins_.end();) {
     if (preserve_disconnected_logins && it->second.checkout_retry_pending) {
@@ -3472,7 +3801,10 @@ void BaseApp::FailAllDbappPendingRequests(std::string_view reason, bool fail_wri
     }
     pending_write_to_db_.clear();
   }
-  canceled_login_checkouts_.clear();
+  if (fail_write_to_db) {
+    canceled_checkouts_.clear();
+    pending_entity_checkouts_.clear();
+  }
   if (preserve_disconnected_logoffs && !preserved_logoff_entities.empty()) {
     std::vector<EntityID> force_flush_entities;
     for (const auto& [entity_id, queued] : pending_remote_force_logoff_acks_) {
@@ -3613,47 +3945,116 @@ void BaseApp::RetryStalledForceLogoff(uint32_t request_id) {
   }
 }
 
-void BaseApp::ReleaseCheckout(DatabaseID dbid, uint16_t type_id) {
-  auto* db_ch = ResolveDbAppChannel(dbid);
-  if (db_ch == nullptr || dbid == kInvalidDBID) {
+void BaseApp::ReleaseCheckout(DatabaseID dbid, uint16_t type_id,
+                              std::optional<CheckoutInfo> owner) {
+  if (dbid <= 0) return;
+  if (!owner) {
+    if (const auto* entity = entity_mgr_.FindByDbid(dbid)) owner = entity->CheckoutOwner();
+  }
+  if (!owner || owner->ownership_version == 0 || owner->process_instance == 0) {
+    ATLAS_LOG_ERROR("BaseApp: cannot check in dbid={} without confirmed owner", dbid);
     return;
   }
+  for (const auto& [id, pending] : pending_checkins_) {
+    (void)id;
+    if (pending.request.dbid == dbid && pending.request.type_id == type_id &&
+        pending.request.owner == *owner)
+      return;
+  }
+  const auto request_id = AllocatePrepareRequestId();
+  if (request_id == 0) {
+    ATLAS_LOG_ERROR("BaseApp: no request ID for checkin dbid={}", dbid);
+    return;
+  }
+  PendingCheckin pending;
+  pending.request = {request_id, type_id, dbid, *owner};
+  pending_checkins_.emplace(request_id, std::move(pending));
+  active_login_dbids_.insert(dbid);
+  SendCheckin(request_id);
+}
 
-  dbapp::CheckinEntity checkin;
-  checkin.type_id = type_id;
-  checkin.dbid = dbid;
-  (void)db_ch->SendMessage(checkin);
+void BaseApp::SendCheckin(uint32_t request_id) {
+  auto& pending = pending_checkins_.at(request_id);
+  ++pending.attempts;
+  pending.next_retry = Clock::now() + std::chrono::seconds(1);
+  auto* channel = ResolveDbAppChannel(pending.request.dbid);
+  if (!channel) return;
+  pending.target = channel->RemoteAddress();
+  (void)channel->SendMessage(pending.request);
+}
+
+void BaseApp::RetryCheckins() {
+  for (auto& [id, pending] : pending_checkins_) {
+    if (pending.stalled || Clock::now() < pending.next_retry) continue;
+    if (pending.attempts >= kDbappCheckoutRetryLimit) {
+      pending.stalled = true;
+      ATLAS_LOG_ERROR("BaseApp: checkin unconfirmed; request={} dbid={} fenced", id,
+                      pending.request.dbid);
+    } else {
+      SendCheckin(id);
+    }
+  }
+}
+
+void BaseApp::OnCheckinEntityAck(const Address& src, const dbapp::CheckinEntityAck& msg) {
+  auto found = pending_checkins_.find(msg.request.request_id);
+  if (found == pending_checkins_.end()) return;
+  const auto& pending = found->second;
+  if (pending.target != src || pending.request.dbid != msg.request.dbid ||
+      pending.request.type_id != msg.request.type_id || pending.request.owner != msg.request.owner)
+    return;
+  if (!msg.success) return;
+  const auto dbid = pending.request.dbid;
+  pending_checkins_.erase(found);
+  FinishLoginFlow(dbid);
+}
+
+void BaseApp::ReleaseLoginCheckout(DatabaseID dbid, uint16_t type_id, const PendingLogin& pending) {
+  if (pending.checkout_request_id != 0) {
+    CancelInflightCheckout(pending.checkout_request_id, pending);
+  } else {
+    ReleaseCheckout(dbid, type_id, pending.checkout_owner);
+  }
 }
 
 void BaseApp::CancelInflightCheckout(uint32_t request_id, const PendingLogin& pending) {
-  canceled_login_checkouts_[request_id] =
-      CanceledCheckout{pending.dbid, pending.type_id, Clock::now()};
-  ++canceled_checkout_total_;
-  SendAbortCheckout(request_id, pending.dbid, pending.type_id);
+  if (!pending.checkout_awaiting_ack && !pending.checkout_outcome_unknown &&
+      !pending.checkout_owner)
+    return;
+  PendingDbCheckout canceled;
+  canceled.request.request_id = request_id;
+  canceled.request.operation_id = pending.checkout_operation_id;
+  canceled.request.dbid = pending.dbid;
+  canceled.resolved_dbid = pending.dbid;
+  canceled.request.type_id = pending.type_id;
+  canceled.request.owner_app_id = pending.checkout_app_id;
+  canceled.request.owner_process_instance = Config().process_instance;
+  canceled.target_addr = pending.checkout_target_addr;
+  canceled.created_at = Clock::now();
+  canceled.outcome_unknown = true;
+  auto [entry, inserted] = canceled_checkouts_.emplace(request_id, std::move(canceled));
+  if (inserted) ++canceled_checkout_total_;
+  if (SendAbortCheckout(entry->second)) ++entry->second.retry_count;
 }
 
-void BaseApp::SendAbortCheckout(uint32_t request_id, DatabaseID dbid, uint16_t type_id) {
-  auto* db_ch = ResolveDbAppChannel(dbid);
-  if (db_ch == nullptr) {
-    ATLAS_LOG_WARNING(
-        "BaseApp: cannot abort checkout request_id={} dbid={} without DBApp "
-        "channel",
-        request_id, dbid);
-    return;
-  }
-
+bool BaseApp::SendAbortCheckout(PendingDbCheckout& pending) {
+  pending.next_retry_at = Clock::now() + std::chrono::seconds(1);
+  auto* channel = ResolveDbAppChannel(pending.request.dbid);
+  if (!channel) return false;
   dbapp::AbortCheckout abort;
-  abort.request_id = request_id;
-  abort.type_id = type_id;
-  abort.dbid = dbid;
-  if (auto r = db_ch->SendMessage(abort); !r) {
-    // DBApp wedges the slot until BaseApp-death detection clears it;
-    // re-login returns kAlreadyCheckedOut against a discarded holder.
-    ATLAS_LOG_ERROR(
-        "BaseApp: AbortCheckout dropped, dbid={} type_id={} request_id={}: {} "
-        "account wedge risk",
-        dbid, type_id, request_id, r.Error().Message());
-  }
+  const auto& request = pending.request;
+  abort.operation_id = request.operation_id;
+  abort.request_id = request.request_id;
+  abort.dbid = request.dbid;
+  abort.type_id = request.type_id;
+  abort.mode = request.mode;
+  abort.identifier = request.identifier;
+  abort.entity_id = request.entity_id;
+  abort.owner_app_id = request.owner_app_id;
+  abort.owner_process_instance = request.owner_process_instance;
+  pending.target_addr = channel->RemoteAddress();
+  pending.awaiting_ack = channel->SendMessage(abort).HasValue();
+  return pending.awaiting_ack;
 }
 
 auto BaseApp::RollbackPreparedLoginEntity(uint32_t login_request_id) -> bool {
@@ -3677,7 +4078,7 @@ auto BaseApp::RollbackPreparedLoginEntity(uint32_t login_request_id) -> bool {
   (void)entity_mgr_.ClearSessionKey(kPrepared.entity_id);
   (void)entity_mgr_.AssignDbid(kPrepared.entity_id, kInvalidDBID);
   ent->MarkForDestroy();
-  ReleaseCheckout(kPrepared.dbid, kPrepared.type_id);
+  ReleaseCheckout(kPrepared.dbid, kPrepared.type_id, kPrepared.checkout_owner);
   return true;
 }
 
@@ -3732,7 +4133,7 @@ void BaseApp::CancelPrepareLogin(uint32_t login_request_id, DatabaseID dbid) {
         continue;
       }
 
-      ReleaseCheckout(entry_it->dbid, entry_it->type_id);
+      ReleaseLoginCheckout(entry_it->dbid, entry_it->type_id, entry_it->pending);
       FinishLoginFlow(entry_it->pending.dbid);
       entry_it = deferred.erase(entry_it);
       removed = true;
@@ -3763,7 +4164,7 @@ auto BaseApp::RetryLoginAfterCheckoutConflict(PendingLogin pending, DatabaseID d
     return false;
   }
 
-  const uint32_t kForceRequestId = next_prepare_request_id_++;
+  const uint32_t kForceRequestId = AllocatePrepareRequestId();
   pending.force_logoff_holder_addr = holder_addr;
   pending.force_logoff_sent_at = Clock::now();
   pending.next_force_logoff_retry_at = {};

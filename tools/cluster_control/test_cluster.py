@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from common.cluster import (
     LoggedProcess,
     resolve_program,
@@ -33,9 +34,9 @@ def parse_args() -> argparse.Namespace:
                         help="Subdirectory of bin/ where binaries live (default: debug).")
     parser.add_argument("--port-base", type=int, default=0,
                         help="Lowest port to use; 0 = auto-pick a free range.")
-    # 60s headroom for cold-start where dbapp's first SQLite init + .NET JIT
-    # can blow past the 20s that the warm path normally hits in well under 1s.
+    # Allow database initialization and cold .NET JIT startup.
     parser.add_argument("--registration-timeout-sec", type=int, default=60)
+    add_database_options(parser)
     return parser.parse_args()
 
 
@@ -70,6 +71,8 @@ def _port_bindable(port: int) -> bool:
 
 def main() -> int:
     args = parse_args()
+    if args.db_backend == 'mysql':
+        database_config(args, Path())
     # Retry on bind failure — even with the probe filter, a port can be
     # transiently reserved between probe and child bind. Fixed port_base skips.
     if args.port_base > 0:
@@ -118,7 +121,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             print(f"missing: {prog}", file=sys.stderr, flush=True)
             return 1
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_root = repo_root / ".tmp" / "test_cluster" / timestamp
     log_dir = run_root / "logs"
     db_dir = run_root / "db"
@@ -127,17 +130,16 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     db_dir.mkdir(parents=True, exist_ok=True)
 
+    database = database_config(args, db_dir / 'test_cluster.sqlite3')
+    record_database_run(run_root, database)
+
     machined_address = f"127.0.0.1:{machined_port}"
     db_config_path.write_text(
         json.dumps({
             "machined_address": machined_address,
             "auto_create_accounts": True,
             "account_type_id": 1,
-            "database": {
-                "type": "sqlite",
-                "sqlite_path": str(db_dir / "test_cluster.sqlite3"),
-                "sqlite_foreign_keys": True,
-            },
+            "database": database,
         }, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -162,6 +164,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        "--config", str(db_config_path),
                        "--update-hertz", "50", "--log-level", "info"]))
         processes[-1].start_order = 2
+        wait_for_database_start(processes[-1].process, log_dir)
 
         processes.append(start_logged_process(
             name="baseappmgr", file_path=baseappmgr,
@@ -203,6 +206,12 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         time.sleep(_EARLY_EXIT_GRACE_SEC)
         for p in processes:
             if p.process.poll() is not None:
+                if p.name == "dbapp":
+                    detail = (log_dir / "dbapp.stderr.log").read_text(encoding="utf-8", errors="replace")
+                    if "database startup failed" in detail or "CreateDatabase:" in detail:
+                        print("Database startup failed; no backend fallback. " + detail,
+                              file=sys.stderr, flush=True)
+                        return 1
                 print(f"{p.name} exited early (rc={p.process.returncode}); will retry",
                       file=sys.stderr, flush=True)
                 return _RC_RETRY
@@ -225,7 +234,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         # Single-line READY marker; consumers parse `key=value` pairs.
         print(
             f"READY loginapp_port={loginapp_port} baseapp_external_port={baseapp_external_port} "
-            f"machined_port={machined_port} log_dir={log_dir}",
+            f"machined_port={machined_port} log_dir={log_dir} db_backend={args.db_backend} dbapps=1",
             flush=True,
         )
 
@@ -241,4 +250,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

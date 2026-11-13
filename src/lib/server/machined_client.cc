@@ -63,8 +63,8 @@ auto MachinedClient::IsConnected() const -> bool {
 }
 
 void MachinedClient::SendRegister(const ServerConfig& cfg) {
-  cached_reg_ =
-      RegistrationInfo{cfg.process_type, cfg.process_name, cfg.internal_port, cfg.external_port};
+  cached_reg_ = RegistrationInfo{cfg.process_type, cfg.process_name, cfg.internal_port,
+                                 cfg.external_port, cfg.process_instance};
 
   if (!IsConnected()) {
     ATLAS_LOG_DEBUG("MachinedClient: send_register deferred until reconnect");
@@ -84,6 +84,7 @@ void MachinedClient::SendCachedRegister() {
   msg.internal_port = cached_reg_->internal_port;
   msg.external_port = cached_reg_->external_port;
   msg.pid = CurrentPid();
+  msg.process_instance = cached_reg_->process_instance;
 
   if (auto r = channel_->SendMessage(msg); !r) {
     ATLAS_LOG_ERROR("MachinedClient: failed to send register: {}", r.Error().Message());
@@ -100,6 +101,7 @@ void MachinedClient::SendDeregister(const ServerConfig& cfg) {
   msg.process_type = cfg.process_type;
   msg.name = cfg.process_name;
   msg.pid = CurrentPid();
+  msg.process_instance = cfg.process_instance;
 
   if (auto r = channel_->SendMessage(msg); !r) {
     ATLAS_LOG_WARNING("MachinedClient: failed to send deregister: {}", r.Error().Message());
@@ -468,8 +470,9 @@ void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* /*ch*/
   }
 }
 
-void MachinedClient::OnDeathNotification(const Address& /*src*/, Channel* /*ch*/,
+void MachinedClient::OnDeathNotification(const Address& /*src*/, Channel* ch,
                                          const machined::DeathNotification& msg) {
+  if (ch == nullptr || ch != channel_) return;
   for (const auto& sub : subscriptions_) {
     if (sub.target_type != msg.process_type) continue;
     if (sub.listener_type == machined::ListenerType::kBirth) continue;

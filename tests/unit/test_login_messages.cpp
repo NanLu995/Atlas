@@ -32,7 +32,9 @@ TEST(LoginMessages, LoginRequest_RoundTrip) {
 TEST(LoginMessages, LoginResult_Success_RoundTrip) {
   LoginResult msg;
   msg.status = LoginStatus::kSuccess;
-  msg.session_key = SessionKey::Generate();
+  auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  msg.session_key = *key;
   msg.baseapp_addr = Address(0x7F000001u, 20100);
 
   auto out = round_trip(msg);
@@ -110,7 +112,9 @@ TEST(LoginMessages, PrepareLogin_RoundTrip) {
   msg.request_id = 8;
   msg.type_id = 2;
   msg.dbid = 777;
-  msg.session_key = SessionKey::Generate();
+  auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  msg.session_key = *key;
   msg.client_addr = Address(0x7F000001u, 55000);
 
   auto out = round_trip(msg);
@@ -145,14 +149,21 @@ TEST(LoginMessages, CancelPrepareLogin_RoundTrip) {
 TEST(LoginMessages, SessionKey_Generate_Unique) {
   auto k1 = SessionKey::Generate();
   auto k2 = SessionKey::Generate();
-  EXPECT_NE(k1, k2) << "Two generated SessionKeys should differ";
+  ASSERT_TRUE(k1.HasValue());
+  ASSERT_TRUE(k2.HasValue());
+  EXPECT_NE(*k1, *k2) << "Two generated SessionKeys should differ";
 }
 
 TEST(LoginMessages, SessionKey_IsZero) {
   SessionKey zero{};
   EXPECT_TRUE(zero.IsZero());
   auto k = SessionKey::Generate();
-  EXPECT_FALSE(k.IsZero());
+  ASSERT_TRUE(k.HasValue());
+  EXPECT_FALSE(k->IsZero());
+}
+
+TEST(LoginMessages, SecureRandomEmptyBuffer) {
+  EXPECT_TRUE(FillSecureRandom({}).HasValue());
 }
 
 }  // namespace

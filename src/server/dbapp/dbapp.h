@@ -19,6 +19,7 @@
 #include "entitydef/entity_def_registry.h"
 #include "foundation/latency_histogram.h"
 #include "network/machined_types.h"
+#include "platform/sha256.h"
 #include "server/manager_app.h"
 
 namespace atlas {
@@ -59,7 +60,8 @@ class DBApp : public ManagerApp {
   void OnDbAppMgrDeath(const machined::DeathNotification& msg);
   void OnRegisterDbAppAck(const Address& src, Channel* ch, const dbappmgr::RegisterDbAppAck& msg);
   void OnShardTableUpdate(const Address& src, Channel* ch, const dbappmgr::ShardTableUpdate& msg);
-  void OnBaseappDeath(const Address& internal_addr, std::string_view name, uint8_t reason);
+  void OnBaseappDeath(const Address& internal_addr, uint64_t process_instance);
+  void RetireBaseappProcess(const Address& internal_addr, uint64_t process_instance);
 
   [[nodiscard]] auto BuildDbConfig() const -> DatabaseConfig;
   auto ResolveReplyChannel(const Address& addr) -> Channel*;
@@ -71,6 +73,7 @@ class DBApp : public ManagerApp {
   struct RequestCacheKey {
     Address reply_addr;
     uint32_t request_id{0};
+    std::array<std::byte, 16> operation_id{};
 
     [[nodiscard]] auto operator==(const RequestCacheKey& other) const -> bool = default;
   };
@@ -82,8 +85,8 @@ class DBApp : public ManagerApp {
   [[nodiscard]] auto SendCheckoutAck(const RequestCacheKey& key,
                                      const dbapp::CheckoutEntityAck& ack, Channel* fallback_ch)
       -> bool;
-  void RememberWriteAck(const RequestCacheKey& key, const dbapp::WriteEntityAck& ack);
-  void RememberCheckoutAck(const RequestCacheKey& key, const dbapp::CheckoutEntityAck& ack);
+  void RememberCheckoutAck(const RequestCacheKey& key, const dbapp::CheckoutEntity& request,
+                           const dbapp::CheckoutEntityAck& ack);
   [[nodiscard]] auto HasAuthoritativeShardTable() const -> bool;
   [[nodiscard]] auto FindShard(DatabaseID dbid) const -> const dbappmgr::ShardEntry*;
   [[nodiscard]] auto AllocateCreateDbid(const dbappmgr::ShardEntry& shard) -> DatabaseID;
@@ -95,25 +98,32 @@ class DBApp : public ManagerApp {
   void PutCreateEntityWithRetry(const dbappmgr::ShardEntry& shard, DatabaseID dbid,
                                 uint16_t type_id, WriteFlags flags, std::vector<std::byte> blob,
                                 std::string identifier, std::optional<std::string> password_hash,
-                                std::function<void(PutResult)> callback);
+                                std::function<void(PutResult)> callback,
+                                DatabaseWriteOperation operation = {});
 
+  struct ProcessRetirement {
+    Address addr;
+    uint64_t instance{0};
+    bool in_flight{false};
+    TimePoint next_attempt{};
+  };
+  std::vector<ProcessRetirement> process_retirements_;
   std::unique_ptr<IDatabase> database_;
   std::unique_ptr<EntityIdAllocator> id_allocator_;
   CheckoutManager checkout_mgr_;
   struct PendingCheckoutRequest {
-    DatabaseID dbid{kInvalidDBID};
-    uint16_t type_id{0};
-    Address reply_addr;
+    dbapp::CheckoutEntity request;
     bool canceled{false};
-    DatabaseID cleared_dbid{kInvalidDBID};
+    bool retired{false};
   };
   std::unordered_map<RequestCacheKey, PendingCheckoutRequest, RequestCacheKeyHash>
       pending_checkout_requests_;
-  std::unordered_set<RequestCacheKey, RequestCacheKeyHash> pending_write_requests_;
-  std::unordered_map<RequestCacheKey, dbapp::WriteEntityAck, RequestCacheKeyHash> write_ack_cache_;
-  std::deque<RequestCacheKey> write_ack_order_;
-  std::unordered_map<RequestCacheKey, dbapp::CheckoutEntityAck, RequestCacheKeyHash>
-      checkout_ack_cache_;
+  std::unordered_map<RequestCacheKey, Sha256Digest, RequestCacheKeyHash> pending_write_requests_;
+  struct CachedCheckoutReply {
+    dbapp::CheckoutEntity request;
+    dbapp::CheckoutEntityAck ack;
+  };
+  std::unordered_map<RequestCacheKey, CachedCheckoutReply, RequestCacheKeyHash> checkout_ack_cache_;
   std::deque<RequestCacheKey> checkout_ack_order_;
   std::optional<EntityDefRegistry> entity_defs_;  // nullopt until loaded
   bool auto_create_accounts_{false};

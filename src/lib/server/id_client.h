@@ -8,10 +8,7 @@
 
 namespace atlas {
 
-// Water-level EntityID cache backed by DBApp batch refills.
-// Thresholds sized to absorb startup login bursts at 500+ clients without
-// hitting the 200-300 ms dbapp-roundtrip gap on the first tick.
-// Single-threaded (BaseApp main loop only).
+// Caches committed DBApp reservations on the entity app's main loop.
 class IDClient {
  public:
   static constexpr uint64_t kCriticallyLow = 16;
@@ -45,6 +42,7 @@ class IDClient {
 
   std::deque<Range> ranges_;
   uint64_t total_available_{0};
+  EntityID highest_received_id_{0};
   bool ever_received_{false};
 };
 

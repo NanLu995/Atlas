@@ -5,7 +5,7 @@ table、GetShardTable / ShardTableUpdate、watcher、DBApp 注册接入和单元
 已接入；BaseApp shard cache 与 dbid 路由、LoginApp shard cache 与 username
 auth shard 路由、DBApp request version 校验和 request idempotency cache 已接入，
 DBApp range-scoped explicit DBID create allocation 已接入；allocator recovery /
-XML duplicate guard、duplicate retry、BaseApp WriteToDB death retry、
+duplicate guard、duplicate retry、BaseApp WriteToDB death retry、
 BaseApp login checkout death retry、LoginApp auth death retry 和 BaseApp
 logoff death retry 已接入；`RecoverDBAppState` worker shard 重报、
 DBAppMgr recovery window 冻结恢复注册 split、`known_app_id` echo、
@@ -19,7 +19,7 @@ P15 前的 Atlas 基线只有单 DBApp:
 
 - BaseApp / LoginApp 通过 machined registry 找到唯一一台 DBApp 直接发
   `CheckoutEntity` / `WriteEntity`。
-- DBApp 持有 `database_`（当前已落地 SQLite / XML，MySQL 仅预留接口）、
+- DBApp 持有 `database_`（SQLite / MySQL/MariaDB）、
   `id_allocator_`、
   `checkout_mgr_`、`pending_checkout_requests_` —— 全是单点。
 - 单 DBApp 写吞吐 / 容量 / 故障域都是单点。
@@ -156,9 +156,8 @@ Reviver multi-target 已接入 `dbappmgr_target_`，支持
 - **跨 DBApp 事务** — checkout 一个 entity 涉及多个 shard 的场景。
   Atlas 当前 entity 模型每个 entity 一个 dbid,不跨行;不需要分布式
   事务。
-- **DBApp 副本(replication)** — Phase 15 不做主从复制；当前 DBApp 内部
-  仍是 SQLite / XML 存储，MySQL 接入后 replication 也应由 DB 层
-  (MySQL cluster / Postgres streaming)解决，Atlas 上层不关心。
+- **DBApp 副本(replication)** — Phase 15 不做主从复制；MySQL/MariaDB 支持共享
+  同一逻辑数据库，复制由数据库自身负责。SQLite 仅用于单 DBApp 开发和测试。
 - **shard rebalance** — DBApp 死亡时 reassign 已接入；手动 ops 触发
   rebalance 和按负载自动迁移 shard 均推到 Phase 16+。
 - **历史数据迁移工具** — 从单 DBApp 升到多 DBApp 的迁移脚本。当前
@@ -208,7 +207,7 @@ Phase 13 的 "Manager HA 三件套" 已齐:CellAppMgr / BaseAppMgr / DBAppMgr
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| P15.1-D1 | DBAppMgr 进程骨架 + RegisterDbApp + InformLoad | 已接入，含 DBApp 注册接入；runtime new DBID range allocation、allocator recovery、XML duplicate guard 与 duplicate retry 已接入 |
+| P15.1-D1 | DBAppMgr 进程骨架 + RegisterDbApp + InformLoad | 已接入，含 DBApp 注册接入；runtime new DBID range allocation、allocator recovery、duplicate guard 与 duplicate retry 已接入 |
 | P15.1-D2 | Shard table + 客户端 GetShardTable + broadcast invalidate | 已接入 |
 | P15.1-D3 | BaseApp / LoginApp 接入 shard table 缓存,dual-path 兼容 (旧 single-dbapp 仍工作) | BaseApp dbid 路由与 LoginApp username auth 路由已接入；single-dbapp fast path 保留 |
 | P15.1-D4 | DBApp 端 request version 校验 + idempotency cache + request retry on death | version 校验、completed ack idempotency cache、BaseApp WriteToDB death retry、BaseApp login checkout death retry、LoginApp auth death retry 与 BaseApp logoff death retry 已接入 |
@@ -219,7 +218,7 @@ Phase 13 的 "Manager HA 三件套" 已齐:CellAppMgr / BaseAppMgr / DBAppMgr
 
 ## 8. 不会做的事(明确归档)
 
-- 不会在 Phase 15 里把当前 SQLite / XML 后端或未来 MySQL 后端替换为
+- 不会在 Phase 15 里把当前 SQLite / MySQL/MariaDB 后端替换为
   分布式 DB(如 TiDB)。
 - 不会改 Phase 7 已经稳定的 DBApp <-> DB 接口。
 - 不会强制 LoginApp 必须经过 DBAppMgr — LoginApp 直连唯一 DBApp 的

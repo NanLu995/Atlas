@@ -15,7 +15,7 @@
 |---|---|---|
 | 属性同步 | C# → `byte[]` → C++ 网络层 → 客户端 | C++ 透传,客户端可读 |
 | RPC / Mailbox | C# → `byte[]` → C++ Bundle → TCP/UDP → 对端 C# | 双端 C# 格式一致 |
-| 数据库持久化 | C# → `byte[]` → C++ DBApp → SQLite/XML blob（MySQL 仍是未来后端） | 后端切换不改变 C# bytes 语义 |
+| 数据库持久化 | C# → `byte[]` → C++ DBApp → MySQL/MariaDB 或 SQLite blob | 后端切换不改变 C# bytes 语义 |
 | 实体迁移 | C# → `byte[]` → C++ 进程间传输 → 对端 C# | C++ 透传,C# 可读写 |
 | 热重载快照 | C# → `byte[]` → 内存 → C# | 纯 C# 闭环 |
 | 位置与空间数据 | 位置走 `CellEntity` / volatile envelope，SpaceData 走 typed bytes | `position` 不进入普通复制属性；DEF008 保留该字段名 |

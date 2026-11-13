@@ -8,11 +8,20 @@
 #include <type_traits>
 #include <variant>
 
+#include "platform/environment.h"
 #include "serialization/data_section.h"
 
 namespace atlas {
 
 namespace {
+
+auto ValidateDatabaseType(std::string_view type) -> Result<void> {
+  if (type != "sqlite" && type != "mysql") {
+    return Error{ErrorCode::kInvalidArgument,
+                 std::format("unsupported database backend '{}'; use sqlite or mysql", type)};
+  }
+  return {};
+}
 
 auto ParseAddress(std::string_view s) -> Result<Address> {
   auto colon = s.rfind(':');
@@ -86,7 +95,6 @@ static const CliField kCliFields[] = {
     {"runtime-config",             &ServerConfig::runtime_config},
     {"entitydef-bin-path",         &ServerConfig::entitydef_bin_path},
     {"db-type",                    &ServerConfig::db_type},
-    {"db-xml-dir",                 &ServerConfig::db_xml_dir},
     {"db-sqlite-path",             &ServerConfig::db_sqlite_path},
     {"db-sqlite-wal",              &ServerConfig::db_sqlite_wal},
     {"db-sqlite-busy-timeout-ms",  &ServerConfig::db_sqlite_busy_timeout_ms},
@@ -305,10 +313,8 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
     auto edef_bin = db->ReadString("entitydef_bin_path", "");
     if (!edef_bin.empty()) cfg.entitydef_bin_path = edef_bin;
 
-    auto dbtype = db->ReadString("type", "");
-    if (!dbtype.empty()) cfg.db_type = dbtype;
+    if (db->Child("type")) cfg.db_type = db->ReadString("type", "");
 
-    cfg.db_xml_dir = db->ReadString("xml_dir", cfg.db_xml_dir.string());
     cfg.db_sqlite_path = db->ReadString("sqlite_path", cfg.db_sqlite_path.string());
     cfg.db_sqlite_wal = db->ReadBool("sqlite_wal", cfg.db_sqlite_wal);
     cfg.db_sqlite_busy_timeout_ms =
@@ -348,6 +354,7 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
     }
   }
 
+  if (auto valid = ValidateDatabaseType(cfg.db_type); !valid) return valid.Error();
   return cfg;
 }
 
@@ -391,6 +398,7 @@ auto ServerConfig::FromArgs(int argc, char* argv[]) -> Result<ServerConfig> {
     }
   }
 
+  if (auto valid = ValidateDatabaseType(cfg.db_type); !valid) return valid.Error();
   return cfg;
 }
 
@@ -440,6 +448,12 @@ auto ServerConfig::Load(int argc, char* argv[]) -> Result<ServerConfig> {
   }
 
   if (cfg.process_name.empty()) cfg.process_name = std::string(ProcessTypeName(cfg.process_type));
+
+  if (cfg.db_type == "mysql" && cfg.db_mysql_password.empty()) {
+    auto password = ReadEnvironmentVariable("ATLAS_DB_MYSQL_PASSWORD");
+    if (!password) return password.Error();
+    cfg.db_mysql_password = std::move(*password);
+  }
 
   if (cfg.machined_address == Address::kNone || cfg.machined_address == defaults.machined_address) {
     auto default_addr = Address::Resolve("127.0.0.1", 20018);

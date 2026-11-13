@@ -144,7 +144,6 @@
         "test_script_value",
         "test_entity_def_registry_json",
         "test_database_types",
-        "test_xml_database",
         "test_sqlite_database",
         "test_coro_task",
         "test_coro_sleep",

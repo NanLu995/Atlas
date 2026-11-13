@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <set>
+#include <tuple>
 #include <utility>
 
 #include "foundation/clock.h"
@@ -156,6 +157,7 @@ auto MachinedApp::LocalProcessList() const -> std::vector<ProcessInfo> {
     info.internal_addr = e.internal_addr;
     info.external_addr = e.external_addr;
     info.pid = e.pid;
+    info.process_instance = e.process_instance;
     info.load = e.load;
     out.push_back(std::move(info));
   });
@@ -172,11 +174,11 @@ void MachinedApp::BroadcastLocalRegistryIfDue(TimePoint now) {
 void MachinedApp::OnMeshRegistry(const Address& owner, std::vector<ProcessInfo> processes) {
   const auto previous = mesh_registry_.TakeOwner(owner);
   auto key = [](const ProcessInfo& p) {
-    return std::pair<int, std::string>{static_cast<int>(p.process_type), p.name};
+    return std::tuple{static_cast<int>(p.process_type), p.name, p.process_instance};
   };
-  std::set<std::pair<int, std::string>> old_keys;
+  std::set<std::tuple<int, std::string, uint64_t>> old_keys;
   for (const auto& p : previous) old_keys.insert(key(p));
-  std::set<std::pair<int, std::string>> new_keys;
+  std::set<std::tuple<int, std::string, uint64_t>> new_keys;
   for (const auto& p : processes) new_keys.insert(key(p));
 
   // Births: remote processes that appeared since this owner's last gossip.
@@ -188,6 +190,7 @@ void MachinedApp::OnMeshRegistry(const Address& owner, std::vector<ProcessInfo> 
     notif.internal_addr = p.internal_addr;
     notif.external_addr = p.external_addr;
     notif.pid = p.pid;
+    notif.process_instance = p.process_instance;
     listener_manager_.NotifyBirth(notif);
   }
   // Deaths: remote processes that vanished while their host's machined stayed up.
@@ -198,6 +201,7 @@ void MachinedApp::OnMeshRegistry(const Address& owner, std::vector<ProcessInfo> 
     notif.name = p.name;
     notif.internal_addr = p.internal_addr;
     notif.reason = 1;
+    notif.process_instance = p.process_instance;
     listener_manager_.NotifyDeath(notif);
   }
 
@@ -218,7 +222,8 @@ void MachinedApp::OnMeshPeerDeath(const Address& dead) {
     notif.process_type = p.process_type;
     notif.name = p.name;
     notif.internal_addr = p.internal_addr;
-    notif.reason = 2;  // the owning machined left the mesh, so its processes are gone
+    notif.reason = 2;
+    notif.process_instance = p.process_instance;
     listener_manager_.NotifyDeath(notif);
   }
   ATLAS_LOG_WARNING("MachinedApp: mesh peer {} died; evicted {} remote process(es)",
@@ -311,6 +316,7 @@ void MachinedApp::OnRegister(const Address& /*src*/, Channel* ch, const Register
   entry.internal_addr = Address(ch->RemoteAddress().Ip(), msg.internal_port);
   entry.external_addr = Address(ch->RemoteAddress().Ip(), msg.external_port);
   entry.pid = msg.pid;
+  entry.process_instance = msg.process_instance;
   entry.channel = ch;
 
   RegisterAck ack;
@@ -337,6 +343,7 @@ void MachinedApp::OnRegister(const Address& /*src*/, Channel* ch, const Register
   notif.internal_addr = entry.internal_addr;
   notif.external_addr = entry.external_addr;
   notif.pid = entry.pid;
+  notif.process_instance = entry.process_instance;
   listener_manager_.NotifyBirth(notif);
 
   ATLAS_LOG_INFO("MachinedApp: registered process ({}, {})", static_cast<int>(msg.process_type),
@@ -346,7 +353,11 @@ void MachinedApp::OnRegister(const Address& /*src*/, Channel* ch, const Register
 void MachinedApp::OnDeregister(const Address& /*src*/, Channel* ch, const DeregisterMessage& msg) {
   if (ch == nullptr) return;
 
-  auto removed = process_registry_.UnregisterByName(msg.process_type, msg.name);
+  auto registered = process_registry_.FindByChannel(ch);
+  if (!registered || registered->process_type != msg.process_type || registered->name != msg.name ||
+      registered->process_instance != msg.process_instance)
+    return;
+  auto removed = process_registry_.UnregisterByChannel(ch);
   if (!removed) {
     ATLAS_LOG_WARNING("MachinedApp: deregister for unknown ({}, {})",
                       static_cast<int>(msg.process_type), msg.name);
@@ -410,6 +421,7 @@ void MachinedApp::OnQuery(const Address& /*src*/, Channel* ch, const QueryMessag
     info.internal_addr = e.internal_addr;
     info.external_addr = e.external_addr;
     info.pid = e.pid;
+    info.process_instance = e.process_instance;
     info.load = e.load;
     seen.emplace(static_cast<int>(info.process_type), info.name);
     resp.processes.push_back(std::move(info));
@@ -442,6 +454,7 @@ void MachinedApp::OnListenerRegister(const Address& /*src*/, Channel* ch,
       notif.internal_addr = entry.internal_addr;
       notif.external_addr = entry.external_addr;
       notif.pid = entry.pid;
+      notif.process_instance = entry.process_instance;
       if (auto r = ch->SendMessage(notif); !r) {
         // Replay covers peers registered before listener startup; on send failure,
         // the listener waits for a future live birth event.
@@ -546,6 +559,7 @@ void MachinedApp::NotifyDeath(const ProcessEntry& entry, uint8_t reason) {
   notif.name = entry.name;
   notif.internal_addr = entry.internal_addr;
   notif.reason = reason;
+  notif.process_instance = entry.process_instance;
   listener_manager_.NotifyDeath(notif);
 }
 

@@ -535,12 +535,16 @@ auto LoginApp::HandleLoginCoro(uint64_t client_channel_id, Address client_addr,
   Channel* baseapp_ch = static_cast<Channel*>(*ch_result);
 
   auto session_key = SessionKey::Generate();
+  if (!session_key) {
+    SendLoginError(client_channel_id, login::LoginStatus::kInternalError, "session_key_failed");
+    co_return;
+  }
 
   login::PrepareLogin prep;
   prep.request_id = rid;
   prep.type_id = auth_reply.type_id;
   prep.dbid = auth_reply.dbid;
-  prep.session_key = session_key;
+  prep.session_key = *session_key;
   prep.client_addr = client_addr;
   prep.entity_def_digest = request.entity_def_digest;
   prep.username = username;
@@ -604,7 +608,7 @@ auto LoginApp::HandleLoginCoro(uint64_t client_channel_id, Address client_addr,
 
   login::LoginResult result;
   result.status = login::LoginStatus::kSuccess;
-  result.session_key = session_key;
+  result.session_key = *session_key;
   result.baseapp_addr = alloc_reply.external_addr;
 
   if (!client_ch->SendMessage(result)) {

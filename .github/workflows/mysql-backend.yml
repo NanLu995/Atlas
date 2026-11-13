@@ -1,27 +1,46 @@
 name: MySQL Backend
 
-# Validates the atlas_db_mysql backend against a real server. Gated behind
-# ATLAS_DB_MYSQL, so it only runs from this workflow (the default CI leaves the
-# backend off). MariaDB is used as the service: the connector's native auth
-# path keeps the setup simple, and the SQL is portable to MySQL 8.
+# Required MySQL database contracts use an isolated MariaDB service.
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
       - 'src/lib/db_mysql/**'
+      - 'src/lib/db_sqlite/**'
       - 'src/lib/db/**'
+      - 'src/lib/server/server_config.*'
+      - 'tools/common/database.py'
+      - 'tools/cluster_control/**'
+      - 'CMakeLists.txt'
+      - 'src/server/dbapp/**'
+      - 'src/server/baseapp/**'
+      - 'tests/integration/test_dbapp_checkout_cleanup.cpp'
+      - 'tests/integration/CMakeLists.txt'
+      - 'tests/CMakeLists.txt'
       - 'tests/unit/test_mysql_database.cpp'
       - 'tests/unit/CMakeLists.txt'
       - 'cmake/Dependencies.cmake'
+      - 'cmake/AtlasRuntimeDeploy.cmake'
       - '.github/workflows/mysql-backend.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src/lib/db_mysql/**'
+      - 'src/lib/db_sqlite/**'
       - 'src/lib/db/**'
+      - 'src/lib/server/server_config.*'
+      - 'tools/common/database.py'
+      - 'tools/cluster_control/**'
+      - 'CMakeLists.txt'
+      - 'src/server/dbapp/**'
+      - 'src/server/baseapp/**'
+      - 'tests/integration/test_dbapp_checkout_cleanup.cpp'
+      - 'tests/integration/CMakeLists.txt'
+      - 'tests/CMakeLists.txt'
       - 'tests/unit/test_mysql_database.cpp'
       - 'cmake/Dependencies.cmake'
+      - 'cmake/AtlasRuntimeDeploy.cmake'
       - '.github/workflows/mysql-backend.yml'
 
 concurrency:
@@ -67,10 +86,10 @@ jobs:
       - name: Configure
         run: cmake --preset debug -DATLAS_DB_MYSQL=ON
 
-      - name: Build MySQL backend test
-        run: cmake --build build/debug --config Debug --target test_mysql_database --parallel 2
+      - name: Build MySQL backend and DBApp tests
+        run: cmake --build build/debug --config Debug --target test_mysql_database test_dbapp_checkout_cleanup atlas_db_mysql_plugin --parallel 2
 
-      - name: Run MySQL backend contract test
+      - name: Run MySQL backend and DBApp contracts
         working-directory: build/debug
         env:
           ATLAS_TEST_MYSQL: '1'
@@ -79,4 +98,4 @@ jobs:
           ATLAS_TEST_MYSQL_USER: atlas
           ATLAS_TEST_MYSQL_PASSWORD: atlas
           ATLAS_TEST_MYSQL_DATABASE: atlas_test
-        run: ctest --build-config Debug -R test_mysql_database --output-on-failure
+        run: ctest --build-config Debug -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$" --output-on-failure --no-tests=error

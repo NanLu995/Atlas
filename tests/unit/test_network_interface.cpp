@@ -551,39 +551,35 @@ TEST_F(NetworkInterfaceTest, ConnectRudpIsIdempotent) {
   EXPECT_EQ(ni_.ChannelCount(), 1u);
 }
 
-// Same rationale as UdpRateLimitOnlyAdmitsFirstSourcePerPoll: the time-based
-// read loop replaced the count-based exhaustion semantics, so the new
-// invariant is "only one source admitted while limited; new source admitted
-// after the limit lifts".
 TEST_F(NetworkInterfaceTest, RudpRateLimitOnlyAdmitsFirstSourcePerPoll) {
   ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)).HasValue());
   ni_.SetRateLimit(1);
 
-  constexpr uint32_t kDatagramCount = 1500;  // intentionally above the current RUDP budget
+  constexpr uint32_t kDatagramCount = 1500;
+  constexpr uint32_t kSenderCount = 2;
   std::vector<Socket> senders;
-  senders.reserve(kDatagramCount);
+  senders.reserve(kSenderCount);
 
   std::array<std::byte, 9> pkt{};
   pkt[0] = std::byte{rudp::kFlagHasSeq};
   pkt[4] = std::byte{1};
 
-  for (uint32_t i = 0; i < kDatagramCount; ++i) {
+  for (uint32_t i = 0; i < kSenderCount; ++i) {
     auto sender = Socket::CreateUdp();
     ASSERT_TRUE(sender.HasValue()) << sender.Error().Message();
     ASSERT_TRUE(sender->Bind(Address("127.0.0.1", 0)).HasValue());
-
-    auto sent = sender->SendTo(pkt, ni_.RudpAddress());
+    senders.push_back(std::move(*sender));
+  }
+  for (uint32_t i = 0; i < kDatagramCount; ++i) {
+    auto sent = senders[i % kSenderCount].SendTo(pkt, ni_.RudpAddress());
     ASSERT_TRUE(sent.HasValue()) << sent.Error().Message();
     ASSERT_EQ(*sent, pkt.size());
-
-    senders.push_back(std::move(*sender));
   }
 
   dispatcher_.ProcessOnce();
   EXPECT_EQ(ni_.ChannelCount(), 1u);
 
-  // Rate limit lifted: a new source must open a second channel. Resend in the
-  // poll loop so a datagram lost to the burst-saturated buffer still lands.
+  // After the limit lifts, resend from a new source while the burst-saturated buffer drains.
   ni_.SetRateLimit(0);
   auto extra_sender = Socket::CreateUdp();
   ASSERT_TRUE(extra_sender.HasValue());

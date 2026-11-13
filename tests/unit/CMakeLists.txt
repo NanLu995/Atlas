@@ -10,6 +10,8 @@ atlas_add_test(NAME test_error
   DEPS atlas_foundation
 )
 
+atlas_add_test(NAME test_sha256 SOURCES test_sha256.cpp DEPS atlas_platform)
+
 atlas_add_test(NAME test_string_utils
   SOURCES test_string_utils.cpp
   DEPS atlas_foundation
@@ -483,14 +485,15 @@ atlas_add_test(NAME test_cellapp_config
   DEPS atlas_cellapp_lib atlas_server atlas_serialization
 )
 
+atlas_add_test(NAME test_environment
+  SOURCES test_environment.cpp
+  DEPS atlas_platform
+)
+set_tests_properties(test_environment PROPERTIES ENVIRONMENT "ATLAS_ENVIRONMENT_TEST_VALUE=Atlas-环境")
+
 atlas_add_test(NAME test_database_types
   SOURCES test_database_types.cpp
   DEPS atlas_db
-)
-
-atlas_add_test(NAME test_xml_database
-  SOURCES test_xml_database.cpp
-  DEPS atlas_db_xml atlas_entitydef
 )
 
 atlas_add_test(NAME test_sqlite_database
@@ -774,6 +777,11 @@ atlas_add_test(NAME test_delta_forwarder
 atlas_add_test(NAME test_login_messages
   SOURCES test_login_messages.cpp
   DEPS atlas_serialization atlas_loginapp_lib
+)
+
+atlas_add_test(NAME test_session_key_failure
+  SOURCES test_session_key_failure.cpp
+  DEPS atlas_server
 )
 
 atlas_add_test(NAME test_login_rollback

@@ -10,6 +10,11 @@
 namespace atlas {
 
 auto CreateDatabase(const DatabaseConfig& config) -> std::unique_ptr<IDatabase> {
+  if (config.type != "sqlite" && config.type != "mysql") {
+    ATLAS_LOG_ERROR("CreateDatabase: unsupported database backend '{}'; use sqlite or mysql",
+                    config.type);
+    return nullptr;
+  }
   // dlopen on Linux searches neither the exe directory nor the lib*.so
   // spelling, so resolve the plugin's absolute path next to the executable.
   auto exe_path = fs::ExecutablePath();

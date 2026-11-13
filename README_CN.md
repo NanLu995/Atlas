@@ -19,12 +19,12 @@ Atlas 面向大型、长线在线世界：服务器需要跨进程扩展，模�
 - 面向服务端玩法脚本的嵌入式 .NET 运行时。
 - C# 客户端运行时，提供桌面与 Unity 集成表面；UE MVP 另有 C++ 插件 /
   客户端接入路径。
-- 运行时加载的 XML 与 SQLite 数据库插件。
+- 运行时加载的 MySQL/MariaDB 及显式选择的 SQLite 数据库插件。
 - DBAppMgr range 分片、worker 重建式 manager HA，以及对 CellAppMgr /
   BaseAppMgr / DBAppMgr 的 Reviver 监督。
 - Tracy instrumentation、基线压测驱动与 trace 对比工具。
 
-MySQL 后端仍是占位。DB 副本、shard auto-rebalance 和完整 session resume
+主要 MySQL/MariaDB 后端已实现。DB 副本、shard auto-rebalance 和完整 session resume
 不属于当前生产基线。
 
 ## MVP Unity 示例
@@ -59,7 +59,7 @@ LoginApp ──► BaseAppMgr ──► BaseApp ◄──► CellApp
                   ▼          ▼         CellAppMgr
                 DBAppMgr ─► DBApp
                               │
-                         XML / SQLite
+                   MySQL/MariaDB / SQLite
 ```
 
 | 进程 | 职责 |
@@ -89,7 +89,7 @@ ServerApp
 
 Windows：
 
-- Visual Studio 2026（推荐）或 Visual Studio 2022 17.14+,安装 Desktop development with C++ 工作负载（要求 MSBuild 能识别 `net10.0` TFM）
+- Visual Studio 2026（推荐）或 Visual Studio 2022 17.14+，安装 Desktop development with C++ 工作负载；所有生成器均通过 .NET SDK CLI 构建托管项目
 - CMake 3.28+
 - .NET 10 SDK
 - Python 3.9+
@@ -100,11 +100,18 @@ Linux：
 - GCC 13+ 或支持 C++20 的 Clang
 - CMake 3.28+
 - debug 预设需要 Ninja
-- .NET 10 SDK
+- OpenSSL 3.0+ Crypto 开发文件（Ubuntu 包名 `libssl-dev`）
+- .NET SDK 必须满足 `global.json`（10.0.202 或更新的稳定 feature band）；
+  Ubuntu 26.04 提供的 10.0.1xx SDK 不满足此要求。
 - Python 3.9+
 - Git
 
 Windows 构建包装脚本会自动加载 MSVC 环境。debug 预设需要 Ninja 时，包装脚本会自动准备。
+
+CMake 优先从 PATH 查找，缺失时使用所选 Visual Studio 安装中的 CMake。
+
+认证拒绝空用户名和空密码。会话密钥使用操作系统安全随机源，生成失败时拒绝登录。
+公网传输加密和服务端密码派生尚未实现。
 
 ## 构建
 
@@ -128,6 +135,8 @@ tools/bin/build.sh profile
 tools\bin\build.bat debug --clean
 tools\bin\build.bat debug --config-only
 tools\bin\build.bat debug --build-only
+
+tools\bin\build.bat debug --build-dir build/verify-windows
 ```
 
 也支持直接调用 CMake：
@@ -174,10 +183,25 @@ tools\bin\build_linux.bat --with-tests --label "unit|integration"
 ```bash
 ctest --test-dir build/debug -C Debug --label-regex unit --output-on-failure
 ctest --test-dir build/debug -C Debug --label-regex integration --output-on-failure
+ctest --test-dir build/debug -C Debug --label-regex managed --output-on-failure
 ctest --test-dir build/debug -C Debug -R test_math --output-on-failure
 ```
 
 C# 测试：
+
+`managed` 标签串行执行 Runtime、Generators、Client 测试，并从当前构建输出加载原生库。
+构建和测试应使用同一个目录，隔离构建不得加载其他预设中的 DLL。
+Windows 多进程测试使用测试程序同目录的服务器和已部署运行时，CTest 提供运行时配置；
+缺失产物直接失败。两平台构建使用 database factory 的目标时，都会构建所有已启用的
+数据库插件；Windows 还会将 DLL 部署到程序同目录。
+登录、CellApp 及 Manager/Reviver 进程测试目前仅支持 Windows，
+Linux 下的明确跳过不代表 Linux 进程恢复已验证。
+`AtomicReplaceFile` 执行同卷路径替换，不承诺崩溃后的数据持久性。
+Windows 对既有目标使用 `ReplaceFileW`，保留目标元数据，允许共享删除权限的读者继续读取旧文件。
+调用前须关闭源文件的所有句柄；访问被阻止时明确失败，不自动重试。
+目标不存在时使用 `MoveFileExW`；Linux 保持 rename 语义。
+Linux 包装脚本的 `--with-tests` 默认执行 unit、integration、managed 三组；
+可用 `--label` 缩小验证范围。
 
 ```bash
 dotnet test tests/csharp/Atlas.Runtime.Tests/Atlas.Runtime.Tests.csproj --configuration Debug
@@ -215,20 +239,166 @@ tools\bin\test_cluster.bat
 
 ## 数据库
 
-Atlas 通过 database factory 以插件形式加载数据库后端。XML 是轻量本地后端；SQLite 提供单文件关系型后端，支持 WAL 与 busy-timeout。MySQL 选项已经存在，但当前代码树中的实现尚未完成。
+Atlas 通过 database factory 加载 SQLite 和 MySQL/MariaDB 插件。主要开发、联调、正式部署
+和集群验收使用 MySQL/MariaDB，多个 DBApp 共享同一个逻辑数据库。
+`ATLAS_DB_MYSQL` 默认 ON，使用 MariaDB Connector/C 构建插件。SQLite 必须显式选择，
+仅用于单 DBApp 轻量开发、快速冒烟和独立测试，支持 WAL 和 busy-timeout。
+通过 JSON 的 `database.type` 或 `--db-type` 选择 `sqlite` 或 `mysql`（MariaDB 也使用 `mysql`）。
+XML 数据库后端已移除。显式选择 `xml` 或其他不支持的类型时，配置校验和工厂创建均明确失败，
+即使程序旁仍有旧插件也不会加载，不会回退到其他后端。现有数据文件不删除，也不提供迁移工具。
+通用 XML 解析、序列化、配置数据及实体定义支持保留。
+
+EntityID 经后端原子预留后才发放。MySQL 锁定计数行并等待提交确认，失败不会回退到 ID 1。
+崩溃允许留下未使用的区间；已初始化的计数器丢失时，包括重启后也返回错误。
+备份必须同时保留计数器及其初始化元数据。
+
+DBApp 分片游标恢复同时查询左闭右开区间内的现存实体、持久操作回执结果及 checkout 版本历史。
+删除实体不删除其保留的回执或租约历史，因此这些已确认身份在重启后仍低于恢复的游标。
+备份必须包含这三类数据；此机制不承诺恢复被任意删除的元数据，也不将后端原始删除视为 ID 回收。
+多个 MySQL DBApp 同时启动时，先锁住已有结构元数据行，再读取初始化标记并建立 EntityID 计数器，
+统一锁顺序以避免初始化死锁。
+
+事务提交失败返回结果不确定，不视为成功。SQLite 批量回调等待事务结果。
+Checkout 区分实体不存在与数据库错误。注销使用 `kLogOff` 在同次写入中释放 checkout；
+保存失败时 BaseApp 保留实体。
+
+BaseApp 写入携带随机 128 位操作标识，路由重试保持不变，回复回传该标识。
+MySQL 将请求 SHA-256 摘要及成功结果写入 `atlas_write_receipts`，与数据修改同事务提交。
+相同请求在 DBApp 重启后仍返回原 DBID；同一标识对应不同请求时拒绝。
+写入或回执失败会一并回滚。请求摘要使用平台 SHA-256 实现；回执不自动过期，
+备份必须将其与实体数据一起保留。
+
+共享 MySQL 在事务中递增 checkout 版本，版本历史通过 `atlas_checkout_versions`
+保留到实体删除及重启之后，备份也须包含此表。版本耗尽返回失败，不回绕。
+写入、checkin 和独立删除核对期望持有者及版本，DBApp 同时核对来源通道。
+已 checkout 的实体拒绝无版本写入。Checkin 在数据库确认后才清理本地记录。
+取消确认原租约已失效，未知取消请求拒绝，成功缓存回复重放时重新核对数据库所有权。
+旧回调及成功写入的重放不能释放新持有者的租约。
+`CheckinEntityAck` 回显请求编号、数据库实体和完整持有者。BaseApp 在发送失败、回复丢失
+及 DBApp 路由变更后保留等待记录，并核对回复来源和完整请求。最多尝试三次，间隔至少
+一秒；耗尽后记录错误并继续阻塞该数据库身份，晚到且匹配的成功回复仍可完成确认。
+DBApp 在条件释放成功，或数据库读取确认原租约已失效后，才确认成功。读取失败、原租约
+仍有效均不能确认释放；重复或旧 checkin 不会释放新租约。
+`baseapp/pending_checkin_count` 包含停止重试的记录。此确认依赖 BaseApp 事件循环运行，
+停服排空仍属后续工作。
+
+共享 MySQL 首次保存将创建实体、获取 checkout 和保存回执放在同一事务中。
+确认回复携带所有权版本；重放返回原 DBID 和版本。请求摘要绑定创建者地址、AppID
+及运行时实体，其他创建者不能复用同一操作标识。
+
+保存或退出写入等待确认期间，新的保存会被拒绝并记录警告。断线退出等待保存成功后
+继续，竞争的强制退出请求明确失败。提交不确定、断线或回复超时后保留原操作及数据，
+最多重试三次；错误回复及发送失败后的重试至少间隔一秒。结果仍不确定时，阻止该实体
+的新持久化及退出销毁。晚到成功可确认原操作；重试耗尽会记录错误，始终未确认则需
+重启进程。尚未出现不确定结果时的普通失败正常返回失败。
+
+SQLite 后端持久保存递增的 checkout 版本，并支持核对完整持有者的条件释放。
+版本上限为 `INT64_MAX`，耗尽或存储版本损坏时失败；版本历史通过
+`atlas_checkout_versions` 保留到删除、重启之后，备份也须包含此表。
+提交失败不返回已获取版本或释放成功。带版本的写入、注销及独立删除在修改已有实体的
+同一事务内核对全部持有者字段。
+
+所有后端的 DBApp checkout 持有者均绑定来源通道，数据库确认条件释放后才删除本地
+租约。取消通过原操作回执解析租约，也支持换一个 DBApp 确认并条件释放。
+原租约已经失效时，确认取消不会修改新持有者。回执缺失或请求不匹配时失败，解析不会获取新租约。
+旧释放回调不能清除新租约。
+每次服务器启动通过操作系统安全随机源生成非零进程实例身份，随机源失败则拒绝启动。
+注册、发现、死亡通知和 checkout 消息均携带该身份；DBApp 拒绝缺少身份的请求。
+即使地址及 AppID 被复用，旧死亡通知也不能清理新进程的所有权。
+`atlas_checkout_processes` 在同一事务中记录进程退役并清理其租约，阻止此身份之后的
+checkout 和首次保存，包括其他 DBApp 中已排队的请求。该表须纳入备份，记录不自动过期。
+退役失败或提交不确定时保留本地所有权，并在 DBApp 运行期间重试。
+仅不需要进程死亡跟踪的直接后端调用可使用实例零。更新后的协议及实体表结构要求
+进程使用配套重建产物及新数据库，不提供旧格式迁移。
+成功的 checkout 缓存回复重新核对数据库所有权，同一请求标识不能复用
+目标或持有者不同的缓存结果。按名称 checkout 的取消使用解析后的数据库 ID。
+
+两个后端的 `WriteEntity`、`DeleteEntity` 和 `CheckoutEntity` 均支持持久操作回执。
+SQLite 将请求的 SHA-256 摘要和结果与数据修改一同保存到 `atlas_write_receipts`。
+备份必须保留回执，回执不自动过期。
+请求摘要使用 [Windows CNG](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcrypthash)
+或系统 [OpenSSL EVP 接口](https://docs.openssl.org/3.5/man3/EVP_DigestInit/)。
+OpenSSL 3.0+ 使用 [Apache-2.0](https://openssl-library.org/source/license/index.html)，
+Linux 配置工具及 CI 安装发行版提供的开发包。
+写入重放返回原 DBID 及首次保存时发放的租约，不会再次执行或释放新持有者。checkout 跨 DBApp
+重试保留同一随机操作标识，确认原实体和原所有权版本；数据库回执在租约已释放或被替代时返回
+`checkout_lease_expired`，不会重新获取。DBApp 也可能先根据本地状态拒绝持有者冲突。
+按名称 checkout 的重试仍绑定原实体，即使实体已经改名。
+相同操作标识对应不同操作种类、目标、持有者或内容时明确拒绝。回执不可读时返回结果不确定，
+不视为回执不存在。
+SQLite 的 DBApp 首次保存通过同一事务提交实体和租约，持久化成功后才在回复中返回持有者；
+创建持有者无效或租约版本耗尽时不会创建实体。
+数据库插件未实现持久操作时返回 `write_operation_not_supported` 或 `checkout_operation_not_supported`；
+未实现 checkout 解析时返回 `checkout_resolution_not_supported`。
+自动建号以实体类型和账号名的唯一约束确认身份。名称冲突或提交结果不确定时重新查询
+账号并校验凭证，不再次创建；只有确认存在且非空凭证匹配的账号可以认证成功，账号不存在
+或查询失败时返回内部错误。尚未完成的 checkout 请求也校验目标和持有者，
+冲突请求不会覆盖原请求或改变其取消状态。回复携带操作标识及明确的数据库错误种类，
+BaseApp 同时匹配预期来源和操作标识，不缓存不确定回复。登录和原生数据库装载保留相同
+操作及持有者，最多重试三次，重试至少间隔一秒。原生装载使用显式等待记录，装载期间拒绝
+持久化。请求 ID 回绕跳过尚未完成的记录。
+结果不确定或装载失败回滚时，BaseApp 等待取消确认。取消请求携带原目标及持有者，
+确认回复匹配来源及操作标识。三次取消重试仍未确认时保留停滞记录及已解析账号的保护，
+不会按时间过期；匹配的晚到成功回复可重新触发解析。
+`baseapp/pending_entity_checkout_count` 和 `baseapp/stalled_checkout_count` 提供等待状态。
+始终未确认则需等待数据库确认或重启进程；取消不承诺撤销远端已经执行的工作。
+死亡清理尚缺进程实例校验，共享存储故障切换尚未完成验收。
+使用新初始化的数据库并重建所有参与进程；
+旧格式及混合进程版本没有兼容层，启动时的格式校验也尚未完整。
+
+MySQL CI 使用临时数据库运行后端及真实 DBApp checkout 网络测试。本地共享存储测试
+需要完整的 `ATLAS_TEST_MYSQL_*` 设置；缺失时必要的 MySQL 检查明确失败并报告环境阻断。
+SQLite 通过不能替代 MySQL 验收。通用 Windows/Linux CI 明确使用 `ATLAS_DB_MYSQL=OFF`
+和 SQLite 冒烟范围；独立 MySQL CI 验证数据库及网络契约。
+checkout 回复丢失用例启动两个真实 DBApp 子进程，屏蔽成功回复交付后强制终止原 DBApp，
+通过另一进程重试，并核对重复取消和过期租约。此用例验证该故障边界，不代表完整 HA 验收通过。
+后端故障用例在不改变 TLS 协商的情况下转发连接；独立数据库连接确认实体及回执已经提交，
+再截断返回数据。调用方必须报告 `kCommitUnknown`；通过另一后端实例重试及重启后重放，
+均须返回原 DBID 和租约，不得再次创建实体。
 
 DBApp 配置示例：
 
 ```json
 {
   "database": {
-    "type": "sqlite",
-    "sqlite_path": "data/atlas_dev.sqlite3",
-    "sqlite_wal": true,
-    "sqlite_busy_timeout_ms": 5000
+    "type": "mysql",
+    "mysql_host": "127.0.0.1",
+    "mysql_port": 3306,
+    "mysql_user": "<数据库用户>",
+    "mysql_database": "<隔离开发数据库>"
   }
 }
 ```
+
+
+通过密钥存储或遮蔽输入，在启动进程的环境中设置 `ATLAS_DB_MYSQL_PASSWORD`，不要把凭据
+放入命令、提交的配置或日志。DBApp 在配置密码为空时读取此变量；地址、用户和库名从配置或
+CLI 读取。缺少库名/用户/密码、参数无效、插件不可用或连接失败均停止启动，不回退 SQLite。
+工具还支持 `ATLAS_DB_MYSQL_HOST`、`PORT`、`USER`、`PASSWORD`、`DATABASE`、`POOL_SIZE`
+（均带 `ATLAS_DB_MYSQL_` 前缀），或 `--database-config <本地JSON>`。工具通过子进程环境
+传递密码，不将密码写入生成的 JSON。
+
+```bat
+rem 默认 MySQL；使用现有隔离开发库和本地配置。
+tools\bin\test_cluster.bat --database-config <本地DBApp配置>
+tools\bin\run_login_stress.bat --database-config <本地DBApp配置>
+tools\bin\run_world_stress.bat --database-config <本地DBApp配置>
+rem 显式单 DBApp 快速冒烟，不作为 MySQL 验收。
+tools\bin\test_cluster.bat --db-backend sqlite
+bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3
+```
+
+Linux 使用同名 `tools/bin/*.sh` 包装和 `bin/debug/atlas_dbapp`，参数相同。SQLite 专用构建
+可显式设置 `-DATLAS_DB_MYSQL=OFF`；运行前重建所选输出目录。C# 真实集群测试默认 MySQL，
+显式设置 `ATLAS_TEST_DB_BACKEND=sqlite` 才选择冒烟范围。工具输出 `database-run.json`，记录
+后端、拓扑和范围，控制台/READY 也标明后端。SQLite 结果标记为 `sqlite_smoke_only`，不能作为
+容量或共享存储验收结论。
+
+SQLite 在规范化的本地存档路径旁持有操作系统文件锁，覆盖连接整个生命周期。同一存档的
+第二个 Atlas 实例在访问结构和数据前失败；进程退出后锁释放，`.atlas-lock` 文件保留。
+仅支持本地文件系统，不能删除或替换活动锁文件；外部数据库维护须先停服。不同 SQLite 文件
+保持独立，不支持共享存档、复制或生产 HA。策划配置使用 SQLite 是独立用途；本次不新增配置
+系统，也不将配置读取接入实体存档的 `IDatabase`。
 
 ## C# 玩法与客户端运行时
 

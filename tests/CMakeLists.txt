@@ -12,12 +12,7 @@ function(atlas_add_test)
   target_link_libraries(${ARG_NAME} PRIVATE GTest::gtest_main ${ARG_DEPS})
   target_include_directories(${ARG_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-  # Windows: copy every transitively-linked runtime DLL (nethost.dll for
-  # CLR-dependent tests, zlib1.dll for compression, etc.) next to the test
-  # exe so the OS loader resolves them at process start. Without this,
-  # missing DLLs trigger a modal STATUS_DLL_NOT_FOUND dialog that blocks CI
-  # and local runs. Delegated to a script so the empty-DLL case is handled
-  # cleanly (cmake -E copy_if_different rejects zero source args).
+  # A script handles empty DLL lists without invoking copy_if_different with no sources.
   if(WIN32)
     add_custom_command(TARGET ${ARG_NAME} POST_BUILD
       COMMAND ${CMAKE_COMMAND}
@@ -26,13 +21,10 @@ function(atlas_add_test)
               -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDLLs.cmake"
       VERBATIM
     )
-    # TARGET_RUNTIME_DLLS misses (a) atlas_engine.dll, which is loaded at
-    # runtime via DynamicLibrary::Load rather than linked, and (b) nethost.dll
-    # on some MSVC configurations when the IMPORTED SHARED target is reached
-    # only transitively. Deploy both explicitly for CLR-dependent tests.
+    # Runtime-loaded CLR libraries are absent from TARGET_RUNTIME_DLLS.
     atlas_deploy_clr_runtime_if_needed(${ARG_NAME})
-    atlas_deploy_db_plugins_if_needed(${ARG_NAME})
   endif()
+  atlas_deploy_db_plugins_if_needed(${ARG_NAME})
 
   add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS "${ARG_LABEL}")
@@ -58,6 +50,17 @@ function(atlas_add_test)
 endfunction()
 
 add_subdirectory(unit)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME test_build_tool
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_build.py)
+set_tests_properties(test_build_tool PROPERTIES LABELS "unit")
+
+add_test(NAME test_database_tools
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_database_tools.py)
+set_tests_properties(test_database_tools PROPERTIES LABELS "unit")
 add_subdirectory(integration)
 add_subdirectory(parity)
 

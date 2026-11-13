@@ -1,6 +1,7 @@
 #include "server/server_app.h"
 
 #include <chrono>
+#include <cstdio>
 #include <format>
 
 #include "foundation/log.h"
@@ -9,6 +10,7 @@
 #include "network/channel.h"
 #include "network/interface_table.h"
 #include "network/machined_types.h"
+#include "platform/secure_random.h"
 #include "server/common_messages.h"
 #include "server/server_app_option.h"
 
@@ -34,7 +36,8 @@ ServerApp::~ServerApp() = default;
 auto ServerApp::RunApp(int argc, char* argv[]) -> int {
   auto cfg_result = ServerConfig::Load(argc, argv);
   if (!cfg_result) {
-    ATLAS_LOG_CRITICAL("Failed to load config: {}", cfg_result.Error().Message());
+    std::fputs(std::format("Failed to load config: {}\n", cfg_result.Error().Message()).c_str(),
+               stderr);
     return 1;
   }
   config_ = std::move(*cfg_result);
@@ -108,6 +111,14 @@ auto ServerApp::Init(int argc, char* argv[]) -> bool {
   (void)argc;
   (void)argv;
 
+  if (config_.process_instance == 0) {
+    auto filled = FillSecureRandom(std::as_writable_bytes(std::span{&config_.process_instance, 1}));
+    config_.process_instance &= UINT64_MAX >> 1;
+    if (!filled || config_.process_instance == 0) {
+      ATLAS_LOG_ERROR("ServerApp: secure process identity creation failed");
+      return false;
+    }
+  }
   start_time_ = Clock::now();
   last_tick_time_ = start_time_;
 

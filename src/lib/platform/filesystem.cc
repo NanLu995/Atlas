@@ -60,6 +60,7 @@ namespace atlas::fs {
   }
 
   file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  file.close();
 
   if (!file) {
     return Error{ErrorCode::kIoError, "Failed to write file: " + path.string()};
@@ -76,6 +77,7 @@ namespace atlas::fs {
   }
 
   file.write(content.data(), static_cast<std::streamsize>(content.size()));
+  file.close();
 
   if (!file) {
     return Error{ErrorCode::kIoError, "Failed to write file: " + path.string()};

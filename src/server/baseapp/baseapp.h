@@ -287,6 +287,10 @@ class BaseApp : public EntityApp {
     Address loginapp_addr;
     uint16_t type_id{0};
     DatabaseID dbid{kInvalidDBID};
+    std::optional<CheckoutInfo> checkout_owner{};
+    std::array<std::byte, 16> checkout_operation_id{};
+    uint32_t checkout_request_id{0};
+    uint32_t checkout_app_id{0};
     SessionKey session_key;
     TimePoint created_at{};
     TimePoint force_logoff_sent_at{};
@@ -300,6 +304,8 @@ class BaseApp : public EntityApp {
     uint8_t checkout_retry_count{0};
     bool checkout_awaiting_ack{false};
     bool checkout_retry_pending{false};
+    bool checkout_outcome_unknown{false};
+    TimePoint next_checkout_retry_at{};
     std::vector<std::byte> entity_blob;
     // Plumbed through so account_entity_index_ can be populated when the
     // entity finally binds to a client in OnClientAuthenticate.
@@ -315,8 +321,12 @@ class BaseApp : public EntityApp {
     dbapp::WriteEntity message;
     Address target_addr;
     TimePoint created_at{};
+    TimePoint next_retry_at{};
     uint8_t retry_count{0};
     bool awaiting_ack{false};
+    bool outcome_unknown{false};
+    bool resolution_stalled{false};
+    bool logoff_after_write{false};
   };
   struct PendingLogoffWrite {
     uint32_t continuation_request_id{0};
@@ -326,9 +336,12 @@ class BaseApp : public EntityApp {
     dbapp::WriteEntity message;
     Address target_addr;
     TimePoint created_at{};
+    TimePoint next_retry_at{};
     uint8_t retry_count{0};
     bool awaiting_ack{false};
     bool retry_pending{false};
+    bool outcome_unknown{false};
+    bool resolution_stalled{false};
   };
   struct PendingRemoteForceLogoffAck {
     Address reply_addr;
@@ -351,11 +364,18 @@ class BaseApp : public EntityApp {
     TimePoint prepared_at{};
     // Bound into account_entity_index_ when OnClientAuthenticate succeeds.
     std::string username;
+    std::optional<CheckoutInfo> checkout_owner{};
   };
-  struct CanceledCheckout {
-    DatabaseID dbid{kInvalidDBID};
-    uint16_t type_id{0};
-    TimePoint canceled_at{};
+  struct PendingDbCheckout {
+    dbapp::CheckoutEntity request;
+    DatabaseID resolved_dbid{kInvalidDBID};
+    Address target_addr;
+    TimePoint created_at{};
+    TimePoint next_retry_at{};
+    uint8_t retry_count{0};
+    bool awaiting_ack{false};
+    bool outcome_unknown{false};
+    bool stalled{false};
   };
   struct LoadSnapshot {
     uint32_t entity_count{0};
@@ -385,7 +405,8 @@ class BaseApp : public EntityApp {
   std::unordered_map<EntityID, DetachedProxyState> detached_proxies_;
   std::unordered_map<uint32_t, PreparedLoginEntity> prepared_login_entities_;
   std::unordered_map<EntityID, uint32_t> prepared_login_requests_by_entity_;
-  std::unordered_map<uint32_t, CanceledCheckout> canceled_login_checkouts_;
+  std::unordered_map<uint32_t, PendingDbCheckout> canceled_checkouts_;
+  std::unordered_map<uint32_t, PendingDbCheckout> pending_entity_checkouts_;
   std::unordered_map<EntityID, std::vector<uint32_t>> pending_local_force_logoff_waiters_;
   std::unordered_set<EntityID> logoff_entities_in_flight_;
   std::unordered_set<DatabaseID> active_login_dbids_;
@@ -520,7 +541,6 @@ class BaseApp : public EntityApp {
   static constexpr Duration kForceLogoffRetryBaseDelay = std::chrono::milliseconds(250);
   static constexpr Duration kForceLogoffRetryMaxDelay = std::chrono::seconds(2);
   static constexpr Duration kPendingTimeout = std::chrono::seconds(8);
-  static constexpr Duration kCanceledCheckoutRetention = std::chrono::seconds(10);
   static constexpr Duration kPreparedLoginTimeout = std::chrono::seconds(10);
   static constexpr Duration kCellAppDeathRestoreTimeout = std::chrono::seconds(5);
   // One shortline reconnect window - longer adds stale-proxy pressure with
@@ -540,9 +560,28 @@ class BaseApp : public EntityApp {
   void FailPendingForceLogoff(uint32_t request_id, std::string_view reason);
   void ScheduleForceLogoffRetry(PendingLogin& pending, TimePoint now);
   void RetryStalledForceLogoff(uint32_t request_id);
-  void ReleaseCheckout(DatabaseID dbid, uint16_t type_id);
+  void ReleaseCheckout(DatabaseID dbid, uint16_t type_id,
+                       std::optional<CheckoutInfo> owner = std::nullopt);
+  void RetryCheckins();
+  void SendCheckin(uint32_t request_id);
+  void OnCheckinEntityAck(const Address& src, const dbapp::CheckinEntityAck& msg);
+  struct PendingCheckin {
+    dbapp::CheckinEntity request;
+    Address target;
+    TimePoint next_retry{};
+    uint8_t attempts{0};
+    bool stalled{false};
+  };
+  std::unordered_map<uint32_t, PendingCheckin> pending_checkins_;
   void CancelInflightCheckout(uint32_t request_id, const PendingLogin& pending);
-  void SendAbortCheckout(uint32_t request_id, DatabaseID dbid, uint16_t type_id);
+  void ReleaseLoginCheckout(DatabaseID dbid, uint16_t type_id, const PendingLogin& pending);
+  auto SendAbortCheckout(PendingDbCheckout& pending) -> bool;
+  auto SendEntityCheckout(PendingDbCheckout& pending) -> bool;
+  auto AllocatePrepareRequestId() -> uint32_t;
+  void RetryEntityCheckouts();
+  void RetryCanceledCheckouts();
+  void OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntityAck& msg);
+  void OnAbortCheckoutAck(const Address& src, const dbapp::AbortCheckoutAck& msg);
   void CancelPrepareLogin(uint32_t login_request_id, DatabaseID dbid);
   [[nodiscard]] auto RollbackPreparedLoginEntity(uint32_t login_request_id) -> bool;
   void ClearPreparedLoginEntity(EntityID entity_id);

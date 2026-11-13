@@ -2,8 +2,10 @@
 #define ATLAS_LIB_SERVER_ENTITY_TYPES_H_
 
 #include <cstdint>
+#include <functional>
 #include <limits>
-#include <random>
+
+#include "platform/secure_random.h"
 
 namespace atlas {
 
@@ -13,11 +15,7 @@ inline constexpr EntityID kInvalidEntityID = 0;
 using DatabaseID = int64_t;
 inline constexpr DatabaseID kInvalidDBID = 0;
 
-// IDs in [1, kFirstLocalEntityID) are server-allocated by DBApp's
-// EntityIdAllocator and cluster-stable. IDs in [kFirstLocalEntityID,
-// 0xFFFFFFFF] are reserved for client-only entities (effects, HUD
-// markers, prediction stand-ins); the server must never mint into
-// this range. Mirrors BigWorld's FIRST_LOCAL_ENTITY_ID convention.
+// IDs below this boundary are server-allocated; the remaining range is client-local.
 inline constexpr EntityID kFirstLocalEntityID = 0x7F000000;
 
 [[nodiscard]] inline constexpr auto IsServerEntityId(EntityID id) -> bool {
@@ -30,14 +28,10 @@ inline constexpr SpaceID kInvalidSpaceID = 0;
 struct SessionKey {
   uint8_t bytes[32]{};
 
-  [[nodiscard]] static auto Generate() -> SessionKey {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<uint64_t> dist;
+  [[nodiscard]] static auto Generate() -> Result<SessionKey> {
     SessionKey key;
-    for (int i = 0; i < 32; i += 8) {
-      uint64_t v = dist(rng);
-      for (int j = 0; j < 8; ++j) key.bytes[i + j] = static_cast<uint8_t>((v >> (j * 8)) & 0xFF);
-    }
+    auto filled = FillSecureRandom(std::as_writable_bytes(std::span{key.bytes}));
+    if (!filled) return filled.Error();
     return key;
   }
 

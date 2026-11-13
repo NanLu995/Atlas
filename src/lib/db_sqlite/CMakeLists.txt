@@ -2,6 +2,7 @@
 
 add_library(atlas_db_sqlite STATIC
   sqlite_database.cc
+  sqlite_write_receipts.cc
 )
 
 target_include_directories(atlas_db_sqlite PUBLIC "${CMAKE_SOURCE_DIR}/src/lib")

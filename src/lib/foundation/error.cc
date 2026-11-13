@@ -60,6 +60,8 @@ auto ErrorCodeName(ErrorCode code) -> std::string_view {
       return "ScriptImportError";
     case ErrorCode::kScriptRuntimeError:
       return "ScriptRuntimeError";
+    case ErrorCode::kCommitUnknown:
+      return "CommitUnknown";
   }
   return "Unknown";
 }

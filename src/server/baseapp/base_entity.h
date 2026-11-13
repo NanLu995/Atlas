@@ -28,6 +28,10 @@ class BaseEntity {
   [[nodiscard]] auto TypeId() const -> uint16_t { return type_id_; }
   [[nodiscard]] auto Dbid() const -> DatabaseID { return dbid_; }
   void SetDbid(DatabaseID id) { dbid_ = id; }
+  [[nodiscard]] auto CheckoutOwner() const -> const std::optional<CheckoutInfo>& {
+    return checkout_owner_;
+  }
+  void SetCheckoutOwner(std::optional<CheckoutInfo> owner) { checkout_owner_ = std::move(owner); }
 
   [[nodiscard]] auto HasCell() const -> bool { return cell_addr_.Ip() != 0; }
   [[nodiscard]] auto CellAddr() const -> const Address& { return cell_addr_; }
@@ -71,6 +75,7 @@ class BaseEntity {
   EntityID entity_id_;
   uint16_t type_id_;
   DatabaseID dbid_;
+  std::optional<CheckoutInfo> checkout_owner_;
   Address cell_addr_;
   uint32_t cell_epoch_{0};
   SpaceID space_id_{kInvalidSpaceID};

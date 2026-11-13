@@ -15,9 +15,12 @@ if(WIN32)
     child_process_windows.cc
     crash_handler_windows.cc
     dynamic_library_windows.cc
+    environment_windows.cc
     filesystem_windows.cc
     io_poller_wsapoll.cc
     process_launcher_windows.cc
+    secure_random_windows.cc
+    sha256_windows.cc
     threading_windows.cc
   )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -25,10 +28,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     child_process_linux.cc
     crash_handler_linux.cc
     dynamic_library_linux.cc
+    environment_linux.cc
     filesystem_linux.cc
     io_poller_epoll.cc
     threading_linux.cc
     process_launcher_linux.cc
+    secure_random_linux.cc
+    sha256_linux.cc
   )
 endif()
 
@@ -42,7 +48,9 @@ target_link_libraries(atlas_platform
 )
 
 if(WIN32)
-  target_link_libraries(atlas_platform PUBLIC ws2_32 dbghelp)
+  target_link_libraries(atlas_platform PUBLIC ws2_32 dbghelp bcrypt)
 elseif(UNIX)
+  find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+  target_link_libraries(atlas_platform PUBLIC OpenSSL::Crypto)
   target_link_libraries(atlas_platform PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 endif()

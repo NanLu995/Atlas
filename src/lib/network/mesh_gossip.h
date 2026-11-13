@@ -13,7 +13,7 @@
 
 namespace atlas::machined {
 
-inline constexpr uint8_t kMeshProtocolVersion = 1;
+inline constexpr uint8_t kMeshProtocolVersion = 2;
 
 // Raw broadcast datagrams between per-host machined daemons (not Channel
 // messages); each is self-framed by a leading MeshMessageType tag.
@@ -87,6 +87,7 @@ struct MeshRegistryMsg {
       w.Write<uint16_t>(p.external_addr.Port());
       w.Write<uint32_t>(p.pid);
       w.Write<float>(p.load);
+      w.Write(p.process_instance);
     }
   }
 
@@ -139,6 +140,9 @@ struct MeshRegistryMsg {
       auto load = r.Read<float>();
       if (!load) return load.Error();
       p.load = *load;
+      auto instance = r.Read<uint64_t>();
+      if (!instance) return instance.Error();
+      p.process_instance = *instance;
       msg.processes.push_back(std::move(p));
     }
     return msg;

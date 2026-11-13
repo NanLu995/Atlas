@@ -5,10 +5,6 @@
 
 using namespace atlas;
 
-// ============================================================================
-// WriteFlags helpers
-// ============================================================================
-
 TEST(DatabaseTypes, WriteFlagsHasFlag) {
   auto flags = static_cast<WriteFlags>(static_cast<uint8_t>(WriteFlags::kCreateNew) |
                                        static_cast<uint8_t>(WriteFlags::kAutoLoadOn));
@@ -28,10 +24,6 @@ TEST(DatabaseTypes, WriteFlagsAndOp) {
   EXPECT_FALSE(HasFlag(combined & WriteFlags::kDelete, WriteFlags::kDelete));
 }
 
-// ============================================================================
-// EntityData default values
-// ============================================================================
-
 TEST(DatabaseTypes, EntityDataDefaults) {
   EntityData d;
   EXPECT_EQ(d.dbid, kInvalidDBID);
@@ -39,10 +31,6 @@ TEST(DatabaseTypes, EntityDataDefaults) {
   EXPECT_TRUE(d.blob.empty());
   EXPECT_TRUE(d.identifier.empty());
 }
-
-// ============================================================================
-// PutResult / GetResult / DelResult / LookupResult defaults
-// ============================================================================
 
 TEST(DatabaseTypes, ResultDefaults) {
   PutResult put;
@@ -61,10 +49,6 @@ TEST(DatabaseTypes, ResultDefaults) {
   EXPECT_EQ(lup.dbid, kInvalidDBID);
 }
 
-// ============================================================================
-// CheckoutInfo
-// ============================================================================
-
 TEST(DatabaseTypes, CheckoutInfoFields) {
   CheckoutInfo info;
   info.base_addr = Address(0x7F000001, 7100);
@@ -78,12 +62,19 @@ TEST(DatabaseTypes, CheckoutInfoFields) {
 
 TEST(DatabaseTypes, CreateDatabaseSupportsSqlite) {
   DatabaseConfig cfg;
+  cfg.type = "sqlite";
 
   auto db = CreateDatabase(cfg);
   ASSERT_NE(db, nullptr);
 }
 
-TEST(DatabaseTypes, DatabaseConfigDefaultsToSqlite) {
+TEST(DatabaseTypes, DatabaseConfigDefaultsToMysql) {
   DatabaseConfig cfg;
-  EXPECT_EQ(cfg.type, "sqlite");
+  EXPECT_EQ(cfg.type, "mysql");
+}
+
+TEST(DatabaseTypes, CreateDatabaseRejectsRemovedXmlBackend) {
+  DatabaseConfig cfg;
+  cfg.type = "xml";
+  EXPECT_EQ(CreateDatabase(cfg), nullptr);
 }

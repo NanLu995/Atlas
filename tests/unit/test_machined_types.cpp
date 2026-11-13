@@ -33,6 +33,30 @@ TEST(MachinedTypes, RegisterRoundTrip) {
   EXPECT_EQ(result->pid, 12345u);
 }
 
+TEST(MachinedTypes, ProcessInstanceSurvivesRegistrationAndNotifications) {
+  RegisterMessage registration;
+  registration.process_instance = 111;
+  EXPECT_EQ(round_trip(registration)->process_instance, 111u);
+  DeregisterMessage deregistration;
+  deregistration.process_instance = 111;
+  EXPECT_EQ(round_trip(deregistration)->process_instance, 111u);
+  BirthNotification birth;
+  birth.process_instance = 111;
+  EXPECT_EQ(round_trip(birth)->process_instance, 111u);
+  DeathNotification death;
+  death.process_instance = 111;
+  EXPECT_EQ(round_trip(death)->process_instance, 111u);
+  QueryResponse query;
+  ProcessInfo process;
+  process.process_instance = 111;
+  query.processes.push_back(process);
+  EXPECT_EQ(round_trip(query)->processes[0].process_instance, 111u);
+  BinaryWriter writer;
+  death.Serialize(writer);
+  BinaryReader truncated(writer.Data().first(writer.Data().size() - 1));
+  EXPECT_FALSE(DeathNotification::Deserialize(truncated));
+}
+
 TEST(MachinedTypes, RegisterTruncatedReturnsError) {
   std::vector<std::byte> empty;
   BinaryReader r(empty);

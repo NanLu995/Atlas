@@ -55,8 +55,8 @@ def parse_args() -> argparse.Namespace:
         help="Run ctest after build (debug preset only).",
     )
     p.add_argument(
-        "--label", default="unit",
-        help="ctest --label-regex when --with-tests is set (default: unit).",
+        "--label", default="unit|integration|managed",
+        help="ctest label filter (default: unit|integration|managed).",
     )
     return p.parse_args()
 

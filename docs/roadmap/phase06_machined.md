@@ -56,7 +56,8 @@ WatcherResponse / WatcherForward / WatcherReply / ShutdownTarget`
 转发 `msg::ShutdownRequest`；`ServerApp::Init` 已注册该 handler 调用
 `Shutdown()`。
 
-协议版本号字段固定在 `RegisterMessage.protocol_version = 1`。
+注册协议及 mesh 协议版本为 2。注册、查询、出生及死亡通知携带服务器本次启动的
+`process_instance`；重连沿用同一身份，重启生成新身份。旧协议不兼容，须配套重建集群进程。
 
 mesh datagram 定义于 `src/lib/network/mesh_gossip.h`：
 

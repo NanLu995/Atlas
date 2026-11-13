@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -8,10 +9,6 @@
 #include "server/server_app.h"
 
 using namespace atlas;
-
-// ============================================================================
-// Test helpers
-// ============================================================================
 
 // Minimal concrete ServerApp — no network binding needed for unit tests.
 // Overrides Init() to skip port binding and shorten the tick interval.
@@ -82,11 +79,6 @@ struct MinimalArgv {
   char** argv() { return ptrs.data(); }
 };
 
-// ============================================================================
-// common_messages: static_assert already validates NetworkMessage concept.
-// Basic serialise/deserialise round-trips.
-// ============================================================================
-
 TEST(CommonMessages, HeartbeatRoundTrip) {
   msg::Heartbeat hb{42, 0.75f};
 
@@ -124,9 +116,18 @@ TEST(CommonMessages, ShutdownRequestDescriptor) {
   EXPECT_EQ(desc.length_style, MessageLengthStyle::kFixed);
 }
 
-// ============================================================================
-// ServerApp lifecycle
-// ============================================================================
+TEST(ServerAppDeathTest, RemovedDatabaseBackendReportsErrorBeforeRuntimeStarts) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EventDispatcher dispatcher("config_error");
+  NetworkInterface network(dispatcher);
+  TestServerApp app(dispatcher, network);
+  char executable[] = "server";
+  char option[] = "--db-type";
+  char backend[] = "xml";
+  char* args[] = {executable, option, backend};
+  EXPECT_EXIT(std::exit(app.RunApp(3, args)), ::testing::ExitedWithCode(1),
+              "unsupported database backend 'xml'; use sqlite or mysql");
+}
 
 TEST(ServerApp, InitRunFiniOrder) {
   EventDispatcher dispatcher("test");
@@ -137,6 +138,8 @@ TEST(ServerApp, InitRunFiniOrder) {
   MinimalArgv args;
   int exit_code = app.RunApp(args.argc(), args.argv());
   EXPECT_EQ(exit_code, 0);
+  EXPECT_GT(app.Config().process_instance, 0u);
+  EXPECT_LE(app.Config().process_instance, UINT64_MAX >> 1);
 
   // init and fini must both have been called
   EXPECT_TRUE(app.init_called);

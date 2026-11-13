@@ -1,4 +1,4 @@
-option(ATLAS_BUILD_NET_CLIENT "Build the Unity native client DLL" OFF)
+option(ATLAS_BUILD_NET_CLIENT "Build the native client DLL" ${ATLAS_BUILD_TESTS})
 
 if(NOT ATLAS_BUILD_NET_CLIENT)
   return()

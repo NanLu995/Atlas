@@ -206,6 +206,37 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
   EXPECT_FALSE(client.auth_result.success);
   EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
 
+  client.reset_auth();
+  auto empty_password = missing;
+  empty_password.request_id = 5;
+  empty_password.password_hash.clear();
+  ASSERT_TRUE((*ch)->SendMessage(empty_password).HasValue());
+  ASSERT_TRUE(poll_until(client.dispatcher,
+                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
+  EXPECT_FALSE(client.auth_result.success);
+  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
+
+  client.reset_auth();
+  empty_password.request_id = 6;
+  empty_password.username = "empty_password_account";
+  empty_password.auto_create = true;
+  ASSERT_TRUE((*ch)->SendMessage(empty_password).HasValue());
+  ASSERT_TRUE(poll_until(client.dispatcher,
+                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
+  EXPECT_FALSE(client.auth_result.success);
+  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
+
+  client.reset_auth();
+  auto empty_username = missing;
+  empty_username.request_id = 7;
+  empty_username.username.clear();
+  empty_username.auto_create = true;
+  ASSERT_TRUE((*ch)->SendMessage(empty_username).HasValue());
+  ASSERT_TRUE(poll_until(client.dispatcher,
+                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
+  EXPECT_FALSE(client.auth_result.success);
+  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
+
   stop_flag.store(true, std::memory_order_release);
   app_thread.join();
 

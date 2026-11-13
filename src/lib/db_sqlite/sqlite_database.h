@@ -3,13 +3,17 @@
 
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <sqlite3.h>
 
-#include "db/idatabase.h"
+#include "db/write_operation.h"
+#include "platform/filesystem.h"
 
 namespace atlas {
 
@@ -27,6 +31,11 @@ class SqliteDatabase : public IDatabase {
   void PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                  std::span<const std::byte> blob, const std::string& identifier,
                  std::function<void(PutResult)> callback) override;
+
+  void PutEntityWithOperation(const DatabaseWriteOperation& operation, DatabaseID dbid,
+                              uint16_t type_id, WriteFlags flags, std::span<const std::byte> blob,
+                              const std::string& identifier,
+                              std::function<void(PutResult)> callback) override;
 
   void PutEntityWithPassword(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                              std::span<const std::byte> blob, const std::string& identifier,
@@ -48,12 +57,22 @@ class SqliteDatabase : public IDatabase {
   void CheckoutEntityByName(uint16_t type_id, const std::string& identifier,
                             const CheckoutInfo& new_owner,
                             std::function<void(GetResult)> callback) override;
+  void CheckoutWithOperation(const DatabaseCheckoutOperation& operation,
+                             std::function<void(GetResult)> callback) override;
+  void ResolveCheckoutOperation(const DatabaseCheckoutOperation& operation,
+                                std::function<void(GetResult)> callback) override;
+
+  void ReleaseCheckout(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner,
+                       std::function<void(Result<void>)> callback) override;
 
   void ClearCheckout(DatabaseID dbid, uint16_t type_id,
                      std::function<void(bool)> callback) override;
 
   void ClearCheckoutsForAddress(const Address& base_addr,
                                 std::function<void(int cleared_count)> callback) override;
+
+  void RetireCheckoutProcess(const Address& base_addr, uint64_t instance,
+                             std::function<void(Result<int>)> callback) override;
 
   void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id) override;
 
@@ -64,8 +83,8 @@ class SqliteDatabase : public IDatabase {
   void GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                          std::function<void(DbidRangeResult)> callback) override;
 
-  void LoadEntityIdCounter(std::function<void(EntityID next_id)> callback) override;
-  void SaveEntityIdCounter(EntityID next_id, std::function<void(bool success)> callback) override;
+  void ReserveEntityIds(uint32_t count,
+                        std::function<void(Result<EntityIdRange>)> callback) override;
 
   void ProcessResults() override;
 
@@ -73,6 +92,10 @@ class SqliteDatabase : public IDatabase {
   void EndBatch() override;
 
  private:
+  friend struct SqliteDatabaseTestAccess;
+  struct BatchStatus {
+    std::optional<Error> error;
+  };
   struct EntityRow {
     bool found{false};
     EntityData data;
@@ -107,20 +130,64 @@ class SqliteDatabase : public IDatabase {
   [[nodiscard]] auto FetchByDbid(DatabaseID dbid, uint16_t type_id) -> Result<EntityRow>;
   [[nodiscard]] auto FetchByName(uint16_t type_id, std::string_view identifier)
       -> Result<EntityRow>;
-  [[nodiscard]] auto ReadRow(sqlite3_stmt* stmt) const -> EntityRow;
+  [[nodiscard]] auto ReadRow(sqlite3_stmt* stmt) const -> Result<EntityRow>;
+  [[nodiscard]] auto AcquireCheckoutVersion(DatabaseID dbid, uint16_t type_id) -> Result<uint64_t>;
+  [[nodiscard]] auto CheckCheckoutProcess(const CheckoutInfo& owner) -> Result<void>;
+  [[nodiscard]] auto AcquireCheckout(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner)
+      -> Result<uint64_t>;
+  void CheckoutTail(EntityRow row, const CheckoutInfo& owner, const std::string& scope,
+                    std::function<void(GetResult)> callback);
   [[nodiscard]] auto BindIdentifier(Statement& stmt, int index, const std::string& identifier) const
       -> Result<void>;
   [[nodiscard]] auto BindBlob(Statement& stmt, int index, std::span<const std::byte> blob) const
       -> Result<void>;
   [[nodiscard]] auto SqliteError(std::string_view prefix) const -> Error;
   [[nodiscard]] auto SqliteError(std::string_view prefix, int code) const -> Error;
-  void FireOrDefer(std::function<void()> cb);
+  template <typename T>
+  void FireOrDefer(std::function<void(T)> callback, T result) {
+    auto status = batch_txn_open_ ? batch_status_ : nullptr;
+    auto complete = [cb = std::move(callback), result = std::move(result), status]() mutable {
+      if (status && status->error) {
+        if constexpr (requires {
+                        result.HasValue();
+                        result.Error();
+                      }) {
+          result = *status->error;
+        } else {
+          result = T{};
+          if constexpr (std::is_same_v<T, int>) result = -1;
+          if constexpr (requires { result.error; }) result.error = status->error->Message();
+          if constexpr (requires { result.error_kind; }) {
+            result.error_kind = DatabaseErrorKind::kCommitUnknown;
+          }
+        }
+      }
+      cb(std::move(result));
+    };
+    if (deferred_mode_ || status)
+      deferred_.push_back(std::move(complete));
+    else
+      complete();
+  }
 
+  void PutEntityImpl(const DatabaseWriteOperation* operation, DatabaseID dbid, uint16_t type_id,
+                     WriteFlags flags, std::span<const std::byte> blob,
+                     const std::string& identifier, std::function<void(PutResult)> callback);
+  void CheckoutOperationImpl(const DatabaseCheckoutOperation& operation, bool acquire,
+                             std::function<void(GetResult)> callback);
+  [[nodiscard]] auto FindOperationReceipt(const std::array<std::byte, 16>& id)
+      -> Result<std::optional<DatabaseOperationReceipt>>;
+  [[nodiscard]] auto SaveOperationReceipt(const std::array<std::byte, 16>& id,
+                                          const DatabaseOperationReceipt& receipt) -> Result<void>;
+  void FinishWrite(const std::string& scope, const DatabaseWriteOperation* operation,
+                   const std::optional<Sha256Digest>& hash, PutResult result,
+                   std::function<void(PutResult)> callback);
   [[nodiscard]] auto BeginWriteScope() -> Result<std::string>;
-  void CommitWriteScope(const std::string& scope);
+  [[nodiscard]] auto CommitWriteScope(const std::string& scope) -> Result<void>;
   void RollbackWriteScope(const std::string& scope);
 
   sqlite3* db_{nullptr};
+  fs::ScopedFileLock database_lock_;
   const EntityDefRegistry* entity_defs_{nullptr};
   std::filesystem::path db_path_;
   bool started_{false};
@@ -129,6 +196,7 @@ class SqliteDatabase : public IDatabase {
 
   bool batch_active_{false};
   bool batch_txn_open_{false};
+  std::shared_ptr<BatchStatus> batch_status_;
   int batch_savepoint_seq_{0};
 
   static constexpr int kMaxCallbacksPerTick = 2048;

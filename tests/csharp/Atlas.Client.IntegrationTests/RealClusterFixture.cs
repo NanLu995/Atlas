@@ -28,7 +28,10 @@ public sealed class RealClusterFixture : IDisposable
             StartInfo = new ProcessStartInfo
             {
                 FileName = ResolvePython(),
-                Arguments = $"\"{launcher}\"",
+                Arguments = $"\"{launcher}\" --db-backend " +
+                    (Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql") +
+                    " --build-dir \"" + Path.GetFileName(
+                        Environment.GetEnvironmentVariable("ATLAS_BIN_DIR") ?? "debug") + "\"",
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,

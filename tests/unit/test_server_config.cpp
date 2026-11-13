@@ -383,7 +383,7 @@ TEST(ServerConfig, FromJsonFilePartialKeys) {
   auto r = ServerConfig::FromJsonFile(path);
   ASSERT_TRUE(r.HasValue());
   EXPECT_EQ(r->update_hertz, 5);
-  EXPECT_EQ(r->db_type, "sqlite");
+  EXPECT_EQ(r->db_type, "mysql");
   EXPECT_EQ(r->log_level, LogLevel::kInfo);
   EXPECT_FALSE(r->is_production);
 }
@@ -393,8 +393,7 @@ TEST(ServerConfig, LoadCliOverridesJson) {
         "update_hertz": 10,
         "log_level": "info",
         "database": {
-            "type": "xml",
-            "xml_dir": "data/xml",
+            "type": "mysql",
             "sqlite_path": "data/from_json.sqlite3",
             "sqlite_wal": true,
             "sqlite_busy_timeout_ms": 5000,
@@ -459,7 +458,47 @@ TEST(ServerConfig, LoadNoConfigFile) {
   ASSERT_TRUE(r.HasValue());
   EXPECT_EQ(r->process_type, ProcessType::kMachined);
   EXPECT_EQ(r->process_name, "main");
-  EXPECT_EQ(r->db_type, "sqlite");
+  EXPECT_EQ(r->db_type, "mysql");
+}
+
+TEST(ServerConfig, FromArgsRejectsUnsupportedDatabaseType) {
+  for (const auto* type : {"xml", "XML", "unsupported", ""}) {
+    FakeArgv args({"exe", "--db-type", type});
+    auto result = ServerConfig::FromArgs(args.argc(), args.argv());
+    ASSERT_FALSE(result.HasValue()) << type;
+    EXPECT_NE(result.Error().Message().find("sqlite"), std::string_view::npos);
+    EXPECT_NE(result.Error().Message().find("mysql"), std::string_view::npos);
+  }
+}
+
+TEST(ServerConfig, FromJsonRejectsRemovedXmlDatabase) {
+  const auto path = write_temp_json(R"({"database":{"type":"xml"}})");
+  auto result = ServerConfig::FromJsonFile(path);
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_NE(result.Error().Message().find("xml"), std::string_view::npos);
+  EXPECT_NE(result.Error().Message().find("sqlite"), std::string_view::npos);
+  FakeArgv args({"exe", "--config", path.string()});
+  EXPECT_FALSE(ServerConfig::Load(args.argc(), args.argv()).HasValue());
+}
+
+TEST(ServerConfig, FromArgsSupportsMysqlDatabase) {
+  FakeArgv args({"exe", "--db-type", "mysql"});
+  auto result = ServerConfig::FromArgs(args.argc(), args.argv());
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result->db_type, "mysql");
+}
+
+TEST(ServerConfig, SqlitePathDoesNotImplicitlySelectSqlite) {
+  FakeArgv args({"exe", "--db-sqlite-path", "unused.sqlite3"});
+  auto cli = ServerConfig::FromArgs(args.argc(), args.argv());
+  ASSERT_TRUE(cli.HasValue());
+  EXPECT_EQ(cli->db_type, "mysql");
+  const auto path = write_temp_json(R"({"database":{"sqlite_path":"unused.sqlite3"}})");
+  auto json = ServerConfig::FromJsonFile(path);
+  ASSERT_TRUE(json.HasValue());
+  EXPECT_EQ(json->db_type, "mysql");
+  const auto empty_type = write_temp_json(R"({"database":{"type":""}})");
+  EXPECT_FALSE(ServerConfig::FromJsonFile(empty_type).HasValue());
 }
 
 TEST(ServerConfig, LoadDefaultProcessName) {

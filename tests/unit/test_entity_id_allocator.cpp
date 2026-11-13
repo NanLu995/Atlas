@@ -1,43 +1,48 @@
 #include <functional>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "db/idatabase.h"
 #include "entity_id_allocator.h"
-#include "server/entity_types.h"
 
 using namespace atlas;
-
-// ============================================================================
-// Minimal in-memory IDatabase stub for EntityIdAllocator tests.
-// Only load_entity_id_counter / save_entity_id_counter are implemented;
-// all other pure virtuals are stubbed to satisfy the linker.
-// ============================================================================
 
 namespace {
 
 class StubDatabase : public IDatabase {
  public:
-  // ---- EntityID counter state (the only part under test) -----------------
-  EntityID stored_next_id{0};  // 0 = "no counter stored yet"
-  bool save_should_fail{false};
+  EntityID next{1};
+  bool fail{false};
+  bool deferred{false};
+  int calls{0};
+  std::optional<EntityIdRange> override_range;
+  std::vector<std::function<void()>> pending;
 
-  void LoadEntityIdCounter(std::function<void(EntityID)> callback) override {
-    EntityID id = (stored_next_id > 0) ? stored_next_id : 1;
-    callback(id);
+  void ReserveEntityIds(uint32_t count,
+                        std::function<void(Result<EntityIdRange>)> callback) override {
+    ++calls;
+    auto reserve = [this, count, cb = std::move(callback)] {
+      if (fail) {
+        cb(Error{ErrorCode::kIoError, "reservation failed"});
+      } else if (override_range) {
+        cb(*override_range);
+      } else if (count > kFirstLocalEntityID - next) {
+        cb(Error{ErrorCode::kOutOfRange, "IDs exhausted"});
+      } else {
+        EntityIdRange range{next, next + count - 1};
+        next += count;
+        cb(range);
+      }
+    };
+    if (deferred)
+      pending.push_back(std::move(reserve));
+    else
+      reserve();
   }
 
-  void SaveEntityIdCounter(EntityID next_id, std::function<void(bool)> callback) override {
-    if (save_should_fail) {
-      callback(false);
-      return;
-    }
-    stored_next_id = next_id;
-    callback(true);
-  }
-
-  // ---- Stubs for the rest of the interface (unused by allocator) ---------
   auto Startup(const DatabaseConfig& /*config*/, const EntityDefRegistry& /*defs*/)
       -> Result<void> override {
     return {};
@@ -63,199 +68,97 @@ class StubDatabase : public IDatabase {
   void ProcessResults() override {}
 };
 
+TEST(EntityIdAllocator, ConcurrentReservationsDoNotAllocateOverlappingIds) {
+  StubDatabase db;
+  db.deferred = true;
+  EntityIdAllocator first(db);
+  EntityIdAllocator second(db);
+  std::vector<EntityIdRange> ranges;
+  auto collect = [&](Result<EntityIdRange> range) {
+    ASSERT_TRUE(range.HasValue());
+    ranges.push_back(*range);
+  };
+  first.Allocate(10, collect);
+  second.Allocate(10, collect);
+  EXPECT_TRUE(ranges.empty());
+  for (auto& complete : db.pending) complete();
+  ASSERT_EQ(ranges.size(), 2u);
+  EXPECT_EQ(ranges[0].first, 1u);
+  EXPECT_LT(ranges[0].last, ranges[1].first);
+  EXPECT_EQ(db.next, 21u);
+}
+
+TEST(EntityIdAllocator, InvalidCountDoesNotReachDatabase) {
+  StubDatabase db;
+  EntityIdAllocator alloc(db);
+  for (uint32_t count : {0u, kFirstLocalEntityID, UINT32_MAX}) {
+    bool completed = false;
+    alloc.Allocate(count, [&](Result<EntityIdRange> range) {
+      completed = true;
+      ASSERT_FALSE(range.HasValue());
+      EXPECT_EQ(range.Error().Code(), ErrorCode::kOutOfRange);
+    });
+    EXPECT_TRUE(completed);
+  }
+  EXPECT_EQ(db.calls, 0);
+}
+
+TEST(EntityIdAllocator, ReservationFailureDoesNotInventIds) {
+  StubDatabase db;
+  db.fail = true;
+  EntityIdAllocator alloc(db);
+  alloc.Allocate(10, [](Result<EntityIdRange> range) {
+    ASSERT_FALSE(range.HasValue());
+    EXPECT_EQ(range.Error().Code(), ErrorCode::kIoError);
+  });
+  EXPECT_EQ(db.next, 1u);
+  db.fail = false;
+  alloc.Allocate(10, [](Result<EntityIdRange> range) {
+    ASSERT_TRUE(range.HasValue());
+    EXPECT_EQ(range->first, 1u);
+    EXPECT_EQ(range->last, 10u);
+  });
+}
+
+TEST(EntityIdAllocator, InvalidBackendRangesAreRejected) {
+  StubDatabase db;
+  EntityIdAllocator alloc(db);
+  for (auto range : {EntityIdRange{0, 9}, EntityIdRange{10, 1}, EntityIdRange{1, 11},
+                     EntityIdRange{kFirstLocalEntityID - 9, kFirstLocalEntityID}}) {
+    db.override_range = range;
+    alloc.Allocate(10, [](Result<EntityIdRange> result) {
+      ASSERT_FALSE(result.HasValue());
+      EXPECT_EQ(result.Error().Code(), ErrorCode::kIoError);
+    });
+  }
+}
+
+TEST(EntityIdAllocator, ExhaustionNeverEntersClientLocalRange) {
+  StubDatabase db;
+  db.next = kFirstLocalEntityID - 5;
+  EntityIdAllocator alloc(db);
+  alloc.Allocate(5, [](Result<EntityIdRange> range) {
+    ASSERT_TRUE(range.HasValue());
+    EXPECT_EQ(range->last, kFirstLocalEntityID - 1);
+  });
+  alloc.Allocate(1, [](Result<EntityIdRange> range) {
+    ASSERT_FALSE(range.HasValue());
+    EXPECT_EQ(range.Error().Code(), ErrorCode::kOutOfRange);
+  });
+  EXPECT_EQ(db.next, kFirstLocalEntityID);
+}
+
+TEST(EntityIdAllocator, NewAllocatorDoesNotReuseReservedIds) {
+  StubDatabase db;
+  {
+    EntityIdAllocator first(db);
+    first.Allocate(100, [](Result<EntityIdRange> range) { ASSERT_TRUE(range.HasValue()); });
+  }
+  EntityIdAllocator restarted(db);
+  restarted.Allocate(1, [](Result<EntityIdRange> range) {
+    ASSERT_TRUE(range.HasValue());
+    EXPECT_EQ(range->first, 101u);
+  });
+}
+
 }  // namespace
-
-// ============================================================================
-// EntityIdAllocator tests
-// ============================================================================
-
-TEST(EntityIdAllocator, StartupLoadsAndPersistsWithBuffer) {
-  StubDatabase db;
-  db.stored_next_id = 0;  // first boot
-
-  EntityIdAllocator alloc(db);
-  bool started = false;
-  alloc.Startup([&](bool ok) {
-    started = true;
-    EXPECT_TRUE(ok);
-  });
-  ASSERT_TRUE(started);
-
-  // After startup, the allocator should have persisted next_id + buffer
-  EXPECT_EQ(alloc.next_id(), 1u);
-  // stored value = 1 + 100'000 = 100'001
-  EXPECT_EQ(db.stored_next_id, 100'001u);
-}
-
-TEST(EntityIdAllocator, AllocateReturnsMonotonicRanges) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  auto [s1, e1] = alloc.Allocate(10);
-  EXPECT_EQ(s1, 1u);
-  EXPECT_EQ(e1, 10u);
-
-  auto [s2, e2] = alloc.Allocate(5);
-  EXPECT_EQ(s2, 11u);
-  EXPECT_EQ(e2, 15u);
-
-  auto [s3, e3] = alloc.Allocate(1);
-  EXPECT_EQ(s3, 16u);
-  EXPECT_EQ(e3, 16u);
-}
-
-TEST(EntityIdAllocator, AllocateZeroReturnsInvalid) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  auto [s, e] = alloc.Allocate(0);
-  EXPECT_EQ(s, kInvalidEntityID);
-  EXPECT_EQ(e, kInvalidEntityID);
-
-  // next_id unchanged
-  EXPECT_EQ(alloc.next_id(), 1u);
-}
-
-TEST(EntityIdAllocator, PersistIfNeededTriggersWhenPastBuffer) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  // After startup, persisted_up_to = 100'001.
-  // Allocate enough IDs to push next_id past the buffer boundary.
-  // next_id + 100'000 > persisted_up_to  =>  next_id > 1
-  // Actually, at startup: persisted = 1+100'000 = 100'001
-  // persist triggers when next_id + 100'000 > persisted_up_to
-  // => next_id > 100'001 - 100'000 = 1, so any allocation triggers.
-
-  (void)alloc.Allocate(1);  // next_id = 2
-
-  bool called = false;
-  alloc.PersistIfNeeded([&](bool ok) {
-    called = true;
-    EXPECT_TRUE(ok);
-  });
-  ASSERT_TRUE(called);
-  // Should have persisted a new value
-  EXPECT_EQ(db.stored_next_id, alloc.next_id() + 100'000);
-}
-
-TEST(EntityIdAllocator, PersistIfNeededSkipsWhenNotNeeded) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  // Right after startup, next_id=1, persisted=100'001
-  // next_id + buffer = 1 + 100'000 = 100'001, NOT > 100'001
-  // So persist_if_needed should be a no-op.
-  EntityID before = db.stored_next_id;
-  bool called = false;
-  alloc.PersistIfNeeded([&](bool ok) {
-    called = true;
-    EXPECT_TRUE(ok);
-  });
-  ASSERT_TRUE(called);
-  EXPECT_EQ(db.stored_next_id, before);
-}
-
-TEST(EntityIdAllocator, CrashRecoverySkipsAllocatedIds) {
-  // Simulate: allocator persisted up_to 200'001, then we allocated
-  // IDs 1..500 but crashed before the next persist.
-  // On recovery, the allocator loads 200'001 and starts from there.
-  StubDatabase db;
-  db.stored_next_id = 200'001;
-
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool ok) { EXPECT_TRUE(ok); });
-
-  EXPECT_EQ(alloc.next_id(), 200'001u);
-
-  auto [s, e] = alloc.Allocate(1);
-  EXPECT_EQ(s, 200'001u);
-  EXPECT_EQ(e, 200'001u);
-}
-
-TEST(EntityIdAllocator, ForcePersistAlwaysWrites) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  bool called = false;
-  alloc.Persist([&](bool ok) {
-    called = true;
-    EXPECT_TRUE(ok);
-  });
-  ASSERT_TRUE(called);
-  // Force persist always writes, even if not strictly needed
-  EXPECT_EQ(db.stored_next_id, alloc.next_id() + 100'000);
-}
-
-TEST(EntityIdAllocator, SaveFailureReportedViaCallback) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  db.save_should_fail = true;
-
-  bool called = false;
-  alloc.Persist([&](bool ok) {
-    called = true;
-    EXPECT_FALSE(ok);
-  });
-  ASSERT_TRUE(called);
-}
-
-TEST(EntityIdAllocator, LargeAllocationIsContiguous) {
-  StubDatabase db;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  auto [s, e] = alloc.Allocate(10'000);
-  EXPECT_EQ(s, 1u);
-  EXPECT_EQ(e, 10'000u);
-  EXPECT_EQ(alloc.next_id(), 10'001u);
-}
-
-TEST(EntityIdAllocator, AllocateRefusesPastReservedBoundary) {
-  // Seed the persisted counter just below kFirstLocalEntityID so the
-  // next allocation collides with the client-local reserved range.
-  StubDatabase db;
-  db.stored_next_id = kFirstLocalEntityID - 5;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  // Fits exactly: 5 ids before the ceiling.
-  auto [s1, e1] = alloc.Allocate(5);
-  EXPECT_EQ(s1, kFirstLocalEntityID - 5);
-  EXPECT_EQ(e1, kFirstLocalEntityID - 1);
-  EXPECT_EQ(alloc.next_id(), kFirstLocalEntityID);
-
-  // Any further allocation must be refused, leaving the counter put.
-  auto [s2, e2] = alloc.Allocate(1);
-  EXPECT_EQ(s2, kInvalidEntityID);
-  EXPECT_EQ(e2, kInvalidEntityID);
-  EXPECT_EQ(alloc.next_id(), kFirstLocalEntityID);
-}
-
-TEST(EntityIdAllocator, AllocateRefusesRangeStraddlingBoundary) {
-  StubDatabase db;
-  db.stored_next_id = kFirstLocalEntityID - 3;
-  EntityIdAllocator alloc(db);
-  alloc.Startup([](bool) {});
-
-  // Asking for 10 ids when only 3 fit: all-or-nothing rejection.
-  auto [s, e] = alloc.Allocate(10);
-  EXPECT_EQ(s, kInvalidEntityID);
-  EXPECT_EQ(e, kInvalidEntityID);
-  EXPECT_EQ(alloc.next_id(), kFirstLocalEntityID - 3);
-}
-
-TEST(EntityTypes, IsServerEntityIdHelper) {
-  EXPECT_FALSE(IsServerEntityId(kInvalidEntityID));
-  EXPECT_TRUE(IsServerEntityId(1));
-  EXPECT_TRUE(IsServerEntityId(kFirstLocalEntityID - 1));
-  EXPECT_FALSE(IsServerEntityId(kFirstLocalEntityID));
-  EXPECT_FALSE(IsServerEntityId(0xFFFFFFFFu));
-}

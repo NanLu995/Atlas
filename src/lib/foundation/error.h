@@ -43,6 +43,7 @@ enum class ErrorCode : uint32_t {
   kScriptValueError,
   kScriptImportError,
   kScriptRuntimeError,
+  kCommitUnknown,
 };
 
 [[nodiscard]] auto ErrorCodeName(ErrorCode code) -> std::string_view;

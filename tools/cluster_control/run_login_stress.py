@@ -15,6 +15,7 @@ from typing import Iterable, NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.paths import REPO_ROOT, resolve_repo_root  # noqa: F401
+from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from common.cluster import (
     LoggedProcess,
     resolve_program,
@@ -66,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--keep-cluster", action="store_true")
     parser.add_argument("--verbose-failures", action="store_true")
+    add_database_options(parser)
     return parser.parse_args()
 
 
@@ -170,18 +172,13 @@ def build_runtime_config(
     *,
     machined_address: str,
     account_type_id: int,
-    db_dir: Path,
+    database: dict[str, object],
 ) -> dict[str, object]:
-    sqlite_path = db_dir / "atlas_login_stress.sqlite3"
     return {
         "machined_address": machined_address,
         "auto_create_accounts": True,
         "account_type_id": account_type_id,
-        "database": {
-            "type": "sqlite",
-            "sqlite_path": str(sqlite_path),
-            "sqlite_foreign_keys": True,
-        },
+        "database": database,
     }
 
 
@@ -301,6 +298,8 @@ def build_baseapp_specs(args: argparse.Namespace) -> list[dict[str, object]]:
 
 def main() -> int:
     args = parse_args()
+    if args.db_backend == 'mysql':
+        database_config(args, Path())
     source_ips = collect_source_ips(args)
     worker_plan = build_worker_plan(args, source_ips)
     baseapp_specs = build_baseapp_specs(args)
@@ -332,7 +331,7 @@ def main() -> int:
 
     entity_def_digest = load_entity_def_digest(repo_root)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_root = repo_root / ".tmp" / "login-stress" / timestamp
     log_dir = run_root / "logs"
     db_dir = run_root / "db"
@@ -341,13 +340,16 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     db_dir.mkdir(parents=True, exist_ok=True)
 
+    database = database_config(args, db_dir / 'atlas_login_stress.sqlite3')
+    record_database_run(run_root, database, baseapps=args.baseapp_count, cellapps=0)
+
     machined_address = f"{args.machined_host}:{args.machined_port}"
     db_config_path.write_text(
         json.dumps(
             build_runtime_config(
                 machined_address=machined_address,
                 account_type_id=args.account_type_id,
-                db_dir=db_dir,
+                database=database,
             ),
             indent=2,
         )
@@ -448,6 +450,7 @@ def main() -> int:
             )
         )
         processes[-1].start_order = 2
+        wait_for_database_start(processes[-1].process, log_dir)
         time.sleep(1)
 
         processes.append(
@@ -506,11 +509,7 @@ def main() -> int:
         ]
 
         if not all(registrations):
-            log(
-                "Warning: cluster did not fully register with machined within the timeout. "
-                f"Continuing anyway; check logs under {log_dir} if login_stress fails.",
-                stream=sys.stderr,
-            )
+            fail(f"Cluster startup failed; not all processes registered. Check {log_dir}")
         else:
             log("")
             log("Registered processes:")

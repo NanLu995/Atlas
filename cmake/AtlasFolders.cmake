@@ -68,7 +68,6 @@ set(_atlas_lib_targets
   atlas_space
   atlas_db
   atlas_db_sqlite
-  atlas_db_xml
   atlas_db_mysql
   atlas_clrscript
   atlas_engine
@@ -195,7 +194,7 @@ atlas_set_output_dir(""
   ${_atlas_stress_targets} ${_atlas_app_tool_targets}
   # Libraries (static + third-party)
   ${_atlas_lib_targets}
-  atlas_db_iface atlas_db_sqlite atlas_db_xml
+  atlas_db_iface atlas_db_sqlite
   atlas_baseapp_lib atlas_baseappmgr_lib
   atlas_cellapp_lib atlas_cellappmgr_lib atlas_cellappmgr_bsp
   atlas_dbapp_lib atlas_dbappmgr_lib atlas_loginapp_lib
@@ -206,10 +205,8 @@ atlas_set_output_dir(""
   zlib zlibstatic
 )
 
-# DB plugin DLLs share the flat output dir. ARCHIVE (import lib) collides
-# with the static lib of the same name if both land in the same dir, so
-# the plugin's import lib stays under the build tree.
-foreach(_plugin IN ITEMS atlas_db_sqlite_plugin atlas_db_xml_plugin atlas_db_mysql_plugin)
+# Plugin import libraries stay under the build tree to avoid static-library collisions.
+foreach(_plugin IN ITEMS atlas_db_sqlite_plugin atlas_db_mysql_plugin)
   if(TARGET ${_plugin})
     foreach(_cfg IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
       string(TOUPPER "${_cfg}" _CFG)

@@ -162,6 +162,7 @@ enum class DBApp : uint16_t {
   kLookupEntityAck = 4008,
   kAbortCheckout = 4009,
   kAbortCheckoutAck = 4010,
+  kCheckinEntityAck = 4011,
   kGetEntityIds = 4020,
   kGetEntityIdsAck = 4021,
   kPutEntityIds = 4022,

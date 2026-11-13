@@ -22,6 +22,7 @@ class DataSectionTree;
 // can extract their own keys without requiring explicit support here.
 struct ServerConfig {
   ProcessType process_type = ProcessType::kBaseApp;
+  uint64_t process_instance{0};
   std::string process_name;
 
   Address machined_address{};  // default resolved lazily from "127.0.0.1:20018"
@@ -52,8 +53,7 @@ struct ServerConfig {
   // Binary descriptor (ATDF, emitted by Atlas.Tools.DefDump) consumed by
   // EntityDefRegistry::RegisterFromBinaryFile on DBApp startup.
   std::filesystem::path entitydef_bin_path;
-  std::string db_type{"sqlite"};  // "xml", "sqlite", or "mysql"
-  std::filesystem::path db_xml_dir{"data/db"};
+  std::string db_type{"mysql"};  // "mysql" or explicitly selected "sqlite"
   std::filesystem::path db_sqlite_path{"data/atlas_dev.sqlite3"};
   bool db_sqlite_wal{true};
   int db_sqlite_busy_timeout_ms{5000};
@@ -62,7 +62,7 @@ struct ServerConfig {
   uint16_t db_mysql_port{3306};
   std::string db_mysql_user;
   std::string db_mysql_password;
-  std::string db_mysql_database{"atlas"};
+  std::string db_mysql_database;
   int db_mysql_pool_size{4};
 
   bool enable_hot_reload{false};
