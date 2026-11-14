@@ -13,7 +13,9 @@
 #include "network/machined_types.h"
 #include "network/mesh_gossip.h"
 #include "network/network_interface.h"
+#include "network/reliable_udp.h"
 #include "serialization/binary_stream.h"
+#include "server/cellapp_peer_registry.h"
 #include "server/common_messages.h"
 #include "server/machined_client.h"
 #include "server/mesh_transport.h"
@@ -139,6 +141,68 @@ class MachinedRegistrationTest : public ::testing::Test {
     if (machined_thread_.joinable()) machined_thread_.join();
   }
 };
+
+TEST_F(MachinedRegistrationTest, PeerRestartReplacesTransportAndRejectsOldDeath) {
+  MachinedClient client(client_disp_, client_ni_);
+  ASSERT_TRUE(client.Connect(machined_addr_));
+  ASSERT_TRUE(poll_until(client_disp_, [&] { return client.IsConnected(); }));
+  int deaths = 0;
+  client.Subscribe(ListenerType::kDeath, ProcessType::kBaseApp, nullptr,
+                   [&](const DeathNotification&) { ++deaths; });
+  auto* control = client_ni_.FindChannel(machined_addr_);
+  ASSERT_NE(control, nullptr);
+  BirthNotification birth;
+  birth.process_type = ProcessType::kBaseApp;
+  birth.internal_addr = Address("127.0.0.1", 30008);
+  birth.process_instance = 11;
+  auto deliver = [&](const auto& message, Channel* channel) {
+    BinaryWriter writer;
+    message.Serialize(writer);
+    BinaryReader reader(writer.Data());
+    EXPECT_TRUE(client_ni_.InterfaceTable().Dispatch(machined_addr_, channel,
+                                                     message.Descriptor().id, reader));
+  };
+  deliver(birth, control);
+  auto connected = client_ni_.ConnectRudpNocwnd(birth.internal_addr);
+  ASSERT_TRUE(connected);
+  IntrusivePtr<Channel> original{*connected};
+  birth.process_instance = 12;
+  deliver(birth, control);
+  auto* replacement = client_ni_.FindChannel(birth.internal_addr);
+  ASSERT_NE(replacement, nullptr);
+  EXPECT_NE(replacement, original.get());
+  EXPECT_TRUE(original->IsCondemned());
+  deliver(birth, control);
+  EXPECT_EQ(client_ni_.FindChannel(birth.internal_addr), replacement);
+  birth.process_instance = 13;
+  deliver(birth, replacement);
+  EXPECT_EQ(client_ni_.FindChannel(birth.internal_addr), replacement);
+  DeathNotification death;
+  death.process_type = ProcessType::kBaseApp;
+  death.internal_addr = birth.internal_addr;
+  death.process_instance = 11;
+  deliver(death, control);
+  EXPECT_EQ(deaths, 0);
+  EXPECT_EQ(client_ni_.FindChannel(birth.internal_addr), replacement);
+  death.process_instance = 12;
+  deliver(death, control);
+  EXPECT_EQ(deaths, 1);
+  EXPECT_EQ(client_ni_.FindChannel(birth.internal_addr), nullptr);
+
+  CellAppPeerRegistry peers(client_ni_);
+  peers.Subscribe(client, {});
+  birth.process_type = ProcessType::kCellApp;
+  birth.internal_addr = Address("127.0.0.1", 30009);
+  birth.process_instance = 21;
+  deliver(birth, control);
+  IntrusivePtr<Channel> old_peer{peers.Find(birth.internal_addr)};
+  ASSERT_NE(old_peer.get(), nullptr);
+  birth.process_instance = 22;
+  deliver(birth, control);
+  EXPECT_TRUE(old_peer->IsCondemned());
+  EXPECT_NE(peers.Find(birth.internal_addr), old_peer.get());
+  EXPECT_EQ(peers.Find(birth.internal_addr), client_ni_.FindChannel(birth.internal_addr));
+}
 
 TEST_F(MachinedRegistrationTest, RegisterReceivesAck) {
   MachinedClient client(client_disp_, client_ni_);

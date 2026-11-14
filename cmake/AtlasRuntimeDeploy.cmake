@@ -69,6 +69,13 @@ endfunction()
 # POST_BUILD. Idempotent — calling twice on the same target is safe.
 function(atlas_deploy_clr_runtime target)
   if(NOT WIN32)
+    _atlas_transitively_links(${target} atlas_clrscript _need_clr)
+    if(_need_clr)
+      if(NOT TARGET atlas_engine)
+        message(FATAL_ERROR "${target} loads the CLR bridge but atlas_engine is not defined")
+      endif()
+      add_dependencies(${target} atlas_engine)
+    endif()
     return()
   endif()
 

@@ -7,11 +7,203 @@
 #include <gtest/gtest.h>
 
 #include "baseapp_messages.h"
+#include "client_handoff_messages.h"
 #include "network/message_ids.h"
 #include "serialization/binary_stream.h"
+#include "session_messages.h"
 
 using namespace atlas;
 using namespace atlas::baseapp;
+
+TEST(BaseAppMessages, ClientHandoffRejectsEmptyCredentialsAndMalformedDestinations) {
+  ClientHandoff request;
+  request.target = {Address("127.0.0.1", 25002), 55, 222};
+  request.credential.bytes[0] = 1;
+  BinaryWriter writer;
+  request.Serialize(writer);
+  for (std::size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader input(writer.Data().first(length));
+    EXPECT_FALSE(ClientHandoff::Deserialize(input).HasValue());
+  }
+  BinaryReader input(writer.Data());
+  auto parsed = ClientHandoff::Deserialize(input);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed->target, request.target);
+  EXPECT_TRUE(parsed->credential == request.credential);
+  for (int invalid = 0; invalid < 3; ++invalid) {
+    auto bad = request;
+    if (invalid == 0) bad.credential = {};
+    if (invalid == 1) bad.target.process_instance = 0;
+    BinaryWriter bytes;
+    bad.Serialize(bytes);
+    if (invalid == 2) bytes.Write(uint8_t{1});
+    BinaryReader reader(bytes.Data());
+    EXPECT_FALSE(ClientHandoff::Deserialize(reader).HasValue());
+  }
+}
+
+TEST(BaseAppMessages, AuthenticationCapabilityAndProcessIdentityAreStrict) {
+  Authenticate request;
+  request.session_key.bytes[0] = 1;
+  request.supports_handoff = true;
+  BinaryWriter writer;
+  request.Serialize(writer);
+  EXPECT_EQ(writer.Data().size(), static_cast<std::size_t>(request.Descriptor().fixed_length));
+  BinaryReader input(writer.Data());
+  auto parsed = Authenticate::Deserialize(input);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_TRUE(parsed->supports_handoff);
+  auto bytes = writer.Detach();
+  bytes.back() = std::byte{2};
+  BinaryReader invalid(bytes);
+  EXPECT_FALSE(Authenticate::Deserialize(invalid).HasValue());
+  AuthenticateResult reply;
+  reply.success = true;
+  reply.entity_id = 55;
+  reply.type_id = 7;
+  reply.process_instance = (uint64_t{1} << 40) + 222;
+  BinaryWriter result;
+  reply.Serialize(result);
+  for (std::size_t length = 0; length < result.Data().size(); ++length) {
+    BinaryReader truncated(result.Data().first(length));
+    EXPECT_FALSE(AuthenticateResult::Deserialize(truncated).HasValue());
+  }
+  BinaryReader reader(result.Data());
+  auto identity = AuthenticateResult::Deserialize(reader);
+  ASSERT_TRUE(identity.HasValue());
+  EXPECT_EQ(identity->process_instance, reply.process_instance);
+  result.Write(uint8_t{1});
+  BinaryReader trailing(result.Data());
+  EXPECT_FALSE(AuthenticateResult::Deserialize(trailing).HasValue());
+}
+
+TEST(BaseAppMessages, ClientHandoffRejectsTruncationTrailingAndInvalidPhase) {
+  PrepareClientHandoff request;
+  request.request_id = (uint64_t{1} << 40) + 3;
+  request.requester_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  request.username = "handoff-test";
+  request.expected.version = 8;
+  request.expected.phase = AccountSessionPhase::kPreparing;
+  request.expected.owner = {Address("127.0.0.1", 25001), 100, 111};
+  request.expected.target = {Address("127.0.0.1", 25002), 200, 222};
+  request.expected.handoff_id[0] = std::byte{1};
+  request.expected.credential_hash[0] = std::byte{2};
+  BinaryWriter writer;
+  request.Serialize(writer);
+  for (std::size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader reader(writer.Data().first(length));
+    EXPECT_FALSE(PrepareClientHandoff::Deserialize(reader).HasValue());
+  }
+  BinaryReader reader(writer.Data());
+  auto parsed = PrepareClientHandoff::Deserialize(reader);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed->request_id, request.request_id);
+  EXPECT_EQ(parsed->expected, request.expected);
+  writer.Write(uint8_t{1});
+  BinaryReader trailing(writer.Data());
+  EXPECT_FALSE(PrepareClientHandoff::Deserialize(trailing).HasValue());
+  for (int invalid = 0; invalid < 3; ++invalid) {
+    auto bad = request;
+    if (invalid == 0) bad.expected.phase = AccountSessionPhase::kAccepted;
+    if (invalid == 1) bad.username.assign(129, 'x');
+    if (invalid == 2) bad.requester_instance = 999;
+    BinaryWriter bytes;
+    bad.Serialize(bytes);
+    BinaryReader input(bytes.Data());
+    EXPECT_FALSE(PrepareClientHandoff::Deserialize(input).HasValue());
+  }
+}
+
+TEST(BaseAppMessages, ClientHandoffReplyRejectsTruncationAndInvalidStatus) {
+  PrepareClientHandoffReply reply;
+  reply.request_id = (uint64_t{1} << 40) + 3;
+  reply.requester_instance = 111;
+  reply.account_dbid = 42;
+  reply.account_type_id = 7;
+  reply.status = ErrorCode::kCommitUnknown;
+  reply.error = "commit not confirmed";
+  BinaryWriter writer;
+  reply.Serialize(writer);
+  for (std::size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader reader(writer.Data().first(length));
+    EXPECT_FALSE(PrepareClientHandoffReply::Deserialize(reader).HasValue());
+  }
+  BinaryReader reader(writer.Data());
+  auto parsed = PrepareClientHandoffReply::Deserialize(reader);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed->request_id, reply.request_id);
+  EXPECT_EQ(parsed->status, reply.status);
+  for (int invalid = 0; invalid < 3; ++invalid) {
+    auto bad = reply;
+    if (invalid == 0) bad.status = static_cast<ErrorCode>(UINT32_MAX);
+    if (invalid == 1) bad.error.assign(513, 'x');
+    BinaryWriter bytes;
+    bad.Serialize(bytes);
+    if (invalid == 2) bytes.Write(uint8_t{1});
+    BinaryReader input(bytes.Data());
+    EXPECT_FALSE(PrepareClientHandoffReply::Deserialize(input).HasValue());
+  }
+}
+
+TEST(BaseAppMessages, SessionRevocationRejectsTruncationTrailingAndMissingIdentity) {
+  RevokeAccountSession request;
+  request.request_id = (uint64_t{1} << 40) + 7;
+  request.requester_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  request.version = 9;
+  request.owner = {Address("127.0.0.1", 25001), 100, 222};
+  BinaryWriter writer;
+  request.Serialize(writer);
+  const auto bytes = writer.Data();
+  for (std::size_t length = 0; length < bytes.size(); ++length) {
+    BinaryReader truncated(bytes.first(length));
+    EXPECT_FALSE(RevokeAccountSession::Deserialize(truncated).HasValue());
+  }
+  BinaryReader reader(bytes);
+  auto parsed = RevokeAccountSession::Deserialize(reader);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed->request_id, request.request_id);
+  EXPECT_EQ(parsed->owner, request.owner);
+  writer.Write(uint8_t{1});
+  BinaryReader trailing(writer.Data());
+  EXPECT_FALSE(RevokeAccountSession::Deserialize(trailing).HasValue());
+  request.owner.process_instance = 0;
+  BinaryWriter invalid;
+  request.Serialize(invalid);
+  BinaryReader missing(invalid.Data());
+  EXPECT_FALSE(RevokeAccountSession::Deserialize(missing).HasValue());
+}
+
+TEST(BaseAppMessages, SessionRevocationReplyPreservesCorrelationAndError) {
+  RevokeAccountSessionReply reply;
+  reply.request_id = (uint64_t{1} << 40) + 7;
+  reply.requester_instance = 111;
+  reply.account_dbid = 42;
+  reply.account_type_id = 7;
+  reply.version = 9;
+  reply.status = ErrorCode::kCommitUnknown;
+  reply.error = "commit outcome unavailable";
+  BinaryWriter writer;
+  reply.Serialize(writer);
+  for (std::size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader truncated(writer.Data().first(length));
+    EXPECT_FALSE(RevokeAccountSessionReply::Deserialize(truncated).HasValue());
+  }
+  BinaryReader reader(writer.Data());
+  auto parsed = RevokeAccountSessionReply::Deserialize(reader);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed->request_id, reply.request_id);
+  EXPECT_EQ(parsed->version, reply.version);
+  EXPECT_EQ(parsed->status, reply.status);
+  reply.error.assign(513, 'x');
+  BinaryWriter invalid;
+  reply.Serialize(invalid);
+  BinaryReader oversized(invalid.Data());
+  EXPECT_FALSE(RevokeAccountSessionReply::Deserialize(oversized).HasValue());
+}
 
 template <typename Msg>
 auto round_trip(const Msg& msg) -> std::optional<Msg> {
@@ -46,19 +238,6 @@ TEST(BaseAppMessages, CreateBaseFromDB) {
   EXPECT_EQ(rt->type_id, 7u);
   EXPECT_EQ(rt->dbid, 999);
   EXPECT_EQ(rt->identifier, "player_001");
-}
-
-TEST(BaseAppMessages, AcceptClient) {
-  AcceptClient msg;
-  msg.dest_entity_id = 77;
-  msg.session_key.bytes[0] = 0xDE;
-  msg.session_key.bytes[31] = 0xAD;
-
-  auto rt = round_trip(msg);
-  ASSERT_TRUE(rt.has_value());
-  EXPECT_EQ(rt->dest_entity_id, 77u);
-  EXPECT_EQ(rt->session_key.bytes[0], 0xDE);
-  EXPECT_EQ(rt->session_key.bytes[31], 0xAD);
 }
 
 TEST(BaseAppMessages, CellEntityCreated) {

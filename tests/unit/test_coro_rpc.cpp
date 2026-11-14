@@ -472,6 +472,38 @@ TEST_F(PendingRpcRegistryTest, CancelAll) {
   EXPECT_EQ(registry.PendingCount(), 0u);
 }
 
+TEST_F(PendingRpcRegistryTest, SessionRepliesMatchFullWidthIds) {
+  for (const auto reply_id : {msg_id::Id(msg_id::DBApp::kAccountSessionReply),
+                              msg_id::Id(msg_id::BaseApp::kRevokeAccountSessionReply),
+                              msg_id::Id(msg_id::BaseApp::kPrepareClientHandoffReply)}) {
+    PendingRpcRegistry registry(dispatcher_);
+    constexpr uint64_t kLow = 7;
+    constexpr uint64_t kHigh = (uint64_t{1} << 40) + kLow;
+    bool low = false;
+    bool high = false;
+    registry.RegisterPending(
+        reply_id, kLow, [&](std::span<const std::byte>) { low = true; }, [](Error) {},
+        Milliseconds(5000));
+    registry.RegisterPending(
+        reply_id, kHigh, [&](std::span<const std::byte>) { high = true; }, [](Error) {},
+        Milliseconds(5000));
+    BinaryWriter truncated;
+    truncated.Write(static_cast<uint32_t>(kLow));
+    EXPECT_FALSE(registry.TryDispatch(reply_id, truncated.Data()));
+    BinaryWriter first;
+    first.Write(kHigh);
+    EXPECT_TRUE(registry.TryDispatch(reply_id, first.Data()));
+    EXPECT_TRUE(high);
+    EXPECT_FALSE(low);
+    EXPECT_FALSE(registry.TryDispatch(reply_id, first.Data()));
+    BinaryWriter second;
+    second.Write(kLow);
+    EXPECT_TRUE(registry.TryDispatch(reply_id, second.Data()));
+    EXPECT_TRUE(low);
+    EXPECT_EQ(registry.PendingCount(), 0u);
+  }
+}
+
 TEST_F(PendingRpcRegistryTest, PayloadTooSmallNotConsumed) {
   PendingRpcRegistry registry(dispatcher_);
 

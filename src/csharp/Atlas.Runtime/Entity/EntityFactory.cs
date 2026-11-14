@@ -50,15 +50,8 @@ public static class EntityFactory
     public static ushort GetTypeId(string typeName) =>
         _typeIdByName.TryGetValue(typeName, out var id) ? id : (ushort)0;
 
-    /// <summary>
-    /// Creates a new base entity of the named type on the local BaseApp
-    /// and returns it. <paramref name="spaceId"/> is forwarded to the cell
-    /// side for has_cell types (ignored for base-only). Witness attachment
-    /// happens later via the client-bind path; call
-    /// <see cref="ServerEntity.SetAoIRadius"/> after
-    /// <see cref="ServerEntity.GiveClientTo"/> to override the default
-    /// AoI radius.
-    /// </summary>
+    // Cell-bearing types use spaceId; witness attachment follows client binding.
+    // Await GiveClientToAsync before overriding the destination's AoI radius.
     public static BaseServerEntity? CreateBase(string typeName, uint spaceId = 1)
     {
         var typeId = GetTypeId(typeName);

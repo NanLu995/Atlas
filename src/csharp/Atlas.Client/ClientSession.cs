@@ -208,6 +208,9 @@ public sealed class ClientSession
                 case ClientCallbacks.kEntityTransferredMessageId:
                     DispatchEntityTransferred(body);
                     break;
+                case ClientCallbacks.kClientHandoffMessageId:
+                    Reset();
+                    break;
                 case ClientCallbacks.kCellReadyMessageId:
                     if (body.Length == sizeof(uint))
                     {

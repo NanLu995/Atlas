@@ -240,7 +240,7 @@ The UEClient Output Log should show, in order:
 
 ```
 LogAtlasUE: Loaded ATDF from ...entity_defs.bin; digest_size=32
-LogAtlasUE: AtlasUE module started; atlas_net_client ABI=0x02050000
+LogAtlasUE: AtlasUE module started; atlas_net_client ABI=0x03000000
 LogUEClient: Atlas login host=127.0.0.1 port=20018 user=mvp_<guid>
 LogUEClient: Atlas login succeeded, authenticating
 LogUEClient: Sent Account.SelectAvatar(1) entity_id=<n>
@@ -381,6 +381,9 @@ With a second client connected, both see each other's lines — exercising the
 own_client → cell → AllClients broadcast path end-to-end.
 
 ### Persistence surface
+
+`SelectAvatar` awaits `GiveClientToAsync` before sending session information through the Avatar.
+A failed or uncertain ownership confirmation is reported in the server log.
 
 `Account.loginCount` and `Account.lastLogin` are `persistent="true"` and
 auto-round-trip through DBApp: `Account.SelectAvatar` increments the counter,

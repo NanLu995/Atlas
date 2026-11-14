@@ -12,8 +12,8 @@ extern "C" {
 #endif
 
 // ABI layout: [MAJOR:8][MINOR:8][PATCH:16]; Create rejects major mismatch or newer caller minor.
-// 0x02050000 adds transport impairment hooks for movement prediction validation.
-#define ATLAS_NET_ABI_VERSION 0x02050000u
+// 0x03000000 adds client handoff state and process-bound authentication replies.
+#define ATLAS_NET_ABI_VERSION 0x03000000u
 
 #define ATLAS_NET_OK 0
 #define ATLAS_NET_ERR_BUSY -16
@@ -49,6 +49,7 @@ typedef enum AtlasNetState {
   ATLAS_NET_STATE_LOGIN_SUCCEEDED = 2,
   ATLAS_NET_STATE_AUTHENTICATING = 3,
   ATLAS_NET_STATE_CONNECTED = 4,
+  ATLAS_NET_STATE_HANDOFF = 5,
 } AtlasNetState;
 
 ATLAS_NET_API AtlasNetState AtlasNetGetState(AtlasNetContext* ctx);

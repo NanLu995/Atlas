@@ -1,6 +1,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -209,11 +210,25 @@ TEST(CellAppMgrMessages, CreateSpaceRequest_RoundTrip) {
   msg.space_id = 999;
   msg.request_id = 42;
   msg.reply_addr = Address(0x0A000003u, 20003);
+  msg.reuse_existing = true;
   auto rt = RoundTrip(msg);
   ASSERT_TRUE(rt.has_value());
   EXPECT_EQ(rt->space_id, 999u);
   EXPECT_EQ(rt->request_id, 42u);
   EXPECT_EQ(rt->reply_addr.Port(), 20003u);
+  EXPECT_TRUE(rt->reuse_existing);
+}
+
+TEST(CellAppMgrMessages, CreateSpaceRequestRejectsMissingOrInvalidReuseFlag) {
+  BinaryWriter writer;
+  CreateSpaceRequest{}.Serialize(writer);
+  std::vector<std::byte> bytes(writer.Data().begin(), writer.Data().end());
+  bytes.back() = std::byte{2};
+  BinaryReader invalid(bytes);
+  EXPECT_FALSE(CreateSpaceRequest::Deserialize(invalid));
+  bytes.pop_back();
+  BinaryReader truncated(bytes);
+  EXPECT_FALSE(CreateSpaceRequest::Deserialize(truncated));
 }
 
 TEST(CellAppMgrMessages, AddCellToSpace_RoundTrip) {

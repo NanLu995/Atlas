@@ -150,6 +150,39 @@ TEST(EntityManager, FlushDestroyed) {
   EXPECT_EQ(f.mgr.Size(), 1u);
 }
 
+TEST(EntityManager, ClearSessionRevokesRetiredKeys) {
+  TestFixture f;
+  auto* entity = f.mgr.Create(9, true);
+  ASSERT_NE(entity, nullptr);
+  const auto old_key = SessionKey::Generate();
+  const auto new_key = SessionKey::Generate();
+  ASSERT_TRUE(old_key.HasValue());
+  ASSERT_TRUE(new_key.HasValue());
+  ASSERT_TRUE(f.mgr.AssignSessionKey(entity->EntityId(), *old_key));
+  ASSERT_TRUE(f.mgr.AssignSessionKey(entity->EntityId(), *new_key));
+
+  ASSERT_TRUE(f.mgr.ClearSessionKey(entity->EntityId()));
+
+  EXPECT_EQ(f.mgr.FindProxyBySession(*old_key), nullptr);
+  EXPECT_EQ(f.mgr.FindProxyBySession(*new_key), nullptr);
+}
+
+TEST(EntityManager, DestroyingEntityCannotAuthenticateWithCurrentOrRetiredKey) {
+  TestFixture f;
+  auto* entity = f.mgr.Create(9, true);
+  ASSERT_NE(entity, nullptr);
+  const auto old_key = SessionKey::Generate();
+  const auto new_key = SessionKey::Generate();
+  ASSERT_TRUE(old_key.HasValue());
+  ASSERT_TRUE(new_key.HasValue());
+  ASSERT_TRUE(f.mgr.AssignSessionKey(entity->EntityId(), *old_key));
+  ASSERT_TRUE(f.mgr.AssignSessionKey(entity->EntityId(), *new_key));
+  entity->MarkForDestroy();
+
+  EXPECT_EQ(f.mgr.FindProxyBySession(*old_key), nullptr);
+  EXPECT_EQ(f.mgr.FindProxyBySession(*new_key), nullptr);
+}
+
 TEST(EntityManager, ForEach) {
   TestFixture f;
   f.mgr.Create(1, false);

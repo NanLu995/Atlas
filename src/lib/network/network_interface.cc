@@ -246,7 +246,7 @@ auto NetworkInterface::StartRudpServer(const Address& addr, const RudpProfile& a
   auto sock = Socket::CreateUdp();
   if (!sock) return sock.Error();
 
-  if (auto r = sock->SetReuseAddr(true); !r) return r.Error();
+  if (auto r = sock->SetReuseAddr(false); !r) return r.Error();
   if (auto r = sock->SetNonBlocking(true); !r) return r.Error();
   if (auto r = sock->SetRecvBufferSize(4 * 1024 * 1024); !r)
     ATLAS_LOG_WARNING("RUDP: failed to set recv buffer size: {}", r.Error().Message());
@@ -294,6 +294,7 @@ auto NetworkInterface::ConnectRudp(const Address& addr, const RudpProfile& profi
     auto sock = Socket::CreateUdp();
     if (!sock) return sock.Error();
 
+    if (auto r = sock->SetReuseAddr(false); !r) return r.Error();
     if (auto r = sock->SetNonBlocking(true); !r) return r.Error();
     if (auto r = sock->SetRecvBufferSize(4 * 1024 * 1024); !r)
       ATLAS_LOG_WARNING("RUDP: failed to set recv buffer size: {}", r.Error().Message());

@@ -15,5 +15,12 @@
     </method>
     <method name="ReadNotification" exposed="own_client" reply="int32" />
     <method name="AttachProbe" exposed="own_client" reply="uint32" />
+    <method name="HandoffLocation" exposed="own_client" reply="list[uint64]" />
+    <method name="HandoffClient" exposed="own_client" reply="int32">
+      <arg name="entityId" type="uint32" />
+      <arg name="baseIp" type="uint32" />
+      <arg name="basePort" type="uint16" />
+      <arg name="instance" type="uint64" />
+    </method>
   </base_methods>
 </entity>

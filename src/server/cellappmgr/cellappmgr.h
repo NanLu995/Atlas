@@ -14,6 +14,7 @@
 #include "bsp_tree.h"
 #include "cellappmgr_messages.h"
 #include "foundation/clock.h"
+#include "foundation/intrusive_ptr.h"
 #include "server/entity_types.h"
 #include "server/manager_app.h"
 
@@ -277,7 +278,7 @@ class CellAppMgr : public ManagerApp {
   struct PendingSpaceCreate {
     cellappmgr::CreateSpaceRequest msg;
     Address src;
-    Channel* ch;
+    IntrusivePtr<Channel> ch;
     TimePoint queued_at;
     TimePoint quiescence_deadline;
   };

@@ -143,7 +143,10 @@ def wait_for_registration(
             cwd=resolve_repo_root(),
             env=os.environ.copy(),
         )
-        if result.returncode == 0 and name in result.stdout:
-            return True
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[0] == proc_type and fields[1] == name:
+                    return True
         time.sleep(0.5)
     return False

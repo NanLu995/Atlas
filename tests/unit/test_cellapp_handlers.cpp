@@ -402,7 +402,8 @@ TEST_F(CellAppHandlersTest, GhostSnapshotRefreshUpdatesPersistentBlobFallback) {
   refresh.entity_id = 204;
   refresh.event_seq = 1;
   refresh.persistent_blob = {std::byte{0x44}, std::byte{0x55}, std::byte{0x66}};
-  app_.OnGhostSnapshotRefresh({}, nullptr, refresh);
+  app_.PeerRegistryForTest().InsertForTest(ghost.real_cellapp_addr, FakeChannel(0xBEEF));
+  app_.OnGhostSnapshotRefresh(ghost.real_cellapp_addr, FakeChannel(0xBEEF), refresh);
   ghost_calls_.clear();
 
   auto msg = MakeCreate(204, 1, {9, 0, 9});
@@ -898,7 +899,7 @@ TEST_F(CellAppHandlersTest, OffloadPreservesIsLocalFlag) {
   msg.direction = {1, 0, 0};
   msg.is_local = true;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   auto* real = app_.FindRealEntity(7777);
   ASSERT_NE(real, nullptr);
@@ -906,6 +907,19 @@ TEST_F(CellAppHandlersTest, OffloadPreservesIsLocalFlag) {
 
   app_.DestroyLocalEntity(7777);
   EXPECT_EQ(app_.FindRealEntity(7777), nullptr);
+}
+
+TEST_F(CellAppHandlersTest, OffloadRequiresTheRegisteredSourceChannel) {
+  cellapp::OffloadEntity msg;
+  msg.entity_id = 7777;
+  msg.type_id = 1;
+  msg.space_id = 1;
+  app_.OnOffloadEntity({}, nullptr, msg);
+  EXPECT_EQ(app_.FindRealEntity(msg.entity_id), nullptr);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xBEEF), msg);
+  EXPECT_EQ(app_.FindRealEntity(msg.entity_id), nullptr);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_NE(app_.FindRealEntity(msg.entity_id), nullptr);
 }
 
 TEST_F(CellAppHandlersTest, DestroyLocalEntityRefusesBaseOwnedEntity) {
@@ -1943,7 +1957,8 @@ TEST_F(CellAppHandlersTest, GhostPositionUpdateRejectsNaN) {
   upd.direction = {1, 0, 0};
   upd.on_ground = true;
   upd.volatile_seq = 1;
-  app_.OnGhostPositionUpdate({}, nullptr, upd);
+  app_.PeerRegistryForTest().InsertForTest(cg.real_cellapp_addr, FakeChannel(0xBEEF));
+  app_.OnGhostPositionUpdate(cg.real_cellapp_addr, FakeChannel(0xBEEF), upd);
 
   EXPECT_FLOAT_EQ(ghost->Position().x, 10.f);
   EXPECT_FLOAT_EQ(ghost->Position().z, 20.f);
@@ -2428,7 +2443,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityRejectsMismatchedGeometryVersion) {
   msg.target_cell_id = 2;
   msg.geometry_version = 4;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.FindRealEntity(7777), nullptr);
 }
 
@@ -2460,7 +2475,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityRejectsMissingTargetCell) {
   msg.target_cell_id = 99;
   msg.geometry_version = 5;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.FindRealEntity(7777), nullptr);
 }
 
@@ -2478,7 +2493,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityAcceptsMatchingGeometryTarget) {
   msg.target_cell_id = 2;
   msg.geometry_version = 5;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
   auto* real = app_.FindRealEntity(7777);
   ASSERT_NE(real, nullptr);
   EXPECT_TRUE(cell->HasRealEntity(real));
@@ -2502,7 +2517,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityRestoresMovementState) {
   msg.movement_state.flags = movement::kMovementFlagGrounded;
   msg.movement_state.last_processed_input_seq = 77;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   const auto* state = app_.MovementSystemForTest().state_store().Find(7779);
   ASSERT_NE(state, nullptr);
@@ -2536,7 +2551,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityRestoresMovementPositionHistory) {
   msg.movement_position_history.push_back(MovementPositionSample{30, first});
   msg.movement_position_history.push_back(MovementPositionSample{31, second});
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   const auto dest_tick = app_.MovementServerTickForTest();
   const auto* history = app_.MovementSystemForTest().position_history().Find(7781);
@@ -2569,7 +2584,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityRestoresMovementCommand) {
   msg.movement_command.elapsed_ms = 120;
   msg.movement_command.curve_id = 3;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   const auto* command = app_.MovementSystemForTest().command_store().Find(7782);
   ASSERT_NE(command, nullptr);
@@ -2595,7 +2610,7 @@ TEST_F(CellAppHandlersTest, OffloadEntityDropsUnsafeMovementState) {
   msg.movement_state.direction = msg.direction;
   msg.movement_state.flags = movement::kMovementFlagGrounded;
 
-  app_.OnOffloadEntity({}, nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   EXPECT_EQ(app_.MovementSystemForTest().state_store().Find(7780), nullptr);
 }
@@ -2699,11 +2714,226 @@ TEST_F(CellAppHandlersTest, OnDeleteGhostFiresDestroyGhostCallback) {
   ghost_calls_.clear();
 
   cellapp::DeleteGhost dg{600};
-  app_.OnDeleteGhost({}, FakeChannel(0xBEEF), dg);
+  const auto owner = MakeGhost(600).real_cellapp_addr;
+  app_.PeerRegistryForTest().InsertForTest(owner, FakeChannel(0xBEEF));
+  app_.OnDeleteGhost(owner, FakeChannel(0xBEEF), dg);
 
   ASSERT_EQ(ghost_calls_.size(), 1u);
   EXPECT_EQ(ghost_calls_[0].kind, GhostCall::kDestroyGhost);
   EXPECT_EQ(ghost_calls_[0].entity_id, 600u);
+}
+
+TEST_F(CellAppHandlersTest, GhostDeleteRejectsPreviousOwnerAndReplacedChannel) {
+  EnableGhostLifecycleCallbacks();
+  const auto create = MakeGhost(601);
+  auto* previous = FakeChannel(0xA001);
+  auto* current = FakeChannel(0xB001);
+  const Address owner("127.0.0.1", 26003);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, previous);
+  app_.PeerRegistryForTest().InsertForTest(owner, current);
+  app_.OnCreateGhost(create.real_cellapp_addr, previous, create);
+  auto* ghost = app_.FindEntity(601);
+  ASSERT_NE(ghost, nullptr);
+  ghost->RebindRealChannel(current, owner);
+  ghost_calls_.clear();
+  const cellapp::DeleteGhost remove{601};
+  app_.OnDeleteGhost(create.real_cellapp_addr, previous, remove);
+  app_.OnDeleteGhost(owner, previous, remove);
+  app_.OnDeleteGhost(owner, nullptr, remove);
+  ASSERT_EQ(app_.FindEntity(601), ghost);
+  EXPECT_TRUE(ghost_calls_.empty());
+  app_.OnDeleteGhost(owner, current, remove);
+  EXPECT_EQ(app_.FindEntity(601), nullptr);
+  ASSERT_EQ(ghost_calls_.size(), 1u);
+  EXPECT_EQ(ghost_calls_.front().kind, GhostCall::kDestroyGhost);
+}
+
+TEST_F(CellAppHandlersTest, GhostSetRealCannotRedirectAnEntityFromAnUnrelatedPeer) {
+  const auto create = MakeGhost(605);
+  auto* owner = FakeChannel(0xA005);
+  auto* unrelated = FakeChannel(0xB005);
+  const Address other("127.0.0.1", 26005);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, owner);
+  app_.PeerRegistryForTest().InsertForTest(other, unrelated);
+  app_.OnCreateGhost(create.real_cellapp_addr, owner, create);
+  auto* ghost = app_.FindEntity(605);
+  ASSERT_NE(ghost, nullptr);
+  cellapp::GhostSetReal redirect;
+  redirect.entity_id = 605;
+  redirect.new_real_addr = other;
+  app_.OnGhostSetReal(create.real_cellapp_addr, owner, redirect);
+  EXPECT_EQ(ghost->GetRealAddr(), create.real_cellapp_addr);
+  EXPECT_EQ(ghost->GetRealChannel(), owner);
+}
+
+TEST_F(CellAppHandlersTest, ReturnedGhostRejectsEarlierEpochDataFromTheSameHost) {
+  auto create = MakeGhost(607, {1, 0, 1});
+  create.cell_epoch = 2;
+  auto* channel = FakeChannel(0xA007);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, channel);
+  app_.OnCreateGhost(create.real_cellapp_addr, channel, create);
+  auto* ghost = app_.FindEntity(607);
+  ASSERT_NE(ghost, nullptr);
+  cellapp::GhostPositionUpdate position;
+  position.entity_id = 607;
+  position.position = {9, 0, 9};
+  position.volatile_seq = 99;
+  cellapp::GhostDelta delta;
+  delta.entity_id = 607;
+  delta.event_seq = 99;
+  delta.other_delta = {std::byte{1}};
+  cellapp::GhostSnapshotRefresh snapshot;
+  snapshot.entity_id = 607;
+  snapshot.event_seq = 99;
+  snapshot.persistent_blob = {std::byte{2}};
+  app_.OnGhostPositionUpdate(create.real_cellapp_addr, channel, position);
+  app_.OnGhostDelta(create.real_cellapp_addr, channel, delta);
+  app_.OnGhostSnapshotRefresh(create.real_cellapp_addr, channel, snapshot);
+  EXPECT_FLOAT_EQ(ghost->Position().x, 1.f);
+  EXPECT_TRUE(ghost->GhostPersistentBlob().empty());
+  EXPECT_EQ(ghost->GetReplicationState(), nullptr);
+  position.cell_epoch = delta.cell_epoch = snapshot.cell_epoch = 2;
+  app_.OnGhostPositionUpdate(create.real_cellapp_addr, channel, position);
+  app_.OnGhostDelta(create.real_cellapp_addr, channel, delta);
+  app_.OnGhostSnapshotRefresh(create.real_cellapp_addr, channel, snapshot);
+  EXPECT_FLOAT_EQ(ghost->Position().x, 9.f);
+  EXPECT_EQ(ghost->GhostPersistentBlob(), snapshot.persistent_blob);
+  ASSERT_NE(ghost->GetReplicationState(), nullptr);
+  EXPECT_EQ(ghost->GetReplicationState()->latest_event_seq, 99u);
+}
+
+TEST_F(CellAppHandlersTest, ReturnedGhostRejectsEarlierEpochDeletionFromTheSameHost) {
+  auto create = MakeGhost(608);
+  create.cell_epoch = 2;
+  auto* channel = FakeChannel(0xA008);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, channel);
+  app_.OnCreateGhost(create.real_cellapp_addr, channel, create);
+  auto* ghost = app_.FindEntity(608);
+  ASSERT_NE(ghost, nullptr);
+  app_.OnDeleteGhost(create.real_cellapp_addr, channel, cellapp::DeleteGhost{608});
+  EXPECT_EQ(app_.FindEntity(608), ghost);
+  app_.OnDeleteGhost(create.real_cellapp_addr, channel, cellapp::DeleteGhost{608, 2});
+  EXPECT_EQ(app_.FindEntity(608), nullptr);
+}
+
+TEST_F(CellAppHandlersTest, GhostUpdatesRejectPreviousOwnerAndReplacedChannel) {
+  const auto create = MakeGhost(602, {1, 0, 1});
+  auto* previous = FakeChannel(0xA002);
+  auto* current = FakeChannel(0xB002);
+  const Address owner("127.0.0.1", 26003);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, previous);
+  app_.PeerRegistryForTest().InsertForTest(owner, current);
+  app_.OnCreateGhost(create.real_cellapp_addr, previous, create);
+  auto* ghost = app_.FindEntity(602);
+  ASSERT_NE(ghost, nullptr);
+  ghost->RebindRealChannel(current, owner);
+  cellapp::GhostPositionUpdate position;
+  position.entity_id = 602;
+  position.position = {9, 0, 9};
+  position.volatile_seq = 1;
+  cellapp::GhostDelta delta;
+  delta.entity_id = 602;
+  delta.event_seq = 1;
+  delta.other_delta = {std::byte{0x11}};
+  cellapp::GhostSnapshotRefresh snapshot;
+  snapshot.entity_id = 602;
+  snapshot.event_seq = 2;
+  snapshot.other_snapshot = {std::byte{0x22}};
+  snapshot.persistent_blob = {std::byte{0x33}};
+  cellapp::GhostSetNextReal next;
+  next.entity_id = 602;
+  next.cell_epoch = 1;
+  next.next_real_addr = Address("127.0.0.1", 26004);
+  auto update = [&](const Address& source, Channel* channel) {
+    app_.OnGhostPositionUpdate(source, channel, position);
+    app_.OnGhostDelta(source, channel, delta);
+    app_.OnGhostSnapshotRefresh(source, channel, snapshot);
+    app_.OnGhostSetNextReal(source, channel, next);
+  };
+  update(create.real_cellapp_addr, previous);
+  update(owner, previous);
+  update(owner, nullptr);
+  EXPECT_FLOAT_EQ(ghost->Position().x, 1.f);
+  EXPECT_TRUE(ghost->GhostPersistentBlob().empty());
+  EXPECT_EQ(ghost->GetReplicationState(), nullptr);
+  EXPECT_EQ(ghost->NextRealAddr(), Address{});
+  update(owner, current);
+  EXPECT_FLOAT_EQ(ghost->Position().x, 9.f);
+  EXPECT_EQ(ghost->GhostPersistentBlob(), snapshot.persistent_blob);
+  ASSERT_NE(ghost->GetReplicationState(), nullptr);
+  EXPECT_EQ(ghost->GetReplicationState()->latest_event_seq, 2u);
+  EXPECT_EQ(ghost->NextRealAddr(), next.next_real_addr);
+}
+
+TEST_F(CellAppHandlersTest,
+       GhostOwnershipEpochRejectsLateHintsAndReplaysWithoutRequiringHintFirst) {
+  auto create = MakeGhost(606);
+  create.cell_epoch = 8;
+  auto* original = FakeChannel(0xA006);
+  auto* target = FakeChannel(0xB006);
+  const Address destination("127.0.0.1", 26006);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, original);
+  app_.PeerRegistryForTest().InsertForTest(destination, target);
+  app_.OnCreateGhost(create.real_cellapp_addr, original, create);
+  auto* ghost = app_.FindEntity(606);
+  ASSERT_NE(ghost, nullptr);
+  EXPECT_EQ(ghost->CellEpoch(), 8u);
+  cellapp::GhostSetReal moved;
+  moved.entity_id = 606;
+  moved.new_real_addr = destination;
+  moved.previous_real_addr = create.real_cellapp_addr;
+  moved.cell_epoch = 9;
+  app_.OnGhostSetReal(destination, original, moved);
+  EXPECT_EQ(ghost->CellEpoch(), 8u);
+  app_.OnGhostSetReal(destination, target, moved);
+  EXPECT_EQ(ghost->GetRealAddr(), destination);
+  EXPECT_EQ(ghost->CellEpoch(), 9u);
+  cellapp::GhostSetNextReal late;
+  late.entity_id = 606;
+  late.next_real_addr = destination;
+  late.cell_epoch = 9;
+  app_.OnGhostSetNextReal(create.real_cellapp_addr, original, late);
+  EXPECT_EQ(ghost->NextRealAddr(), Address{});
+  auto restored = moved;
+  restored.previous_real_addr = destination;
+  restored.new_real_addr = create.real_cellapp_addr;
+  restored.cell_epoch = 10;
+  app_.OnGhostSetReal(create.real_cellapp_addr, original, restored);
+  EXPECT_EQ(ghost->CellEpoch(), 10u);
+  app_.OnGhostSetReal(destination, target, moved);
+  EXPECT_EQ(ghost->GetRealAddr(), create.real_cellapp_addr);
+  EXPECT_EQ(ghost->CellEpoch(), 10u);
+  late.next_real_addr = destination;
+  app_.OnGhostSetNextReal(create.real_cellapp_addr, original, late);
+  EXPECT_EQ(ghost->NextRealAddr(), Address{});
+}
+
+TEST_F(CellAppHandlersTest, GhostOwnershipDrainsReversedMigrationChain) {
+  auto create = MakeGhost(609);
+  create.cell_epoch = 8;
+  auto* original = FakeChannel(0xA009);
+  app_.PeerRegistryForTest().InsertForTest(create.real_cellapp_addr, original);
+  app_.OnCreateGhost(create.real_cellapp_addr, original, create);
+  auto* ghost = app_.FindEntity(609);
+  ASSERT_NE(ghost, nullptr);
+  const Address hosts[] = {create.real_cellapp_addr, Address("127.0.0.1", 26009),
+                           Address("127.0.0.1", 26010), Address("127.0.0.1", 26011)};
+  Channel* channels[] = {original, FakeChannel(0xB009), FakeChannel(0xC009), FakeChannel(0xD009)};
+  for (int i = 1; i <= 3; ++i) app_.PeerRegistryForTest().InsertForTest(hosts[i], channels[i]);
+  for (int i = 3; i >= 1; --i) {
+    cellapp::GhostSetReal moved;
+    moved.entity_id = create.entity_id;
+    moved.new_real_addr = hosts[i];
+    moved.previous_real_addr = hosts[i - 1];
+    moved.cell_epoch = 8 + i;
+    app_.OnGhostSetReal(hosts[i], channels[i], moved);
+    if (i > 1) {
+      EXPECT_EQ(ghost->CellEpoch(), 8u);
+    }
+  }
+  EXPECT_EQ(ghost->CellEpoch(), 11u);
+  EXPECT_EQ(ghost->GetRealAddr(), hosts[3]);
+  EXPECT_EQ(ghost->GetRealChannel(), channels[3]);
 }
 
 TEST_F(CellAppHandlersTest, OffloadOnExistingGhostFiresDestroyGhostThenRestoreEntity) {
@@ -2719,7 +2949,7 @@ TEST_F(CellAppHandlersTest, OffloadOnExistingGhostFiresDestroyGhostThenRestoreEn
   msg.direction = {1, 0, 0};
   // restore_entity_fn only fires when persistent_blob is non-empty.
   msg.persistent_blob = {std::byte{0x11}};
-  app_.OnOffloadEntity({}, /*ch=*/nullptr, msg);
+  app_.OnOffloadEntity({}, test_support::FakeChannel(0xFEED), msg);
 
   // destroy_ghost MUST run before restore_entity, else RestoreEntity sees an
   // existing C# Ghost instance and skips OnInit on the promoted Real.

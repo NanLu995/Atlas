@@ -16,7 +16,7 @@ namespace atlas {
 
 template <typename T>
 concept RpcReplyMessage = NetworkMessage<T> && requires(const T& msg) {
-  { msg.request_id } -> std::convertible_to<uint32_t>;
+  { msg.request_id } -> std::convertible_to<uint64_t>;
 };
 
 template <RpcReplyMessage Reply, NetworkMessage Request>

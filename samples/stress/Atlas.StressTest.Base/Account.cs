@@ -7,7 +7,7 @@ namespace Atlas.StressTest.Base;
 [Entity("Account")]
 public partial class Account : BaseServerEntity
 {
-    public partial void SelectAvatar(int avatarIndex)
+    public async partial void SelectAvatar(int avatarIndex)
     {
         const int SpaceMask = 0xFFFF;
         int spawnCode = avatarIndex > 0 ? avatarIndex >> 16 : 0;
@@ -28,7 +28,12 @@ public partial class Account : BaseServerEntity
         Log.Info(
             $"[StressTest.Base] SelectAvatar: created StressAvatar entity={avatar.EntityId} in space={spaceId}, handing off client");
 
-        GiveClientTo(avatar.EntityId);
+        var moved = await GiveClientToAsync(avatar.EntityId);
+        if (!moved.IsOk)
+        {
+            Log.Error($"[StressTest.Base] Client transfer failed: {moved.ErrorMessage}");
+            return;
+        }
         avatar.SetAoIRadius(50f, 5f);
     }
 

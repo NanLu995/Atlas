@@ -2,6 +2,9 @@
 
 #include "db/database_factory.h"
 #include "db/idatabase.h"
+#include "platform/dynamic_library.h"
+#include "platform/filesystem.h"
+#include "platform/platform_config.h"
 
 using namespace atlas;
 
@@ -71,6 +74,21 @@ TEST(DatabaseTypes, CreateDatabaseSupportsSqlite) {
 TEST(DatabaseTypes, DatabaseConfigDefaultsToMysql) {
   DatabaseConfig cfg;
   EXPECT_EQ(cfg.type, "mysql");
+}
+
+TEST(DatabaseTypes, SqlitePluginExportsOnlyTheCurrentDatabaseInterface) {
+  auto executable = fs::ExecutablePath();
+  ASSERT_TRUE(executable.HasValue());
+#if ATLAS_PLATFORM_WINDOWS
+  const auto path = executable->parent_path() / "atlas_db_sqlite.dll";
+#else
+  const auto path = executable->parent_path() / "libatlas_db_sqlite.so";
+#endif
+  auto library = DynamicLibrary::Load(path);
+  ASSERT_TRUE(library.HasValue());
+  using CreateFn = IDatabase* (*)();
+  EXPECT_TRUE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV2").HasValue());
+  EXPECT_FALSE(library->GetSymbol<CreateFn>("AtlasCreateDatabase").HasValue());
 }
 
 TEST(DatabaseTypes, CreateDatabaseRejectsRemovedXmlBackend) {

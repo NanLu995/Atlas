@@ -28,7 +28,8 @@ def parse_args() -> argparse.Namespace:
         description="Spawn a minimal Atlas cluster (machined + dbapp + baseappmgr + "
         "loginapp + baseapp) on 127.0.0.1 for integration testing. Outputs a "
         "READY line to stdout once every process has registered, then blocks "
-        "until stdin is closed before tearing the cluster down.",
+        "until stdin is closed before tearing the cluster down. Stdin accepts "
+        "kill-baseapp or restart-baseapp <internal-port> for this launcher's own BaseApps.",
     )
     parser.add_argument("--build-dir", default="debug",
                         help="Subdirectory of bin/ where binaries live (default: debug).")
@@ -36,6 +37,8 @@ def parse_args() -> argparse.Namespace:
                         help="BaseApp script assembly (default: bin/<build-dir>/Atlas.Runtime.dll).")
     parser.add_argument("--cell-assembly", type=Path,
                         help="Also start CellAppMgr and one CellApp with this script assembly.")
+    parser.add_argument("--baseapps", type=int, choices=(1, 2), default=1,
+                        help="Number of BaseApps; use 2 for client handoff verification (default: 1).")
     parser.add_argument("--port-base", type=int, default=0,
                         help="Lowest port to use; 0 = auto-pick a free range.")
     # Allow database initialization and cold .NET JIT startup.
@@ -97,6 +100,37 @@ _RC_RETRY = -42
 _EARLY_EXIT_GRACE_SEC = 2.0
 
 
+def _kill_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int) -> None:
+    index = next((i for i, pair in enumerate(ports) if pair[0] == port), None)
+    if index is None:
+        raise RuntimeError(f"BaseApp port {port} is not in this test cluster")
+    name = 'baseapp' if index == 0 else 'baseapp-2'
+    process = next(entry.process for entry in processes if entry.name == name)
+    if process.poll() is not None:
+        raise RuntimeError(f"{name} already exited; inspect its test cluster log")
+    process.kill()
+    process.wait(timeout=5)
+
+
+def _restart_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int,
+                     repo_root: Path, log_dir: Path) -> None:
+    index = next((i for i, pair in enumerate(ports) if pair[0] == port), None)
+    if index is None:
+        raise RuntimeError(f"BaseApp port {port} is not in this test cluster")
+    name = 'baseapp' if index == 0 else 'baseapp-2'
+    entry_index = next(i for i, entry in enumerate(processes) if entry.name == name)
+    previous = processes[entry_index]
+    if previous.process.poll() is None:
+        raise RuntimeError(f"{name} is still running; kill it before restart")
+    arguments = previous.process.args
+    restart_logs = log_dir / 'restarts' / f'{name}-{time.monotonic_ns()}'
+    restart_logs.mkdir(parents=True)
+    replacement = start_logged_process(name=name, file_path=Path(arguments[0]),
+        arguments=arguments[1:], working_directory=repo_root, log_directory=restart_logs)
+    replacement.start_order = previous.start_order
+    processes[entry_index] = replacement
+
+
 def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     # machined_app.cc binds UDP heartbeat to internal_port+1 and mesh to
     # internal_port+2, so peers start at port_base+3.
@@ -141,7 +175,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     db_dir.mkdir(parents=True, exist_ok=True)
 
     database = database_config(args, db_dir / 'test_cluster.sqlite3')
-    record_database_run(run_root, database, cellapps=1 if args.cell_assembly else 0)
+    record_database_run(run_root, database, baseapps=args.baseapps,
+                        cellapps=1 if args.cell_assembly else 0)
 
     machined_address = f"127.0.0.1:{machined_port}"
     db_config_path.write_text(
@@ -205,17 +240,22 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--update-hertz", "50", "--log-level", "info"]))
             processes[-1].start_order = 3
 
-        processes.append(start_logged_process(
-            name="baseapp", file_path=baseapp,
-            working_directory=repo_root, log_directory=log_dir,
-            arguments=["--type", "baseapp", "--name", "baseapp",
-                       "--machined", machined_address,
-                       "--internal-port", str(baseapp_internal_port),
-                       "--external-port", str(baseapp_external_port),
-                       "--assembly", str(base_assembly),
-                       "--runtime-config", str(runtime_config),
-                       "--update-hertz", "50", "--log-level", "info"]))
-        processes[-1].start_order = 4
+        baseapp_ports = [(baseapp_internal_port, baseapp_external_port)]
+        if args.baseapps == 2:
+            baseapp_ports.append((port_base + 10, port_base + 11))
+        for index, (internal_port, external_port) in enumerate(baseapp_ports):
+            name = "baseapp" if index == 0 else "baseapp-2"
+            processes.append(start_logged_process(
+                name=name, file_path=baseapp,
+                working_directory=repo_root, log_directory=log_dir,
+                arguments=["--type", "baseapp", "--name", name,
+                           "--machined", machined_address,
+                           "--internal-port", str(internal_port),
+                           "--external-port", str(external_port),
+                           "--assembly", str(base_assembly),
+                           "--runtime-config", str(runtime_config),
+                           "--update-hertz", "50", "--log-level", "info"]))
+            processes[-1].start_order = 4
 
         processes.append(start_logged_process(
             name="loginapp", file_path=loginapp,
@@ -254,6 +294,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         ]
         if args.cell_assembly:
             ready_targets.extend([("cellappmgr", "cellappmgr"), ("cellapp", "cellapp")])
+        if args.baseapps == 2:
+            ready_targets.append(("baseapp", "baseapp-2"))
         for proc_type, name in ready_targets:
             if not wait_for_registration(
                 atlas_tool=atlas_tool, machined_address=machined_address,
@@ -267,14 +309,24 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         print(
             f"READY loginapp_port={loginapp_port} baseapp_external_port={baseapp_external_port} "
             f"machined_port={machined_port} log_dir={log_dir} db_backend={args.db_backend} "
-            f"dbapps=1 cellapps={1 if args.cell_assembly else 0}",
+            f"dbapps=1 baseapps={args.baseapps} cellapps={1 if args.cell_assembly else 0} "
+            f"baseapp_internal_ports={','.join(str(p[0]) for p in baseapp_ports)} "
+            f"baseapp_external_ports={','.join(str(p[1]) for p in baseapp_ports)}",
             flush=True,
         )
 
-        # Block until stdin closes (parent disposes / CTRL-C). readline returns
-        # '' on EOF; CTRL-C raises KeyboardInterrupt which falls through to finally.
-        for _ in iter(sys.stdin.readline, ""):
-            pass
+        for line in iter(sys.stdin.readline, ""):
+            command = line.split()
+            if (len(command) != 2 or command[0] not in ('kill-baseapp', 'restart-baseapp')
+                    or not command[1].isdigit()):
+                raise RuntimeError("expected kill-baseapp or restart-baseapp <internal-port>")
+            port = int(command[1])
+            if command[0] == 'kill-baseapp':
+                _kill_baseapp(processes, baseapp_ports, port)
+                print(f"KILLED baseapp_internal_port={port}", flush=True)
+            else:
+                _restart_baseapp(processes, baseapp_ports, port, repo_root, log_dir)
+                print(f"RESTARTED baseapp_internal_port={port}", flush=True)
         return 0
     except KeyboardInterrupt:
         return 0

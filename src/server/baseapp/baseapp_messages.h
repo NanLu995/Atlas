@@ -87,39 +87,6 @@ struct CreateBaseFromDB {
 };
 static_assert(NetworkMessage<CreateBaseFromDB>);
 
-struct AcceptClient {
-  EntityID dest_entity_id{kInvalidEntityID};
-  SessionKey session_key;
-
-  static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kAcceptClient),
-                                   "baseapp::AcceptClient",
-                                   MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(uint32_t) + sizeof(SessionKey)),
-                                   MessageReliability::kReliable,
-                                   MessageUrgency::kImmediate};
-    return kDesc;
-  }
-
-  void Serialize(BinaryWriter& w) const {
-    w.Write(dest_entity_id);
-    w.WriteBytes(std::span<const std::byte>(reinterpret_cast<const std::byte*>(session_key.bytes),
-                                            sizeof(session_key.bytes)));
-  }
-
-  static auto Deserialize(BinaryReader& r) -> Result<AcceptClient> {
-    auto eid = r.Read<uint32_t>();
-    if (!eid) return Error{ErrorCode::kInvalidArgument, "AcceptClient: truncated"};
-    auto key_span = r.ReadBytes(sizeof(SessionKey));
-    if (!key_span) return Error{ErrorCode::kInvalidArgument, "AcceptClient: key truncated"};
-    AcceptClient msg;
-    msg.dest_entity_id = *eid;
-    std::memcpy(msg.session_key.bytes, key_span->data(), sizeof(SessionKey));
-    return msg;
-  }
-};
-static_assert(NetworkMessage<AcceptClient>);
-
 struct CellEntityCreated {
   EntityID entity_id{kInvalidEntityID};
   Address cell_addr;
@@ -631,12 +598,13 @@ static_assert(NetworkMessage<ReplicatedBaselineToClient>);
 
 struct Authenticate {
   SessionKey session_key;
+  bool supports_handoff{false};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kAuthenticate),
                                    "baseapp::Authenticate",
                                    MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(SessionKey)),
+                                   static_cast<int>(sizeof(SessionKey) + sizeof(uint8_t)),
                                    MessageReliability::kReliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
@@ -645,6 +613,7 @@ struct Authenticate {
   void Serialize(BinaryWriter& w) const {
     w.WriteBytes(std::span<const std::byte>(reinterpret_cast<const std::byte*>(session_key.bytes),
                                             sizeof(session_key.bytes)));
+    w.Write(static_cast<uint8_t>(supports_handoff));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<Authenticate> {
@@ -652,6 +621,10 @@ struct Authenticate {
     if (!key_span) return Error{ErrorCode::kInvalidArgument, "Authenticate: key truncated"};
     Authenticate msg;
     std::memcpy(msg.session_key.bytes, key_span->data(), sizeof(SessionKey));
+    auto handoff = r.Read<uint8_t>();
+    if (!handoff || *handoff > 1 || r.Remaining() != 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid client handoff capability"};
+    msg.supports_handoff = *handoff != 0;
     return msg;
   }
 };
@@ -662,6 +635,7 @@ struct AuthenticateResult {
   EntityID entity_id{kInvalidEntityID};
   uint16_t type_id{0};
   std::string error;
+  uint64_t process_instance{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kAuthenticateResult),
@@ -678,6 +652,7 @@ struct AuthenticateResult {
     w.Write(entity_id);
     w.Write(type_id);
     w.WriteString(error);
+    w.Write(process_instance);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<AuthenticateResult> {
@@ -685,13 +660,15 @@ struct AuthenticateResult {
     auto eid = r.Read<uint32_t>();
     auto ti = r.Read<uint16_t>();
     auto err = r.ReadString();
-    if (!ok || !eid || !ti || !err)
+    auto instance = r.Read<uint64_t>();
+    if (!ok || !eid || !ti || !err || !instance || *ok > 1 || r.Remaining() != 0)
       return Error{ErrorCode::kInvalidArgument, "AuthenticateResult: truncated"};
     AuthenticateResult msg;
     msg.success = (*ok != 0);
     msg.entity_id = *eid;
     msg.type_id = *ti;
     msg.error = std::move(*err);
+    msg.process_instance = *instance;
     return msg;
   }
 };

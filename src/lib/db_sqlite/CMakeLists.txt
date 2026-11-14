@@ -2,6 +2,7 @@
 
 add_library(atlas_db_sqlite STATIC
   sqlite_database.cc
+  sqlite_account_session.cc
   sqlite_write_receipts.cc
 )
 

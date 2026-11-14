@@ -1,11 +1,6 @@
-// Cross-space teleport (cellapp side) tests.
-//
-// Drives CellApp::RequestTeleport / OnResolveSpaceHostReply / OnOffloadEntity
-// on a ctor-only CellApp (no Init) with a hand-seeded Space + Real entity.
-// Covers anchor-missing rejection, the resolve round-trip, the offload kick
-// (Real->Ghost + OffloadEntity(is_teleport)), and the unhosted-target guard.
-
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -29,6 +24,21 @@
 #include "space.h"
 
 namespace atlas {
+
+struct CellAppTeleportTestAccess {
+  static void LocalRehome(CellApp& app, CellEntity& entity, cellapp::OffloadEntity message) {
+    app.LocalTeleportRehome(entity, std::move(message));
+  }
+  static auto Succeeded(const CellApp& app) -> uint64_t { return app.teleport_succeeded_total_; }
+  static void Offload(CellApp& app, CellEntity& entity, Channel* channel, const Address& address,
+                      cellapp::OffloadEntity message) {
+    app.ProcessOffload(entity, channel, address, std::move(message));
+  }
+  static void ExhaustRequestIds(CellApp& app) {
+    app.next_teleport_request_id_ = std::numeric_limits<uint32_t>::max();
+  }
+};
+
 namespace {
 
 class RecordingChannel final : public Channel {
@@ -40,6 +50,7 @@ class RecordingChannel final : public Channel {
     return data.size();
   }
   [[nodiscard]] auto Sends() const -> const std::vector<std::vector<std::byte>>& { return sends_; }
+  void ClearSends() { sends_.clear(); }
 
  private:
   std::vector<std::vector<std::byte>> sends_;
@@ -166,6 +177,80 @@ TEST(Teleport, ResolveUnknownRequestIsNoop) {
   EXPECT_EQ(h.app.PendingTeleportsForTest().size(), 0u);
 }
 
+TEST(Teleport, ConcurrentRequestForSameEntityIsRejected) {
+  Harness h;
+  SeedReal(h, 100, 1);
+  ASSERT_TRUE(h.app.RequestTeleport(100, 2, {}, {}));
+  EXPECT_FALSE(h.app.RequestTeleport(100, 3, {}, {}));
+  EXPECT_EQ(h.app.PendingTeleportsForTest().size(), 1u);
+  EXPECT_EQ(CountRequests(*h.mgr_ch), 1u);
+}
+
+TEST(Teleport, ExhaustedRequestIdsCannotAliasEarlierReplies) {
+  Harness h;
+  SeedReal(h, 100, 1);
+  CellAppTeleportTestAccess::ExhaustRequestIds(h.app);
+  ASSERT_TRUE(h.app.RequestTeleport(100, 2, {}, {}));
+  ASSERT_TRUE(h.app.PendingTeleportsForTest().contains(std::numeric_limits<uint32_t>::max()));
+  h.app.PendingTeleportsForTest().clear();
+  EXPECT_FALSE(h.app.RequestTeleport(100, 2, {}, {}));
+  EXPECT_TRUE(h.app.PendingTeleportsForTest().empty());
+  EXPECT_EQ(CountRequests(*h.mgr_ch), 1u);
+}
+
+TEST(Teleport, ResolveReplyMustMatchEntityAndSpaceBeforeConsumingRequest) {
+  Harness h;
+  auto* entity = SeedReal(h, 100, 1);
+  ASSERT_TRUE(h.app.RequestTeleport(100, 2, {}, {}));
+  const auto rid = h.app.PendingTeleportsForTest().begin()->first;
+  cellappmgr::ResolveSpaceHostReply reply;
+  reply.request_id = rid;
+  reply.entity_id = 101;
+  reply.space_id = 2;
+  h.app.OnResolveSpaceHostReply({}, h.mgr_ch, reply);
+  EXPECT_EQ(h.app.PendingTeleportsForTest().size(), 1u);
+  reply.entity_id = 100;
+  reply.space_id = 3;
+  h.app.OnResolveSpaceHostReply({}, h.mgr_ch, reply);
+  EXPECT_EQ(h.app.PendingTeleportsForTest().size(), 1u);
+  reply.space_id = 2;
+  h.app.OnResolveSpaceHostReply({}, h.mgr_ch, reply);
+  EXPECT_TRUE(h.app.PendingTeleportsForTest().empty());
+  EXPECT_TRUE(entity->IsReal());
+}
+
+TEST(Teleport, ResolveCannotMigrateANewerEntityEpoch) {
+  Harness h;
+  auto* entity = SeedReal(h, 100, 1);
+  const auto target = MakeAddr(40000);
+  auto* peer = RecordingChan();
+  h.app.PeerRegistryForTest().InsertForTest(target, peer);
+  ASSERT_TRUE(h.app.RequestTeleport(100, 2, {}, {}));
+  entity->SetCellEpoch(entity->CellEpoch() + 1);
+  cellappmgr::ResolveSpaceHostReply reply;
+  reply.request_id = h.app.PendingTeleportsForTest().begin()->first;
+  reply.entity_id = 100;
+  reply.space_id = 2;
+  reply.found = true;
+  reply.host_addr = target;
+  h.app.OnResolveSpaceHostReply({}, h.mgr_ch, reply);
+  EXPECT_TRUE(entity->IsReal());
+  EXPECT_TRUE(h.app.PendingTeleportsForTest().empty());
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+  EXPECT_TRUE(peer->Sends().empty());
+}
+
+TEST(Teleport, ExhaustedEpochRejectsBeforeRequestOrPoseChange) {
+  Harness h;
+  auto* entity = SeedReal(h, 100, 1);
+  const auto before = entity->Position();
+  entity->SetCellEpoch(std::numeric_limits<uint32_t>::max());
+  EXPECT_FALSE(h.app.RequestTeleport(100, 2, {7, 0, 8}, {}));
+  EXPECT_TRUE(h.app.PendingTeleportsForTest().empty());
+  EXPECT_EQ(CountRequests(*h.mgr_ch), 0u);
+  EXPECT_EQ(entity->Position(), before);
+}
+
 TEST(Teleport, ResolveFoundOffloadsToTargetAsTeleport) {
   Harness h;
   auto* entity = SeedReal(h, /*id=*/100, /*sid=*/1);
@@ -197,6 +282,63 @@ TEST(Teleport, ResolveFoundOffloadsToTargetAsTeleport) {
   EXPECT_EQ(off.geometry_version, 0u);
   EXPECT_FLOAT_EQ(off.position.x, 7.f);
   EXPECT_FLOAT_EQ(off.position.z, 8.f);
+  EXPECT_EQ(entity->Position(), (math::Vector3{0, 0, 0}));
+  cellapp::OffloadEntityAck rejection;
+  rejection.entity_id = 100;
+  rejection.cell_epoch = off.cell_epoch;
+  rejection.reject_reason = cellapp::OffloadRejectReason::kTargetMissing;
+  h.app.OnOffloadEntityAck(target, peer_ch, rejection);
+  EXPECT_TRUE(entity->IsReal());
+  EXPECT_EQ(entity->GetSpace().Id(), 1u);
+  EXPECT_EQ(entity->Position(), (math::Vector3{0, 0, 0}));
+}
+
+TEST(Teleport, DuplicateOffloadReplaysSuccessWithoutResurrectingDestroyedEntity) {
+  Harness h;
+  const auto source = MakeAddr(50000);
+  auto* channel = RecordingChan();
+  h.app.PeerRegistryForTest().InsertForTest(source, channel);
+  cellapp::OffloadEntity msg;
+  msg.entity_id = 100;
+  msg.type_id = 1;
+  msg.space_id = 42;
+  msg.cell_epoch = 7;
+  h.app.OnOffloadEntity(source, channel, msg);
+  ASSERT_NE(h.app.FindEntity(100), nullptr);
+  EXPECT_EQ(h.app.FindEntity(100)->CellEpoch(), 8u);
+  EXPECT_TRUE(FirstAck(*channel).success);
+  channel->ClearSends();
+
+  h.app.OnOffloadEntity(source, channel, msg);
+  EXPECT_TRUE(FirstAck(*channel).success);
+  EXPECT_EQ(FirstAck(*channel).cell_epoch, 7u);
+  channel->ClearSends();
+  h.app.EntityPopulationForTest().erase(100);
+  h.app.FindSpace(42)->RemoveEntity(100);
+
+  h.app.OnOffloadEntity(source, channel, msg);
+
+  EXPECT_EQ(h.app.FindEntity(100), nullptr);
+  EXPECT_TRUE(FirstAck(*channel).success);
+}
+
+TEST(Teleport, InvalidControllerStateRejectsWithoutInstallingAReal) {
+  Harness h;
+  const auto source = MakeAddr(50000);
+  auto* channel = RecordingChan();
+  h.app.PeerRegistryForTest().InsertForTest(source, channel);
+  cellapp::OffloadEntity msg;
+  msg.entity_id = 100;
+  msg.type_id = 1;
+  msg.space_id = 42;
+  msg.controller_data = {std::byte{1}};
+
+  h.app.OnOffloadEntity(source, channel, msg);
+
+  EXPECT_EQ(h.app.FindEntity(100), nullptr);
+  const auto ack = FirstAck(*channel);
+  EXPECT_FALSE(ack.success);
+  EXPECT_EQ(ack.reject_reason, cellapp::OffloadRejectReason::kRestoreFailed);
 }
 
 TEST(Teleport, OnOffloadTeleportToUnhostedSpaceRejects) {
@@ -290,6 +432,140 @@ TEST(Teleport, RequestRejectedWhenPendingAtCap) {
   auto& pending = h.app.PendingTeleportsForTest();
   for (uint32_t i = 1; i <= 1024; ++i) pending[i] = CellApp::PendingTeleport{};  // kMaxPendingTeleports
   EXPECT_FALSE(h.app.RequestTeleport(100, /*target_space=*/2, {1, 0, 1}, {1, 0, 0}));
+}
+
+TEST(Teleport, LocalRestoreFailureKeepsSourceAndDoesNotReportSuccess) {
+  Harness h;
+  auto* source = SeedReal(h, 100, 1);
+  auto& spaces = h.app.Spaces();
+  auto* destination = spaces.emplace(2, std::make_unique<Space>(2)).first->second.get();
+  destination->AddLocalCell(std::make_unique<Cell>(*destination, 1, CellBounds{}));
+  BSPTree tree;
+  tree.InitSingleCell(CellInfo{1, h.app.ResolveSelfAddrForTest(), {}, 0.f, 0});
+  destination->SetBspTree(std::move(tree));
+  cellapp::OffloadEntity message;
+  message.entity_id = 100;
+  message.type_id = 1;
+  message.space_id = 2;
+  message.is_teleport = true;
+  message.controller_data = {std::byte{1}};
+  CellAppTeleportTestAccess::LocalRehome(h.app, *source, message);
+  EXPECT_EQ(CellAppTeleportTestAccess::Succeeded(h.app), 0u);
+  auto* restored = h.app.FindEntity(100);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(restored->IsReal());
+  EXPECT_EQ(restored->GetSpace().Id(), 1u);
+  EXPECT_TRUE(spaces.at(1)->FindLocalCell(7)->HasRealEntity(restored));
+  EXPECT_EQ(destination->FindEntity(100), nullptr);
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+}
+
+TEST(Teleport, FailedSendRetainsPassiveGhostAndRecoverySnapshot) {
+  Harness h;
+  auto* source = SeedReal(h, 100, 1);
+  auto* channel = RecordingChan();
+  channel->Condemn();
+  cellapp::OffloadEntity message;
+  message.entity_id = 100;
+  message.type_id = 1;
+  message.space_id = 1;
+  message.persistent_blob = {std::byte{7}};
+  CellAppTeleportTestAccess::Offload(h.app, *source, channel, MakeAddr(40000), message);
+  EXPECT_TRUE(source->IsGhost());
+  EXPECT_FALSE(h.app.FindSpace(1)->FindLocalCell(7)->HasRealEntity(source));
+  const auto& pending = h.app.PendingOffloadsForTest();
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_TRUE(pending.at(100).outcome_unknown);
+  EXPECT_EQ(pending.at(100).persistent_blob, message.persistent_blob);
+}
+
+TEST(Teleport, LocalRollbackFailureKeepsPassiveSourceAndSnapshot) {
+  Harness h;
+  auto* source = SeedReal(h, 100, 1);
+  auto* destination = h.app.Spaces().emplace(2, std::make_unique<Space>(2)).first->second.get();
+  destination->AddLocalCell(std::make_unique<Cell>(*destination, 1, CellBounds{}));
+  BSPTree tree;
+  tree.InitSingleCell(CellInfo{1, h.app.ResolveSelfAddrForTest(), {}, 0.f, 0});
+  destination->SetBspTree(std::move(tree));
+  auto provider = h.app.CreateNativeProviderForTest();
+  static CellApp* app;
+  app = &h.app;
+  auto restore = +[](uint32_t id, uint16_t, int64_t, const uint8_t*, int32_t) {
+    const auto pending = app->PendingOffloadsForTest().find(id);
+    if (pending != app->PendingOffloadsForTest().end())
+      pending->second.controller_blob = {std::byte{1}};
+  };
+  std::array<void*, 4> callbacks{reinterpret_cast<void*>(restore), nullptr, nullptr, nullptr};
+  h.app.NativeProvider()->SetNativeCallbacks(callbacks.data(), sizeof(callbacks));
+  cellapp::OffloadEntity message;
+  message.entity_id = 100;
+  message.type_id = 1;
+  message.space_id = 2;
+  message.is_teleport = true;
+  message.persistent_blob = {std::byte{7}};
+  message.controller_data = {std::byte{1}};
+  CellAppTeleportTestAccess::LocalRehome(h.app, *source, message);
+  app = nullptr;
+  EXPECT_EQ(h.app.FindEntity(100), source);
+  EXPECT_TRUE(source->IsGhost());
+  EXPECT_EQ(source->GetSpace().Id(), 1u);
+  EXPECT_FALSE(h.app.FindSpace(1)->FindLocalCell(7)->HasRealEntity(source));
+  const auto& pending = h.app.PendingOffloadsForTest();
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_TRUE(pending.at(100).outcome_unknown);
+  EXPECT_EQ(pending.at(100).persistent_blob, message.persistent_blob);
+  EXPECT_EQ(CellAppTeleportTestAccess::Succeeded(h.app), 0u);
+}
+
+TEST(Teleport, SameSpaceRehomeLeavesOneLiveEntity) {
+  Harness h;
+  auto* source = SeedReal(h, 100, 1);
+  auto* space = h.app.FindSpace(1);
+  BSPTree tree;
+  tree.InitSingleCell(CellInfo{7, h.app.ResolveSelfAddrForTest(), {}, 0.f, 0});
+  space->SetBspTree(std::move(tree));
+  cellapp::OffloadEntity message;
+  message.entity_id = 100;
+  message.type_id = 1;
+  message.space_id = 1;
+  message.is_teleport = true;
+  message.position = {3, 0, 4};
+  CellAppTeleportTestAccess::LocalRehome(h.app, *source, message);
+  auto* moved = h.app.FindEntity(100);
+  ASSERT_NE(moved, nullptr);
+  EXPECT_TRUE(moved->IsReal());
+  EXPECT_EQ(moved->Position(), message.position);
+  EXPECT_EQ(space->EntityCount(), 1u);
+  EXPECT_TRUE(space->FindLocalCell(7)->HasRealEntity(moved));
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+  EXPECT_EQ(CellAppTeleportTestAccess::Succeeded(h.app), 1u);
+}
+
+TEST(Teleport, FailedSendCanOnlyRollbackAfterExplicitMatchingRejection) {
+  Harness h;
+  auto* source = SeedReal(h, 100, 1);
+  source->SetPositionAndDirection({3, 0, 4}, {1, 0, 0});
+  auto* channel = RecordingChan();
+  const auto target = MakeAddr(40000);
+  h.app.PeerRegistryForTest().InsertForTest(target, channel);
+  channel->Condemn();
+  cellapp::OffloadEntity message;
+  message.entity_id = 100;
+  message.type_id = 1;
+  message.space_id = 2;
+  message.is_teleport = true;
+  message.position = {30, 0, 40};
+  CellAppTeleportTestAccess::Offload(h.app, *source, channel, target, message);
+  cellapp::OffloadEntityAck rejected;
+  rejected.entity_id = 100;
+  rejected.cell_epoch = message.cell_epoch;
+  rejected.success = false;
+  rejected.reject_reason = cellapp::OffloadRejectReason::kTargetMissing;
+  h.app.OnOffloadEntityAck(target, channel, rejected);
+  EXPECT_TRUE(source->IsReal());
+  EXPECT_EQ(source->Position(), (math::Vector3{3, 0, 4}));
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+  EXPECT_TRUE(h.app.FindSpace(1)->FindLocalCell(7)->HasRealEntity(source));
 }
 
 TEST(Teleport, SameCellAppRehomesAcrossSpaces) {

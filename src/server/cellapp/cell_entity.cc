@@ -1,5 +1,6 @@
 #include "cell_entity.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <utility>
 
@@ -140,6 +141,7 @@ void CellEntity::ConvertGhostToReal() {
   real_channel_.reset();
   real_addr_ = {};
   next_real_addr_ = {};
+  pending_ghost_owners_.clear();
   real_data_ = std::make_unique<RealEntityData>(*this);
 }
 
@@ -202,6 +204,43 @@ void CellEntity::RebindRealChannel(Channel* new_real_channel, const Address& new
   real_addr_ = new_real_addr;
   // Offload handoff is done - the transition-window hint no longer applies.
   next_real_addr_ = {};
+}
+
+void CellEntity::UpdateGhostOwner(Channel* channel, const Address& previous_addr,
+                                  const Address& new_addr, uint32_t epoch) {
+  if (!IsGhost() || channel == nullptr || channel->IsCondemned() || epoch <= cell_epoch_) return;
+  std::erase_if(pending_ghost_owners_, [this](const GhostOwnershipUpdate& update) {
+    return update.epoch <= cell_epoch_ || update.channel->IsCondemned();
+  });
+  if (previous_addr != real_addr_) {
+    for (const auto& update : pending_ghost_owners_) {
+      if (update.epoch == epoch) return;
+    }
+    if (pending_ghost_owners_.size() >= 16) {
+      ATLAS_LOG_ERROR("CellEntity: pending Ghost ownership limit reached for entity_id={}", id_);
+      return;
+    }
+    pending_ghost_owners_.push_back(
+        {IntrusivePtr<Channel>{channel}, previous_addr, new_addr, epoch});
+    return;
+  }
+  RebindRealChannel(channel, new_addr);
+  cell_epoch_ = epoch;
+  while (!pending_ghost_owners_.empty()) {
+    std::erase_if(pending_ghost_owners_, [this](const GhostOwnershipUpdate& update) {
+      return update.epoch <= cell_epoch_ || update.channel->IsCondemned();
+    });
+    auto next = pending_ghost_owners_.end();
+    for (auto it = pending_ghost_owners_.begin(); it != pending_ghost_owners_.end(); ++it) {
+      if (it->previous_addr == real_addr_ &&
+          (next == pending_ghost_owners_.end() || it->epoch < next->epoch))
+        next = it;
+    }
+    if (next == pending_ghost_owners_.end()) break;
+    RebindRealChannel(next->channel.get(), next->new_addr);
+    cell_epoch_ = next->epoch;
+    pending_ghost_owners_.erase(next);
+  }
 }
 
 void CellEntity::GhostApplySnapshot(uint64_t event_seq, std::span<const std::byte> other_snapshot) {

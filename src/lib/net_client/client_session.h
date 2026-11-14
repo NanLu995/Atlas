@@ -18,6 +18,7 @@ struct LoginResult;
 }
 namespace atlas::baseapp {
 struct AuthenticateResult;
+struct ClientHandoff;
 }
 
 namespace atlas::net_client {
@@ -82,6 +83,9 @@ class ClientSession {
   void CancelLoginTimeout();
 
   void OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg);
+  void OnClientHandoff(const ::atlas::baseapp::ClientHandoff& msg);
+  void FailClientHandoff(std::string error);
+  void CloseHandoffSourceChannel();
   void FireAuthCallback(bool success, EntityID entity_id, uint16_t type_id, std::string_view error);
   void CancelAuthTimeout();
 
@@ -101,6 +105,10 @@ class ClientSession {
 
   Channel* loginapp_channel_{nullptr};
   Channel* baseapp_channel_{nullptr};
+  Channel* handoff_source_channel_{nullptr};
+  SessionKey handoff_credential_;
+  EntityID handoff_entity_id_{kInvalidEntityID};
+  uint64_t handoff_instance_{0};
 
   std::array<uint8_t, sizeof(SessionKey::bytes)> session_key_{};
   Address baseapp_addr_{};

@@ -179,14 +179,6 @@ auto BaseApp::Run(int argc, char* argv[]) -> int {
   return app.RunApp(argc, argv);
 }
 
-BaseApp::BaseApp(EventDispatcher& dispatcher, NetworkInterface& internal_network,
-                 NetworkInterface& external_network)
-    : EntityApp(dispatcher, internal_network),
-      external_network_(external_network),
-      rpc_registry_(dispatcher),
-      cellapp_peers_(internal_network) {}
-
-BaseApp::~BaseApp() = default;
 
 auto BaseApp::Init(int argc, char* argv[]) -> bool {
   if (!EntityApp::Init(argc, argv)) return false;
@@ -198,6 +190,10 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
   // RPC replies match here first; unmatched messages fall through to handlers.
   Network().InterfaceTable().SetPreDispatchHook(
       [this](Channel* channel, MessageID id, std::span<const std::byte> payload) -> bool {
+        if (id == dbapp::AccountSessionReply::Descriptor().id ||
+            id == baseapp::RevokeAccountSessionReply::Descriptor().id ||
+            id == baseapp::PrepareClientHandoffReply::Descriptor().id)
+          return false;
         return rpc_registry_.TryDispatch(id, payload, channel);
       });
 
@@ -256,10 +252,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
     if (&ch == cellappmgr_channel_) {
       ATLAS_LOG_WARNING("BaseApp: cellappmgr channel down (RUDP dead link), clearing");
       cellappmgr_channel_ = nullptr;
-      for (auto& [rid, cb] : pending_space_creates_) {
-        if (cb) cb(/*success=*/false, /*space_id=*/0, Address{});
-      }
-      pending_space_creates_.clear();
+      FailPendingSpaceCreates();
     }
   });
 
@@ -276,6 +269,10 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
   // Delegated to CellAppPeerRegistry for Birth/Death and self-filtering.
   // BaseApp never self-registers as a CellApp.
   cellapp_peers_.Subscribe(GetMachinedClient(), /*self_addr=*/Address{});
+  GetMachinedClient().Subscribe(
+      machined::ListenerType::kBoth, ProcessType::kBaseApp,
+      [this](const machined::BirthNotification& notification) { OnBaseAppBirth(notification); },
+      [this](const machined::DeathNotification& notification) { OnBaseAppDeath(notification); });
 
   // Connect on birth so scripts can call RequestCreateSpace.
   // On death, clear the channel and fail pending create requests below.
@@ -301,12 +298,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
           ATLAS_LOG_WARNING("BaseApp: CellAppMgr died, clearing channel");
         }
         cellappmgr_channel_ = nullptr;
-        for (auto& [rid, cb] : pending_space_creates_) {
-          if (cb) cb(/*success=*/false, /*space_id=*/0, Address{});
-        }
-        pending_space_creates_.clear();
-        // Callbacks above fire with space_id=0 so per-space caches can't
-        // self-clean; wipe them here so a resurrected mgr re-bootstraps.
+        FailPendingSpaceCreates();
         known_space_hosts_.clear();
         pending_cell_entity_creates_.clear();
         pending_spawn_local_entities_.clear();
@@ -440,6 +432,7 @@ void BaseApp::OnTickComplete() {
   UpdateLoadEstimate();
   ReportLoadToBaseAppMgr();
   CleanupExpiredPendingRequests();
+  SweepIncomingClientHandoffs();
   SweepStaleDestroysInFlight();
   SweepCellAppDeathRestoreTimeouts();
   MaybeRequestMoreIds();
@@ -660,7 +653,21 @@ void BaseApp::RegisterWatchers() {
 }
 
 void BaseApp::RegisterInternalHandlers() {
+  RegisterClientHandoffHandlers();
   auto& table = Network().InterfaceTable();
+  (void)table.RegisterTypedHandler<baseapp::RevokeAccountSession>(
+      [this](const Address&, Channel* channel, const baseapp::RevokeAccountSession& request) {
+        if (channel) OnRevokeAccountSession(IntrusivePtr<Channel>{channel}, request);
+      });
+  (void)table.RegisterTypedHandler<baseapp::RevokeAccountSessionReply>(
+      [this](const Address&, Channel* channel, const baseapp::RevokeAccountSessionReply& reply) {
+        OnRevokeAccountSessionReply(channel, reply);
+      });
+
+  (void)table.RegisterTypedHandler<dbapp::AccountSessionReply>(
+      [this](const Address&, Channel* channel, const dbapp::AccountSessionReply& reply) {
+        OnAccountSessionReply(channel, reply);
+      });
 
   (void)table.RegisterTypedHandler<baseapp::CreateBase>(
       [this](const Address& /*src*/, Channel* ch, const baseapp::CreateBase& msg) {
@@ -670,11 +677,6 @@ void BaseApp::RegisterInternalHandlers() {
   (void)table.RegisterTypedHandler<baseapp::CreateBaseFromDB>(
       [this](const Address& /*src*/, Channel* ch, const baseapp::CreateBaseFromDB& msg) {
         OnCreateBaseFromDb(*ch, msg);
-      });
-
-  (void)table.RegisterTypedHandler<baseapp::AcceptClient>(
-      [this](const Address& /*src*/, Channel* ch, const baseapp::AcceptClient& msg) {
-        OnAcceptClient(*ch, msg);
       });
 
   (void)table.RegisterTypedHandler<baseapp::CellEntityCreated>(
@@ -1101,21 +1103,6 @@ void BaseApp::OnCreateBaseFromDb(Channel& /*ch*/, const baseapp::CreateBaseFromD
   pending_entity_checkouts_.emplace(req.request_id, std::move(pending));
 }
 
-void BaseApp::OnAcceptClient(Channel& /*ch*/, const baseapp::AcceptClient& msg) {
-  auto* proxy = entity_mgr_.FindProxy(msg.dest_entity_id);
-  if (!proxy) {
-    ATLAS_LOG_WARNING("BaseApp: AcceptClient: entity {} not a Proxy", msg.dest_entity_id);
-    return;
-  }
-  if (!entity_mgr_.AssignSessionKey(proxy->EntityId(), msg.session_key)) {
-    ATLAS_LOG_ERROR("BaseApp: AcceptClient: failed to bind session key to entity {}",
-                    msg.dest_entity_id);
-    return;
-  }
-  ClearDetachedGrace(proxy->EntityId());
-  ATLAS_LOG_DEBUG("BaseApp: entity {} ready for client", msg.dest_entity_id);
-}
-
 void BaseApp::QueuePendingAoIRadius(EntityID entity_id, float radius, float hysteresis) {
   pending_aoi_radius_[entity_id] = {radius, hysteresis};
 }
@@ -1139,8 +1126,6 @@ void BaseApp::OnCellEntityCreated(Channel& ch, const baseapp::CellEntityCreated&
     ++cellapp_death_restored_total_;
   }
 
-  // CellReady tells the client its ClientCellRpc will now route.
-  // It is not retroactive for clients binding after the CellApp ack.
   auto* proxy = entity_mgr_.FindProxy(msg.entity_id);
   if (proxy && proxy->HasClient()) {
     // Race fix: BindClient may have run before cell_addr was known and
@@ -1150,15 +1135,9 @@ void BaseApp::OnCellEntityCreated(Channel& ch, const baseapp::CellEntityCreated&
       ew.entity_id = msg.entity_id;
       (void)cell_ch->SendMessage(ew);
     }
-    if (auto* client_ch = ResolveClientChannel(msg.entity_id)) {
-      baseapp::CellReady ready;
-      ready.entity_id = msg.entity_id;
-      (void)client_ch->SendMessage(ready);
-      // Replay the last-known BSP for the client's debug gizmo. No-op
-      // if mgr hasn't pushed geometry yet (LB hasn't kicked in).
-      if (auto it = latest_space_bsp_.find(ent->SpaceId()); it != latest_space_bsp_.end()) {
-        (void)client_ch->SendMessage(it->second);
-      }
+    if (auto ready = NotifyClientCellReady(msg.entity_id); !ready) {
+      ATLAS_LOG_WARNING("BaseApp: CellReady failed entity={}: {}", msg.entity_id,
+                        ready.Error().Message());
     }
   }
   if (auto it = pending_aoi_radius_.find(msg.entity_id); it != pending_aoi_radius_.end()) {
@@ -1196,11 +1175,13 @@ void BaseApp::OnCellEntityDestroyed(Channel& /*ch*/, const baseapp::CellEntityDe
 
 void BaseApp::OnCurrentCell(Channel& ch, const baseapp::CurrentCell& msg) {
   auto* ent = entity_mgr_.Find(msg.entity_id);
-  if (!ent) return;
+  if (!ent || ent->IsPendingDestroy() || msg.epoch < ent->CellEpoch()) return;
   // INADDR_ANY binds make Network().RudpAddress() report 0.0.0.0:P; machined
   // keys peers by the source IP it observes, so fall back to ch.RemoteAddress().
   Address cell_addr = msg.cell_addr;
   if (cell_addr.Ip() == 0) cell_addr = Address(ch.RemoteAddress().Ip(), cell_addr.Port());
+  if (cell_addr != ch.RemoteAddress() || cellapp_peers_.Find(cell_addr) != &ch) return;
+  if (msg.epoch == ent->CellEpoch() && ent->HasCell() && cell_addr != ent->CellAddr()) return;
   ent->SetCell(cell_addr, msg.epoch);
 
   // Drain any ClientCellRpc that arrived before this CurrentCell ack.
@@ -1812,6 +1793,10 @@ auto BaseApp::TryCompleteLocalRelogin(PendingLogin pending) -> bool {
   if (!proxy) {
     return false;
   }
+  if (client_sessions_.contains(proxy->EntityId())) {
+    ReloginAfterSessionRelease(proxy->EntityId(), std::move(pending));
+    return true;
+  }
 
   const bool kWasDetached = proxy->IsDetached();
   if (auto* existing_client = ResolveClientChannel(proxy->EntityId())) {
@@ -2045,8 +2030,8 @@ void BaseApp::DispatchPrepareLogin(PendingLogin pending) {
         ATLAS_LOG_DEBUG(
             "BaseApp: username '{}' orphan owner entity={} dbid_owner={}, force-logoff",
             kName, kIndexed, dbid_owner);
-        ForceLogoffUsernameOwner(kName);
         QueuePendingLoginAwaitingDestroy(kName, std::move(pending));
+        ForceLogoffUsernameOwner(kName);
         return;
       }
     }
@@ -2173,125 +2158,8 @@ void BaseApp::FlushAllRemoteForceLogoffAcks(bool success) {
   }
 }
 
-void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t type_id,
-                                 uint32_t continuation_request_id) {
-  auto write =
-      std::find_if(pending_write_to_db_.begin(), pending_write_to_db_.end(),
-                   [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; });
-  if (write != pending_write_to_db_.end()) write->second.logoff_after_write = true;
-  if (logoff_entities_in_flight_.contains(entity_id) || write != pending_write_to_db_.end()) {
-    ATLAS_LOG_WARNING("BaseApp: logoff blocked by pending persistence for entity={}", entity_id);
-    if (continuation_request_id != 0) {
-      FailPendingForceLogoff(continuation_request_id, "persistence_pending");
-    }
-    FlushRemoteForceLogoffAcks(entity_id, false);
-    return;
-  }
-  if (entity_id == kInvalidEntityID) {
-    if (continuation_request_id != 0)
-      ContinueLoginAfterForceLogoff(continuation_request_id);
-    else
-      FinishLoginFlow(dbid);
-    return;
-  }
 
-  auto* ent = entity_mgr_.Find(entity_id);
-  if (!ent || ent->Dbid() != dbid || ent->IsPendingDestroy()) {
-    if (continuation_request_id != 0)
-      ContinueLoginAfterForceLogoff(continuation_request_id);
-    else
-      FinishLoginFlow(dbid);
-    return;
-  }
 
-  std::vector<std::byte> blob;
-  if (!CaptureEntitySnapshot(entity_id, blob)) {
-    if (continuation_request_id != 0)
-      FailPendingForceLogoff(continuation_request_id, "force_logoff_snapshot_failed");
-    FlushRemoteForceLogoffAcks(entity_id, false);
-    FinishLoginFlow(dbid);
-    return;
-  }
-
-  dbapp::WriteEntity msg;
-  if (auto generated = FillSecureRandom(msg.operation_id); !generated) {
-    if (continuation_request_id != 0)
-      FailPendingForceLogoff(continuation_request_id, "operation_id_generation_failed");
-    FailDeferredPrepareLogins(entity_id, "operation_id_generation_failed");
-    FlushRemoteForceLogoffAcks(entity_id, false);
-    FinishLoginFlow(dbid);
-    return;
-  }
-  msg.flags = WriteFlags::kExplicitDbid | WriteFlags::kLogOff;
-  msg.type_id = type_id;
-  msg.dbid = dbid;
-  msg.entity_id = entity_id;
-  msg.owner = ent->CheckoutOwner().value_or(CheckoutInfo{});
-  msg.request_id = AllocatePrepareRequestId();
-  msg.shard_table_version = dbapp_shard_table_version_;
-  msg.blob = std::move(blob);
-
-  PendingLogoffWrite pending;
-  pending.continuation_request_id = continuation_request_id;
-  pending.entity_id = entity_id;
-  pending.dbid = dbid;
-  pending.type_id = type_id;
-  pending.message = std::move(msg);
-  pending.created_at = Clock::now();
-
-  const uint32_t kRequestId = pending.message.request_id;
-  logoff_entities_in_flight_.insert(entity_id);
-  auto [it, inserted] = pending_logoff_writes_.emplace(kRequestId, std::move(pending));
-  if (!inserted) {
-    logoff_entities_in_flight_.erase(entity_id);
-    ATLAS_LOG_ERROR("BaseApp: duplicate logoff write request_id={} entity_id={}", kRequestId,
-                    entity_id);
-    return;
-  }
-
-  if (!SendPendingLogoffWriteToDb(kRequestId, it->second)) {
-    RequestDbAppShardTable();
-  }
-}
-
-void BaseApp::BeginForceLogoffPersist(uint32_t force_request_id, EntityID entity_id) {
-  auto* ent = entity_mgr_.Find(entity_id);
-  if (!ent || ent->Dbid() == kInvalidDBID) {
-    if (!FinalizeForceLogoff(entity_id)) {
-      FailPendingForceLogoff(force_request_id, "force_logoff_destroy_failed");
-      auto pending_it = pending_force_logoffs_.find(force_request_id);
-      if (pending_it != pending_force_logoffs_.end()) {
-        FinishLoginFlow(pending_it->second.dbid);
-      }
-      return;
-    }
-    ContinueLoginAfterForceLogoff(force_request_id);
-    return;
-  }
-
-  BeginLogoffPersist(entity_id, ent->Dbid(), ent->TypeId(), force_request_id);
-}
-
-void BaseApp::StartDisconnectLogoff(EntityID entity_id) {
-  ClearDetachedGrace(entity_id);
-
-  auto* ent = entity_mgr_.Find(entity_id);
-  if (!ent || ent->IsPendingDestroy()) {
-    return;
-  }
-
-  const DatabaseID kDbid = ent->Dbid();
-  if (kDbid != kInvalidDBID) {
-    active_login_dbids_.insert(kDbid);
-  }
-
-  if (kDbid == kInvalidDBID) {
-    (void)FinalizeForceLogoff(entity_id);
-    return;
-  }
-
-  BeginLogoffPersist(entity_id, kDbid, ent->TypeId(), 0);
-}
 
 void BaseApp::ContinueLoginAfterForceLogoff(uint32_t force_request_id) {
   auto it = pending_force_logoffs_.find(force_request_id);
@@ -2318,6 +2186,8 @@ void BaseApp::ContinueLoginAfterForceLogoff(uint32_t force_request_id) {
 }
 
 auto BaseApp::FinalizeForceLogoff(EntityID entity_id, uint32_t cell_ack_request_id) -> bool {
+  if (client_sessions_.contains(entity_id) || client_transfer_targets_.contains(entity_id))
+    return false;
   auto write =
       std::find_if(pending_write_to_db_.begin(), pending_write_to_db_.end(),
                    [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; });
@@ -2331,6 +2201,9 @@ auto BaseApp::FinalizeForceLogoff(EntityID entity_id, uint32_t cell_ack_request_
     return true;
   }
 
+  const bool had_cell = ent->HasCell();
+  const auto account = account_index_reverse_.find(entity_id);
+  const std::string username = account == account_index_reverse_.end() ? "" : account->second;
   // Cell entity has no independent destroy trigger; without this it leaks.
   if (ent->HasCell()) {
     if (auto* cell_ch = ResolveCellChannelForEntity(entity_id)) {
@@ -2341,7 +2214,9 @@ auto BaseApp::FinalizeForceLogoff(EntityID entity_id, uint32_t cell_ack_request_
             uit != account_index_reverse_.end()) {
           if (auto [it, inserted] = destroys_in_flight_.try_emplace(
                   uit->second, DestroyInFlight{entity_id, Clock::now(), {}, 0});
-              inserted) {
+              inserted || it->second.ack_request_id == 0) {
+            it->second.entity_id = entity_id;
+            it->second.started_at = Clock::now();
             const std::string captured = uit->second;
             cell_ack_request_id = AllocateDestroyAckId(
                 [this, captured](bool /*ok*/) { OnUsernameDestroyComplete(captured); });
@@ -2369,6 +2244,7 @@ auto BaseApp::FinalizeForceLogoff(EntityID entity_id, uint32_t cell_ack_request_
   (void)entity_mgr_.ClearSessionKey(entity_id);
   (void)entity_mgr_.AssignDbid(entity_id, kInvalidDBID);
   ent->MarkForDestroy();
+  if (!had_cell && !username.empty()) OnUsernameDestroyComplete(username);
   return true;
 }
 
@@ -2397,9 +2273,7 @@ void BaseApp::OnDestroyCellEntityAck(const cellapp::DestroyCellEntityAck& msg) {
 void BaseApp::ForceLogoffUsernameOwner(const std::string& username) {
   auto it = account_entity_index_.find(username);
   if (it == account_entity_index_.end()) return;
-  // FinalizeForceLogoff auto-allocates the ack id and registers
-  // destroys_in_flight_ when the entity carries a tracked username.
-  (void)FinalizeForceLogoff(it->second);
+  StartDisconnectLogoff(it->second);
 }
 
 void BaseApp::QueuePendingLoginAwaitingDestroy(const std::string& username, PendingLogin pending) {
@@ -2570,29 +2444,37 @@ void BaseApp::ProcessForceLogoffRequest(const baseapp::ForceLogoff& msg) {
   }
 }
 
-void BaseApp::DoGiveClientToLocal(EntityID src_id, EntityID dest_id) {
+auto BaseApp::DoGiveClientToLocal(EntityID src_id, EntityID dest_id) -> Result<void> {
   auto* src_proxy = entity_mgr_.FindProxy(src_id);
   auto* dst_proxy = entity_mgr_.FindProxy(dest_id);
   if (!src_proxy || !dst_proxy) {
-    ATLAS_LOG_ERROR("BaseApp: give_client_to: invalid src={} or dest={}", src_id, dest_id);
-    return;
+    return Error{ErrorCode::kNotFound, "client transfer entity missing"};
   }
+  if (src_proxy->IsPendingDestroy() || dst_proxy->IsPendingDestroy()) {
+    return Error{ErrorCode::kReceiverGone, "client transfer entity is being destroyed"};
+  }
+  if (src_id == dest_id) return {};
   if (!src_proxy->HasClient()) {
-    ATLAS_LOG_WARNING("BaseApp: give_client_to: src={} has no client", src_id);
-    return;
+    return Error{ErrorCode::kReceiverGone, "client transfer source has no client"};
+  }
+  if (dst_proxy->HasClient() || !dst_proxy->GetSessionKey().IsZero() ||
+      src_proxy->GetSessionKey().IsZero()) {
+    return Error{ErrorCode::kAlreadyExists, "client transfer session unavailable"};
   }
   const auto kSessionKey = src_proxy->GetSessionKey();
   (void)entity_mgr_.ClearSessionKey(src_id);
   if (!entity_mgr_.AssignSessionKey(dest_id, kSessionKey)) {
-    ATLAS_LOG_ERROR("BaseApp: give_client_to: failed to move session key to dest={}", dest_id);
-    return;
+    (void)entity_mgr_.AssignSessionKey(src_id, kSessionKey);
+    return Error{ErrorCode::kInternalError, "client transfer key could not be installed"};
   }
 
   const auto kClientAddr = src_proxy->ClientAddr();
   UnbindClient(src_id);
   if (!BindClient(dest_id, kClientAddr)) {
-    ATLAS_LOG_ERROR("BaseApp: give_client_to: failed to move client binding to dest={}", dest_id);
-    return;
+    (void)entity_mgr_.ClearSessionKey(dest_id);
+    (void)entity_mgr_.AssignSessionKey(src_id, kSessionKey);
+    (void)BindClient(src_id, kClientAddr);
+    return Error{ErrorCode::kInternalError, "client transfer binding could not be installed"};
   }
   // Identity stays with the client through Account -> Avatar; keep the
   // account index aligned with the now-bound entity.
@@ -2604,11 +2486,25 @@ void BaseApp::DoGiveClientToLocal(EntityID src_id, EntityID dest_id) {
     baseapp::EntityTransferred notify;
     notify.new_entity_id = dest_id;
     notify.new_type_id = dst_proxy->TypeId();
-    if (auto r = client_ch->SendMessage(notify); !r) {
-      ATLAS_LOG_WARNING("BaseApp: EntityTransferred notify send failed, dest_id={} client {}: {}",
-                        dest_id, client_ch->RemoteAddress().ToString(), r.Error().Message());
-    }
+    if (auto sent = client_ch->SendMessage(notify); !sent) return sent.Error();
+    return NotifyClientCellReady(dest_id);
   }
+  return Error{ErrorCode::kReceiverGone, "client transfer channel disappeared"};
+}
+
+auto BaseApp::NotifyClientCellReady(EntityID entity_id) -> Result<void> {
+  auto* proxy = entity_mgr_.FindProxy(entity_id);
+  if (proxy == nullptr || !proxy->HasClient() || !proxy->HasCell()) return {};
+  if (ResolveCellChannelForEntity(entity_id) == nullptr)
+    return Error{ErrorCode::kReceiverGone, "client cell route unavailable"};
+  auto* channel = ResolveClientChannel(entity_id);
+  if (channel == nullptr) return Error{ErrorCode::kReceiverGone, "client channel unavailable"};
+  baseapp::CellReady ready;
+  ready.entity_id = entity_id;
+  if (auto sent = channel->SendMessage(ready); !sent) return sent;
+  if (auto geometry = latest_space_bsp_.find(proxy->SpaceId()); geometry != latest_space_bsp_.end())
+    return channel->SendMessage(geometry->second);
+  return {};
 }
 
 auto BaseApp::RequestSpawnCellOnly(uint16_t type_id, SpaceID space_id, math::Vector3 position,
@@ -2765,7 +2661,7 @@ void BaseApp::EnsureSpaceBootstrap(SpaceID space_id) {
         }
         OnSpaceHostKnown(s, host);
       },
-      cell_count);
+      cell_count, true);
 }
 
 void BaseApp::SetSpaceMasterType(SpaceID space_id, std::string type_name) {
@@ -2841,32 +2737,6 @@ void BaseApp::FlushPendingSpawnLocalEntities(SpaceID space_id, const Address& ho
   ATLAS_LOG_INFO("BaseApp: flushed {} SpawnLocalEntity for space_id={} to {}",
                  qit->second.size(), space_id, host.ToString());
   pending_spawn_local_entities_.erase(qit);
-}
-
-void BaseApp::DoGiveClientToRemote(EntityID src_id, EntityID /*dest_id*/,
-                                   const Address& dest_baseapp) {
-  auto* src_proxy = entity_mgr_.FindProxy(src_id);
-  if (!src_proxy || !src_proxy->HasClient()) {
-    ATLAS_LOG_ERROR("BaseApp: give_client_to_remote: src={} has no client", src_id);
-    return;
-  }
-  auto dest_ch_result = Network().ConnectRudpNocwnd(dest_baseapp);
-  if (!dest_ch_result) {
-    ATLAS_LOG_ERROR("BaseApp: give_client_to_remote: could not connect to {}:{}", dest_baseapp.Ip(),
-                    dest_baseapp.Port());
-    return;
-  }
-
-  baseapp::AcceptClient accept;
-  accept.dest_entity_id = src_id;
-  accept.session_key = src_proxy->GetSessionKey();
-  if (auto r = (*dest_ch_result)->SendMessage(accept); !r) {
-    // UnbindClient follows; a lost AcceptClient orphans the client (visible UX bug).
-    ATLAS_LOG_WARNING("BaseApp: AcceptClient send failed (src_id={}, dest baseapp {}): {}", src_id,
-                      dest_baseapp.ToString(), r.Error().Message());
-  }
-
-  UnbindClient(src_id);
 }
 
 void BaseApp::OnRegisterBaseappAck(Channel& /*ch*/, const baseappmgr::RegisterBaseAppAck& msg) {
@@ -3402,6 +3272,10 @@ void BaseApp::OnExternalClientDisconnect(Channel& ch) {
   }
 
   const auto kEntityId = it->second;
+  if (const auto session = client_sessions_.find(kEntityId); session != client_sessions_.end() &&
+                                                             session->second->remote_handoff &&
+                                                             session->second->frozen)
+    return;
   UnbindClient(kEntityId);
   if (auto* proxy = entity_mgr_.FindProxy(kEntityId); proxy && proxy->Dbid() != kInvalidDBID) {
     EnterDetachedGrace(kEntityId);
@@ -3507,6 +3381,18 @@ void BaseApp::SendPrepareLoginResult(const Address& reply_addr,
 
 void BaseApp::CleanupExpiredPendingRequests() {
   const auto kNow = Clock::now();
+  std::vector<PendingSpaceCreate> expired_spaces;
+  for (auto it = pending_space_creates_.begin(); it != pending_space_creates_.end();) {
+    if (kNow - it->second.started_at >= std::chrono::seconds(5)) {
+      expired_spaces.push_back(std::move(it->second));
+      it = pending_space_creates_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto& pending : expired_spaces) {
+    if (pending.callback) pending.callback(false, pending.space_id, Address{});
+  }
   struct ExpiredLoginRequest {
     uint32_t request_id{0};
     PendingLogin pending;
@@ -4067,30 +3953,6 @@ bool BaseApp::SendAbortCheckout(PendingDbCheckout& pending) {
   return pending.awaiting_ack;
 }
 
-auto BaseApp::RollbackPreparedLoginEntity(uint32_t login_request_id) -> bool {
-  auto it = prepared_login_entities_.find(login_request_id);
-  if (it == prepared_login_entities_.end()) {
-    return false;
-  }
-
-  const PreparedLoginEntity kPrepared = it->second;
-  prepared_login_entities_.erase(it);
-  prepared_login_requests_by_entity_.erase(kPrepared.entity_id);
-
-  auto* ent = entity_mgr_.Find(kPrepared.entity_id);
-  if (!ent) {
-    return true;
-  }
-
-  (void)NotifyManagedEntityDestroyed(kPrepared.entity_id, "prepare login cancel");
-  ClearDetachedGrace(kPrepared.entity_id);
-  UnbindClient(kPrepared.entity_id);
-  (void)entity_mgr_.ClearSessionKey(kPrepared.entity_id);
-  (void)entity_mgr_.AssignDbid(kPrepared.entity_id, kInvalidDBID);
-  ent->MarkForDestroy();
-  ReleaseCheckout(kPrepared.dbid, kPrepared.type_id, kPrepared.checkout_owner);
-  return true;
-}
 
 void BaseApp::ClearPreparedLoginEntity(EntityID entity_id) {
   auto it = prepared_login_requests_by_entity_.find(entity_id);
@@ -4293,45 +4155,7 @@ void BaseApp::MaybeRequestMoreIds() {
   ATLAS_LOG_INFO("BaseApp: requested {} EntityIDs from DBApp", count);
 }
 
-void BaseApp::OnPrepareLogin(Channel& ch, const login::PrepareLogin& msg) {
-  ATLAS_LOG_DEBUG("BaseApp: prepare login request_id={} dbid={} type_id={} blob={}B from {}:{}",
-                  msg.request_id, msg.dbid, msg.type_id, msg.entity_blob.size(),
-                  ch.RemoteAddress().Ip(), ch.RemoteAddress().Port());
 
-  const auto server_digest = EntityDefRegistry::Instance().Digest();
-  if (!std::equal(msg.entity_def_digest.begin(), msg.entity_def_digest.end(), server_digest.begin(),
-                  server_digest.end())) {
-    ATLAS_LOG_WARNING(
-        "BaseApp: PrepareLogin rejected request_id={} dbid={}: entity-def digest mismatch",
-        msg.request_id, msg.dbid);
-    login::PrepareLoginResult result;
-    result.request_id = msg.request_id;
-    result.success = false;
-    result.error = "def_mismatch";
-    if (auto r = ch.SendMessage(result); !r) {
-      ATLAS_LOG_WARNING("BaseApp: PrepareLoginResult(def_mismatch) send failed: {}",
-                        r.Error().Message());
-    }
-    return;
-  }
-
-  PendingLogin pending;
-  pending.login_request_id = msg.request_id;
-  pending.loginapp_addr = ch.RemoteAddress();
-  pending.type_id = msg.type_id;
-  pending.dbid = msg.dbid;
-  pending.session_key = msg.session_key;
-  pending.created_at = Clock::now();
-  pending.blob_prefetched = msg.blob_prefetched;
-  pending.entity_blob = msg.entity_blob;
-  pending.username = msg.username;
-  SubmitPrepareLogin(std::move(pending));
-  (void)msg.client_addr;
-}
-
-void BaseApp::OnCancelPrepareLogin(Channel& /*ch*/, const login::CancelPrepareLogin& msg) {
-  CancelPrepareLogin(msg.request_id, msg.dbid);
-}
 
 void BaseApp::OnClientEventSeqReport(const baseapp::ClientEventSeqReport& msg) {
   if (msg.gap_delta == 0) return;
@@ -4401,7 +4225,7 @@ void BaseApp::OnForceLogoffAck(Channel& /*ch*/, const baseapp::ForceLogoffAck& m
   ContinueLoginAfterForceLogoff(msg.request_id);
 }
 
-void BaseApp::OnClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg) {
+void BaseApp::FinishClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg) {
   TimePoint t0 = Clock::now();
   auto* proxy = entity_mgr_.FindProxyBySession(msg.session_key);
   if (!proxy) {
@@ -4425,9 +4249,15 @@ void BaseApp::OnClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg
 
   baseapp::AuthenticateResult res;
   res.success = true;
+  if (auto session = client_sessions_.find(proxy->EntityId()); session != client_sessions_.end())
+    session->second->supports_handoff = msg.supports_handoff;
   res.entity_id = proxy->EntityId();
   res.type_id = proxy->TypeId();
+  res.process_instance = Config().process_instance;
   (void)ch.SendMessage(res);
+  if (auto ready = NotifyClientCellReady(proxy->EntityId()); !ready)
+    ATLAS_LOG_WARNING("BaseApp: authenticated CellReady failed entity={}: {}", proxy->EntityId(),
+                      ready.Error().Message());
   authenticate_latency_.Record(Clock::now() - t0);
   ++auth_success_total_;
 
@@ -4460,6 +4290,7 @@ void BaseApp::OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg) {
     return;
   }
   auto entity_id = it->second;
+  if (HasFrozenClientSession(entity_id)) return;
 
   if (!ConsumeRpcRateToken(ch.RemoteAddress())) {
     ++client_rpc_dropped_rate_total_;
@@ -4526,6 +4357,7 @@ void BaseApp::OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg) {
     return;
   }
   const auto source_entity_id = it->second;
+  if (HasFrozenClientSession(source_entity_id)) return;
 
   if (!ConsumeRpcRateToken(ch.RemoteAddress())) {
     ++client_rpc_dropped_rate_total_;
@@ -4705,6 +4537,10 @@ void BaseApp::OnClientMovementInput(Channel& ch, const baseapp::ClientMovementIn
                       source_entity_id, msg.target_entity_id);
     return;
   }
+  if (HasFrozenClientSession(source_entity_id)) {
+    ++movement_input_dropped_total_;
+    return;
+  }
   if (msg.frames.empty() || msg.frames.size() > movement::kMaxMovementInputFrames) {
     ++movement_input_dropped_total_;
     return;
@@ -4768,7 +4604,8 @@ void BaseApp::OnMovementCorrectionReport(Channel& ch,
     ++movement_correction_report_dropped_total_;
   };
   auto it = client_entity_index_.find(ch.RemoteAddress());
-  if (it == client_entity_index_.end() || it->second != msg.target_entity_id) {
+  if (it == client_entity_index_.end() || it->second != msg.target_entity_id ||
+      HasFrozenClientSession(it->second)) {
     drop();
     return;
   }
@@ -4837,9 +4674,11 @@ auto BaseApp::ResolveCellChannelForEntity(EntityID target_entity_id) const -> Ch
 }
 
 auto BaseApp::RequestCreateSpace(SpaceID space_id, SpaceCreatedCallback callback,
-                                 uint16_t initial_cell_count) -> uint32_t {
-  if (cellappmgr_channel_ == nullptr) {
-    ATLAS_LOG_WARNING("BaseApp: RequestCreateSpace({}); no CellAppMgr channel yet", space_id);
+                                 uint16_t initial_cell_count, bool reuse_existing) -> uint32_t {
+  if (cellappmgr_channel_ == nullptr || cellappmgr_channel_->IsCondemned() ||
+      rpc_registry_.IsStopping() || pending_space_creates_.size() >= 1024 ||
+      next_space_request_id_ == 0) {
+    ATLAS_LOG_WARNING("BaseApp: RequestCreateSpace({}) unavailable", space_id);
     if (callback) callback(/*success=*/false, space_id, Address{});
     return 0;
   }
@@ -4849,7 +4688,9 @@ auto BaseApp::RequestCreateSpace(SpaceID space_id, SpaceCreatedCallback callback
     return 0;
   }
   const uint32_t request_id = next_space_request_id_++;
-  pending_space_creates_[request_id] = std::move(callback);
+  pending_space_creates_.emplace(
+      request_id, PendingSpaceCreate{space_id, std::move(callback),
+                                     IntrusivePtr<Channel>{cellappmgr_channel_}, Clock::now()});
 
   cellappmgr::CreateSpaceRequest msg;
   msg.space_id = space_id;
@@ -4857,18 +4698,30 @@ auto BaseApp::RequestCreateSpace(SpaceID space_id, SpaceCreatedCallback callback
   // Leave reply_addr default (port=0) so CellAppMgr replies on the inbound
   // RUDP channel; Network().RudpAddress() can be 0.0.0.0:P which is unroutable.
   msg.initial_cell_count = std::max<uint16_t>(1, initial_cell_count);
+  msg.reuse_existing = reuse_existing;
   if (auto it = space_master_types_.find(space_id); it != space_master_types_.end()) {
     msg.space_master_type = it->second;
   }
   if (auto r = cellappmgr_channel_->SendMessage(msg); !r) {
-    // pending_space_creates_ entry expires on timeout.
     ATLAS_LOG_WARNING("BaseApp: CreateSpaceRequest send failed (space_id={}, request_id={}): {}",
                       space_id, request_id, r.Error().Message());
+    auto pending = std::move(pending_space_creates_.at(request_id));
+    pending_space_creates_.erase(request_id);
+    if (pending.callback) pending.callback(false, pending.space_id, Address{});
+    return 0;
   }
   return request_id;
 }
 
-void BaseApp::OnSpaceCreatedResult(Channel& /*ch*/, const cellappmgr::SpaceCreatedResult& msg) {
+void BaseApp::FailPendingSpaceCreates() {
+  auto pending = std::move(pending_space_creates_);
+  pending_space_creates_.clear();
+  for (auto& [_, request] : pending) {
+    if (request.callback) request.callback(false, request.space_id, Address{});
+  }
+}
+
+void BaseApp::OnSpaceCreatedResult(Channel& ch, const cellappmgr::SpaceCreatedResult& msg) {
   auto it = pending_space_creates_.find(msg.request_id);
   if (it == pending_space_creates_.end()) {
     ATLAS_LOG_WARNING(
@@ -4876,9 +4729,13 @@ void BaseApp::OnSpaceCreatedResult(Channel& /*ch*/, const cellappmgr::SpaceCreat
         msg.request_id, msg.space_id, msg.success);
     return;
   }
-  auto cb = std::move(it->second);
+  if (&ch != cellappmgr_channel_ || it->second.channel.get() != &ch ||
+      it->second.space_id != msg.space_id ||
+      (msg.success && (msg.cell_id == 0 || msg.host_addr.Ip() == 0 || msg.host_addr.Port() == 0)))
+    return;
+  auto pending = std::move(it->second);
   pending_space_creates_.erase(it);
-  if (cb) cb(msg.success, msg.space_id, msg.host_addr);
+  if (pending.callback) pending.callback(msg.success, pending.space_id, msg.host_addr);
 }
 
 }  // namespace atlas

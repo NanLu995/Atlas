@@ -290,7 +290,7 @@ void MachinedClient::Subscribe(machined::ListenerType listener_type, ProcessType
 
   if (IsConnected()) {
     machined::ListenerRegister msg;
-    msg.listener_type = listener_type;
+    msg.listener_type = machined::ListenerType::kBoth;
     msg.target_type = target_type;
     (void)channel_->SendMessage(msg);
   }
@@ -425,7 +425,7 @@ void MachinedClient::OnRegisterAck(const Address& src, Channel* /*ch*/,
 
     for (const auto& sub : subscriptions_) {
       machined::ListenerRegister listener_msg;
-      listener_msg.listener_type = sub.listener_type;
+      listener_msg.listener_type = machined::ListenerType::kBoth;
       listener_msg.target_type = sub.target_type;
       if (channel_ != nullptr) {
         (void)channel_->SendMessage(listener_msg);
@@ -461,8 +461,20 @@ void MachinedClient::OnQueryResponse(const Address& /*src*/, Channel* /*ch*/,
   }
 }
 
-void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* /*ch*/,
+void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* ch,
                                          const machined::BirthNotification& msg) {
+  if (ch == nullptr || ch != channel_) return;
+  if (msg.process_instance != 0 && msg.internal_addr != machined_addr_) {
+    auto [it, inserted] = peer_instances_.try_emplace(msg.internal_addr, msg.process_instance);
+    if (!inserted && it->second != msg.process_instance) {
+      it->second = msg.process_instance;
+      network_.DisconnectChannel(msg.internal_addr);
+      if (auto result = network_.ConnectRudpNocwnd(msg.internal_addr); !result) {
+        ATLAS_LOG_ERROR("MachinedClient: cannot reconnect restarted peer {}: {}",
+                        msg.internal_addr.ToString(), result.Error().Message());
+      }
+    }
+  }
   for (const auto& sub : subscriptions_) {
     if (sub.target_type != msg.process_type) continue;
     if (sub.listener_type == machined::ListenerType::kDeath) continue;
@@ -473,6 +485,11 @@ void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* /*ch*/
 void MachinedClient::OnDeathNotification(const Address& /*src*/, Channel* ch,
                                          const machined::DeathNotification& msg) {
   if (ch == nullptr || ch != channel_) return;
+  if (msg.process_instance != 0 && msg.internal_addr != machined_addr_) {
+    auto [it, inserted] = peer_instances_.try_emplace(msg.internal_addr, msg.process_instance);
+    if (!inserted && it->second != msg.process_instance) return;
+    network_.DisconnectChannel(msg.internal_addr);
+  }
   for (const auto& sub : subscriptions_) {
     if (sub.target_type != msg.process_type) continue;
     if (sub.listener_type == machined::ListenerType::kBirth) continue;

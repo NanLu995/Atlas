@@ -44,7 +44,7 @@ class PendingRpcRegistry {
                        ErrorCallback on_error, Duration timeout, Channel* channel = nullptr)
       -> PendingHandle;
 
-  // Entity replies carry a little-endian uint64_t ID; other replies carry uint32_t.
+  // Entity and account-session replies use uint64_t IDs; older control replies use uint32_t.
   auto TryDispatch(MessageID id, std::span<const std::byte> payload, Channel* source = nullptr)
       -> bool;
 

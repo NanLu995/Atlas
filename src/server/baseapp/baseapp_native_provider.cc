@@ -160,12 +160,32 @@ void BaseAppNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* entit
   app_.DoWriteToDb(entity_id, entity_data, len);
 }
 
-void BaseAppNativeProvider::GiveClientTo(uint32_t src_entity_id, uint32_t dest_entity_id) {
-  if (app_.GetEntityManager().FindProxy(dest_entity_id))
-    app_.DoGiveClientToLocal(src_entity_id, dest_entity_id);
-  else
-    ATLAS_LOG_WARNING("BaseApp: GiveClientTo dest={} not on this BaseApp; remote case TBD",
-                      dest_entity_id);
+auto BaseAppNativeProvider::TransferClient(uint32_t src_entity_id, uint32_t dest_entity_id,
+                                           uint32_t base_ip, uint16_t base_port,
+                                           uint64_t base_instance, uint64_t request_id)
+    -> RpcSendResult {
+  return app_.StartClientTransfer(src_entity_id, dest_entity_id, request_id,
+                                  {Address(base_ip, base_port), dest_entity_id, base_instance});
+}
+
+auto BaseAppNativeProvider::GetClientHandoffTarget(uint32_t entity_id, uint32_t& base_ip,
+                                                   uint16_t& base_port, uint64_t& base_instance)
+    -> bool {
+  base_ip = 0;
+  base_port = 0;
+  base_instance = 0;
+  auto* proxy = app_.entity_mgr_.FindProxy(entity_id);
+  if (!proxy || proxy->IsPendingDestroy()) return false;
+  for (const auto& [address, peer] : app_.baseapp_peers_) {
+    if (peer.process_instance != app_.Config().process_instance ||
+        address.Port() != app_.Network().RudpAddress().Port())
+      continue;
+    base_ip = address.Ip();
+    base_port = address.Port();
+    base_instance = peer.process_instance;
+    return true;
+  }
+  return false;
 }
 
 void BaseAppNativeProvider::SetSpaceMasterType(uint32_t space_id, const char* name, int32_t len) {

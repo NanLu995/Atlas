@@ -89,6 +89,11 @@ void Space::RemoveEntity(EntityID id) {
   entities_.erase(it);
 }
 
+auto Space::ExtractEntity(EntityID id) -> std::unique_ptr<CellEntity> {
+  auto entry = entities_.extract(id);
+  return entry.empty() ? nullptr : std::move(entry.mapped());
+}
+
 auto Space::FindEntity(EntityID id) -> CellEntity* {
   auto it = entities_.find(id);
   return it == entities_.end() ? nullptr : it->second.get();

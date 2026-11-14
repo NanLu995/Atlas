@@ -148,8 +148,13 @@ internal static unsafe partial class NativeApi
     [LibraryImport(LibName, EntryPoint = "AtlasUnregisterAllEntityTypes")]
     public static partial void UnregisterAllEntityTypes();
 
-    [LibraryImport(LibName, EntryPoint = "AtlasGiveClientTo")]
-    public static partial void GiveClientTo(uint srcEntityId, uint destEntityId);
+    [LibraryImport(LibName, EntryPoint = "AtlasTransferClient")]
+    public static partial RpcSendResult TransferClient(uint srcEntityId, uint destEntityId,
+        uint baseIp, ushort basePort, ulong baseInstance, ulong requestId);
+
+    [LibraryImport(LibName, EntryPoint = "AtlasGetClientHandoffTarget")]
+    public static partial int GetClientHandoffTarget(uint entityId, out uint baseIp,
+        out ushort basePort, out ulong baseInstance);
 
     [LibraryImport(LibName, EntryPoint = "AtlasCreateBaseEntity")]
     private static partial uint CreateBaseEntityNative(ushort typeId, uint spaceId);

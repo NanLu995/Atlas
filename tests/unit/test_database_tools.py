@@ -8,15 +8,75 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from cluster_control import test_cluster
+from common.cluster import wait_for_registration
 
 
 class DatabaseToolsTest(unittest.TestCase):
+    def test_restart_only_reuses_a_stopped_owned_baseapp_and_keeps_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = Mock()
+            process.poll.return_value = None
+            process.args = ['owned-baseapp', '--name', 'baseapp']
+            previous = SimpleNamespace(name='baseapp', process=process, start_order=4)
+            processes = [previous]
+            with patch.object(test_cluster, 'start_logged_process') as start:
+                with self.assertRaisesRegex(RuntimeError, 'not in this test cluster'):
+                    test_cluster._restart_baseapp(processes, [(25005, 25006)], 26000, root, root)
+                with self.assertRaisesRegex(RuntimeError, 'still running'):
+                    test_cluster._restart_baseapp(processes, [(25005, 25006)], 25005, root, root)
+                start.assert_not_called()
+                process.poll.return_value = 1
+                test_cluster._restart_baseapp(processes, [(25005, 25006)], 25005, root, root)
+                self.assertEqual(processes, [start.return_value])
+                self.assertEqual(processes[0].start_order, 4)
+                self.assertEqual(start.call_args.kwargs['arguments'], ['--name', 'baseapp'])
+                self.assertTrue(start.call_args.kwargs['log_directory'].is_relative_to(root / 'restarts'))
+
+    def test_cluster_kill_is_limited_to_its_own_live_baseapp(self):
+        first, second = Mock(), Mock()
+        first.poll.return_value = second.poll.return_value = None
+        processes = [SimpleNamespace(name='baseapp', process=first),
+                     SimpleNamespace(name='baseapp-2', process=second)]
+        ports = [(25005, 25006), (25010, 25011)]
+        with self.assertRaisesRegex(RuntimeError, 'not in this test cluster'):
+            test_cluster._kill_baseapp(processes, ports, 26000)
+        first.kill.assert_not_called()
+        second.kill.assert_not_called()
+        test_cluster._kill_baseapp(processes, ports, 25010)
+        first.kill.assert_not_called()
+        second.kill.assert_called_once_with()
+        second.wait.assert_called_once_with(timeout=5)
+        first.poll.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, 'already exited'):
+            test_cluster._kill_baseapp(processes, ports, 25005)
+        first.kill.assert_not_called()
+
+    def test_handoff_cluster_count_is_explicit_and_bounded(self):
+        with patch.object(sys, 'argv', ['test_cluster.py']):
+            self.assertEqual(test_cluster.parse_args().baseapps, 1)
+        with patch.object(sys, 'argv', ['test_cluster.py', '--baseapps', '2']):
+            self.assertEqual(test_cluster.parse_args().baseapps, 2)
+        with patch.object(sys, 'argv', ['test_cluster.py', '--baseapps', '3']), \
+             patch.object(sys, 'stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                test_cluster.parse_args()
+
+    def test_registration_matches_the_whole_process_name(self):
+        outputs = [SimpleNamespace(returncode=0, stdout='baseapp baseapp-2 127.0.0.1:25001'),
+                   SimpleNamespace(returncode=0, stdout='baseapp baseapp 127.0.0.1:25002')]
+        with patch('common.cluster.subprocess.run', side_effect=outputs) as run, \
+             patch('common.cluster.time.sleep'):
+            self.assertTrue(wait_for_registration(atlas_tool=Path('tool'),
+                machined_address='127.0.0.1:25000', proc_type='baseapp', name='baseapp'))
+            self.assertEqual(run.call_count, 2)
+
     def test_cluster_script_override_is_explicit(self):
         with patch.object(sys, 'argv', ['test_cluster.py']):
             self.assertIsNone(test_cluster.parse_args().base_assembly)

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "account_session_messages.h"
 #include "dbapp_messages.h"
 #include "serialization/binary_stream.h"
 
@@ -33,6 +34,69 @@ std::vector<std::byte> make_blob(std::string_view text) {
 // ============================================================================
 // WriteEntity
 // ============================================================================
+
+TEST(DbappMessages, AccountSessionRequestAndReplyRoundTrip) {
+  AccountSessionRequest request;
+  request.request_id = (uint64_t{1} << 40) + 7;
+  request.shard_table_version = 4;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  AccountSessionOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.account_dbid = 42;
+  operation.account_type_id = 7;
+  operation.actor = {Address("127.0.0.1", 30001), 9, 111};
+  operation.claim_checkout = CheckoutInfo{operation.actor.base_addr, 8, 9, 3, 111};
+  request.operation = operation;
+  auto decoded = round_trip(request);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->request_id, request.request_id);
+  EXPECT_EQ(decoded->process_instance, request.process_instance);
+  ASSERT_TRUE(decoded->operation.has_value());
+  EXPECT_EQ(decoded->operation->claim_checkout, operation.claim_checkout);
+  auto decoded_hash = HashSessionOperation(*decoded->operation);
+  auto original_hash = HashSessionOperation(operation);
+  ASSERT_TRUE(decoded_hash.HasValue());
+  ASSERT_TRUE(original_hash.HasValue());
+  EXPECT_EQ(*decoded_hash, *original_hash);
+  AccountSessionReply reply;
+  reply.request_id = request.request_id;
+  reply.requester_instance = request.process_instance;
+  reply.account_dbid = request.account_dbid;
+  reply.account_type_id = request.account_type_id;
+  reply.operation_id = operation.id;
+  reply.status = ErrorCode::kCommitUnknown;
+  reply.error = "commit outcome unknown";
+  auto result = round_trip(reply);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->request_id, reply.request_id);
+  EXPECT_EQ(result->requester_instance, reply.requester_instance);
+  EXPECT_EQ(result->operation_id, operation.id);
+  EXPECT_EQ(result->status, reply.status);
+}
+
+TEST(DbappMessages, AccountSessionTruncationAndTrailingBytesAreRejected) {
+  AccountSessionRequest request;
+  request.operation.emplace();
+  request.operation->claim_checkout.emplace();
+  BinaryWriter writer;
+  request.Serialize(writer);
+  for (std::size_t size = 0; size < writer.Data().size(); ++size) {
+    BinaryReader reader(writer.Data().first(size));
+    EXPECT_FALSE(AccountSessionRequest::Deserialize(reader).HasValue()) << size;
+  }
+  writer.Write(uint8_t{0});
+  BinaryReader extra(writer.Data());
+  EXPECT_FALSE(AccountSessionRequest::Deserialize(extra).HasValue());
+  AccountSessionReply reply;
+  BinaryWriter payload;
+  reply.Serialize(payload);
+  for (std::size_t size = 0; size < payload.Data().size(); ++size) {
+    BinaryReader reader(payload.Data().first(size));
+    EXPECT_FALSE(AccountSessionReply::Deserialize(reader).HasValue()) << size;
+  }
+}
 
 TEST(DbappMessages, WriteEntityRoundTrip) {
   WriteEntity msg;

@@ -24,10 +24,17 @@
 namespace atlas {
 namespace {
 
+class TestCellApp : public CellApp {
+ public:
+  using CellApp::CellApp;
+  using CellApp::OnEndOfTick;
+};
+
 struct Host {
   EventDispatcher dispatcher;
   NetworkInterface network;
-  CellApp app;
+  TestCellApp app;
+  bool drop_offload_replies{false};
 
   explicit Host(std::string name)
       : dispatcher(std::move(name)), network(dispatcher), app(dispatcher, network) {
@@ -35,6 +42,11 @@ struct Host {
     auto& t = network.InterfaceTable();
     (void)t.RegisterTypedHandler<cellapp::OffloadEntity>(
         [this](const Address& src, Channel* ch, const cellapp::OffloadEntity& m) {
+          if (drop_offload_replies) {
+            auto* rudp = dynamic_cast<ReliableUdpChannel*>(ch);
+            ASSERT_NE(rudp, nullptr);
+            rudp->SetTransportImpairment(0, 10000, 1);
+          }
           app.OnOffloadEntity(src, ch, m);
         });
     (void)t.RegisterTypedHandler<cellapp::OffloadEntityAck>(
@@ -183,6 +195,52 @@ TEST(OffloadTraversal, EntityCrossesBspSplit_PumpsOffload) {
   EXPECT_EQ(command->command_id, 77u);
   EXPECT_EQ(command->elapsed_ms, 300u);
   EXPECT_FLOAT_EQ(command->target_position.x, 25.0f);
+}
+
+TEST(OffloadTraversal, LostAcknowledgementKeepsOneRealAndCompletesAfterNetworkRecovery) {
+  Host source("offload_partition_source"), target("offload_partition_target");
+  const auto source_addr = source.StartServer();
+  const auto target_addr = target.StartServer();
+  auto outbound = source.network.ConnectRudp(target_addr);
+  auto inbound = target.network.ConnectRudp(source_addr);
+  ASSERT_TRUE(outbound);
+  ASSERT_TRUE(inbound);
+  source.app.PeerRegistryForTest().InsertForTest(target_addr, *outbound);
+  target.app.PeerRegistryForTest().InsertForTest(source_addr, *inbound);
+  source.app.OnCreateSpace({}, nullptr, cellapp::CreateSpace{42});
+  auto* space = source.app.FindSpace(42);
+  ASSERT_NE(space, nullptr);
+  space->SetBspTree(BuildTwoCellBsp(source_addr, target_addr));
+  space->AddLocalCell(std::make_unique<Cell>(*space, 1, CellBounds{}));
+  cellapp::CreateCellEntity create;
+  create.entity_id = 102;
+  create.type_id = 1;
+  create.space_id = 42;
+  create.position = {-5, 0, 0};
+  source.app.OnCreateCellEntity({}, nullptr, create);
+  auto* entity = source.app.FindRealEntity(create.entity_id);
+  ASSERT_NE(entity, nullptr);
+  entity->SetPosition({25, 0, 0});
+  target.drop_offload_replies = true;
+  source.app.TickOffloadChecker();
+  ASSERT_TRUE(PumpUntil(source, target,
+                        [&] { return target.app.FindRealEntity(create.entity_id) != nullptr; }));
+  EXPECT_TRUE(entity->IsGhost());
+  ASSERT_EQ(source.app.PendingOffloadsForTest().size(), 1u);
+  source.app.PendingOffloadsForTest().at(create.entity_id).sent_at -= std::chrono::seconds(6);
+  source.app.OnEndOfTick();
+  EXPECT_TRUE(entity->IsGhost());
+  ASSERT_EQ(source.app.PendingOffloadsForTest().size(), 1u);
+  EXPECT_TRUE(source.app.PendingOffloadsForTest().at(create.entity_id).outcome_unknown);
+  target.drop_offload_replies = false;
+  (*inbound)->SetTransportImpairment(0, 0, 1);
+  ASSERT_TRUE(PumpUntil(
+      source, target, [&] { return source.app.PendingOffloadsForTest().empty(); },
+      std::chrono::seconds(4)));
+  EXPECT_TRUE(entity->IsGhost());
+  const auto* real = target.app.FindRealEntity(create.entity_id);
+  ASSERT_NE(real, nullptr);
+  EXPECT_EQ(real->CellEpoch(), 1u);
 }
 
 TEST(OffloadTraversal, EntityStaysInOwnCell_NoOffload) {

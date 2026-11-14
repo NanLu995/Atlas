@@ -495,6 +495,7 @@ atlas_add_test(NAME test_database_types
   SOURCES test_database_types.cpp
   DEPS atlas_db
 )
+add_dependencies(test_database_types atlas_db_sqlite_plugin)
 
 atlas_add_test(NAME test_sqlite_database
   SOURCES test_sqlite_database.cpp

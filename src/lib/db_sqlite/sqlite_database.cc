@@ -318,6 +318,15 @@ void SqliteDatabase::PutEntityImpl(const DatabaseWriteOperation* operation, Data
     return;
   }
   if (HasFlag(flags, WriteFlags::kDelete)) {
+    auto session = ReadAccountSessionImpl(dbid, type_id);
+    if (!session || session->phase != AccountSessionPhase::kOffline) {
+      RollbackWriteScope(scope);
+      result.error = session ? "account session must be released before deletion"
+                             : std::string(session.Error().Message());
+      if (session) result.error_kind = DatabaseErrorKind::kOwnershipConflict;
+      FireOrDefer(std::move(callback), std::move(result));
+      return;
+    }
     auto statement = Prepare("DELETE FROM entities WHERE dbid = ? AND type_id = ?");
     if (statement && sqlite3_bind_int64(statement->Get(), 1, dbid) == SQLITE_OK &&
         sqlite3_bind_int(statement->Get(), 2, type_id) == SQLITE_OK &&
@@ -613,37 +622,45 @@ void SqliteDatabase::GetEntity(DatabaseID dbid, uint16_t type_id,
 
 void SqliteDatabase::DelEntity(DatabaseID dbid, uint16_t type_id,
                                std::function<void(DelResult)> callback) {
+  if (!started_ || db_ == nullptr) {
+    FireOrDefer(std::move(callback), DelResult{false, "SQLite delete database unavailable"});
+    return;
+  }
+  auto scope = BeginWriteScope();
+  if (!scope) {
+    FireOrDefer(std::move(callback), DelResult{false, std::string(scope.Error().Message())});
+    return;
+  }
+  auto remove = [&]() -> Result<void> {
+    auto session = ReadAccountSessionImpl(dbid, type_id);
+    if (!session) return session.Error();
+    if (session->phase != AccountSessionPhase::kOffline)
+      return Error{ErrorCode::kPermissionDenied,
+                   "account session must be released before deletion"};
+    auto statement = Prepare("DELETE FROM entities WHERE dbid = ? AND type_id = ?");
+    if (!statement) return statement.Error();
+    auto* stmt = statement->Get();
+    if (sqlite3_bind_int64(stmt, 1, dbid) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 2, type_id) != SQLITE_OK || sqlite3_step(stmt) != SQLITE_DONE)
+      return SqliteError("SQLite delete failed");
+    if (sqlite3_changes(db_) != 1) return Error{ErrorCode::kNotFound, "delete entity not found"};
+    return {};
+  };
+  auto removed = remove();
+  if (removed)
+    removed = CommitWriteScope(*scope);
+  else
+    RollbackWriteScope(*scope);
   DelResult result;
-  auto stmt_result = Prepare("DELETE FROM entities WHERE dbid = ? AND type_id = ?");
-  if (!stmt_result) {
-    result.error = std::string(stmt_result.Error().Message());
-    FireOrDefer(std::move(callback), std::move(result));
-    return;
+  result.success = removed.HasValue();
+  if (!removed) {
+    result.error = removed.Error().Message();
+    const auto code = removed.Error().Code();
+    result.error_kind = code == ErrorCode::kPermissionDenied ? DatabaseErrorKind::kOwnershipConflict
+                        : code == ErrorCode::kCommitUnknown  ? DatabaseErrorKind::kCommitUnknown
+                        : code == ErrorCode::kNotFound       ? DatabaseErrorKind::kNotFound
+                                                             : DatabaseErrorKind::kNone;
   }
-
-  auto stmt = std::move(*stmt_result);
-  auto rc = sqlite3_bind_int64(stmt.Get(), 1, dbid);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt.Get(), 2, static_cast<int>(type_id));
-  if (rc != SQLITE_OK) {
-    result.error = std::string(SqliteError("SqliteDatabase: delete bind failed").Message());
-    FireOrDefer(std::move(callback), std::move(result));
-    return;
-  }
-
-  rc = sqlite3_step(stmt.Get());
-  if (rc != SQLITE_DONE) {
-    result.error = std::string(SqliteError("SqliteDatabase: delete failed", rc).Message());
-    FireOrDefer(std::move(callback), std::move(result));
-    return;
-  }
-
-  if (sqlite3_changes(db_) <= 0) {
-    result.error = std::format("entity ({},{}) not found", type_id, dbid);
-    FireOrDefer(std::move(callback), std::move(result));
-    return;
-  }
-
-  result.success = true;
   FireOrDefer(std::move(callback), std::move(result));
 }
 
@@ -1368,6 +1385,14 @@ auto SqliteDatabase::EnsureSchema() -> Result<void> {
       "result_dbid INTEGER NOT NULL CHECK(result_dbid > 0),"
       "checkout_version INTEGER NOT NULL CHECK(checkout_version >= 0))");
   if (!receipts) return receipts.Error();
+
+  auto sessions = ExecSql(
+      "CREATE TABLE IF NOT EXISTS atlas_account_sessions ("
+      "dbid INTEGER NOT NULL, type_id INTEGER NOT NULL, version INTEGER NOT NULL CHECK(version > "
+      "0),"
+      "payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 256), PRIMARY KEY(dbid, "
+      "type_id))");
+  if (!sessions) return sessions.Error();
 
   auto eid_table_result = ExecSql(
       "CREATE TABLE IF NOT EXISTS atlas_entity_id_counter ("

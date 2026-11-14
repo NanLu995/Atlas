@@ -76,6 +76,30 @@ public sealed class ClientRpcReplyTests
     }
 
     [Fact]
+    public async Task HandoffCancelsOldWaitsAndRejectsTheirLateReplies()
+    {
+        var session = new ClientSession();
+        var entity = new RpcEntity();
+        session.EntityManager.Register(entity);
+        session.SpaceDataManager.SetKey(9, 1, new byte[] { 7 });
+        var old = AtlasRpc.Await<int>(session.RpcRegistry, 102, 17,
+            static (ref SpanReader reader) => RpcReply<int>.Ok(reader.ReadInt32()), timeoutMs: 0);
+        session.DeliverFromServer(ClientCallbacks.kClientHandoffMessageId, Array.Empty<byte>());
+        Assert.True(entity.IsDestroyed);
+        Assert.Equal(0, session.EntityManager.Count);
+        Assert.False(session.SpaceDataManager.TryGet(9, 1, out _));
+        Assert.True(old.GetAwaiter().IsCompleted);
+        Assert.Equal(RpcErrorCodes.ReceiverGone, (await old).Error);
+        var current = AtlasRpc.Await<int>(session.RpcRegistry, 102, 18,
+            static (ref SpanReader reader) => RpcReply<int>.Ok(reader.ReadInt32()), timeoutMs: 0);
+        session.DeliverFromServer(102, Reply(17, 7));
+        Assert.False(current.GetAwaiter().IsCompleted);
+        session.DeliverFromServer(102, Reply(18, 8));
+        Assert.Equal(8, (await current).Value);
+        session.Reset();
+    }
+
+    [Fact]
     public async Task ReplyIsDeliveredOnlyToItsSessionAndCompletesOnce()
     {
         var first = new ClientSession();

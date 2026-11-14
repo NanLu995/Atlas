@@ -1,5 +1,9 @@
 using System;
 using Atlas.Core;
+using Atlas.Coro;
+using Atlas.Coro.Rpc;
+using Atlas.Protocol;
+using Atlas.Runtime.Coro;
 using Atlas.Serialization;
 
 namespace Atlas.Entity;
@@ -7,10 +11,39 @@ namespace Atlas.Entity;
 // Base-resident entity base — owns the client proxy and base→cell orchestration.
 public abstract class BaseServerEntity : ServerEntity
 {
-    // After-call: subsequent client RPCs target destEntityId, not `this`.
-    protected internal void GiveClientTo(uint destEntityId)
+    public bool TryGetClientHandoffTarget(out ClientHandoffTarget target)
     {
-        NativeApi.GiveClientTo(EntityId, destEntityId);
+        ThreadGuard.EnsureMainThread();
+        if (NativeApi.GetClientHandoffTarget(EntityId, out var ip, out var port,
+                out var instance) != 0)
+        {
+            target = new ClientHandoffTarget(EntityId, ip, port, instance);
+            return true;
+        }
+        target = default;
+        return false;
+    }
+
+    protected internal AtlasTask<RpcReply<bool>> GiveClientToAsync(uint destEntityId,
+        AtlasCancellationToken ct = default)
+        => GiveClientToAsync(new ClientHandoffTarget(destEntityId, 0, 0, 0), ct);
+
+    protected internal AtlasTask<RpcReply<bool>> GiveClientToAsync(ClientHandoffTarget target,
+        AtlasCancellationToken ct = default)
+    {
+        ThreadGuard.EnsureMainThread();
+        var requestId = AtlasRpc.NextRequestId();
+        var source = AtlasRpcSource<RpcReply<bool>>.Rent();
+        source.Start(NativeRpcRegistry.Instance, MessageIds.EntityRpcReply, requestId,
+            static (ref SpanReader reader) => RpcReply<bool>.Ok(reader.ReadBool()),
+            RpcReplyHelpers.For<bool>(), target.ProcessInstance == 0 ? AtlasRpc.DefaultTimeoutMs : 40000,
+            ct, LifecycleCancellation);
+        var task = source.Task;
+        if (!task.GetAwaiter().IsCompleted &&
+            NativeApi.TransferClient(EntityId, target.EntityId, target.BaseIp, target.BasePort,
+                target.ProcessInstance, requestId) != RpcSendResult.Queued)
+            source.FailSend();
+        return task;
     }
 
     // hysteresis is the leave-band width: enter at radius, leave at
@@ -20,9 +53,8 @@ public abstract class BaseServerEntity : ServerEntity
         NativeApi.SetAoIRadius(EntityId, radius, hysteresis);
     }
 
-    // Snapshot full entity state to DBApp. Use for entities outside BaseApp's
-    // automatic logoff-snapshot path (e.g. an Account that handed off the
-    // client via GiveClientTo); a no-op on non-BaseApp process types.
+    // Accounts detached after GiveClientToAsync need an explicit snapshot;
+    // BaseApp automatically saves the entity owning the client during logoff.
     public void PersistToDb()
     {
         var w = new SpanWriter(256);
@@ -33,4 +65,20 @@ public abstract class BaseServerEntity : ServerEntity
         }
         finally { w.Dispose(); }
     }
+}
+
+public readonly struct ClientHandoffTarget
+{
+    public ClientHandoffTarget(uint entityId, uint baseIp, ushort basePort, ulong processInstance)
+    {
+        EntityId = entityId;
+        BaseIp = baseIp;
+        BasePort = basePort;
+        ProcessInstance = processInstance;
+    }
+
+    public uint EntityId { get; }
+    public uint BaseIp { get; }
+    public ushort BasePort { get; }
+    public ulong ProcessInstance { get; }
 }

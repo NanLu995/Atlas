@@ -191,7 +191,7 @@ UEClient Output Log 按顺序应该出现：
 
 ```
 LogAtlasUE: Loaded ATDF from ...entity_defs.bin; digest_size=32
-LogAtlasUE: AtlasUE module started; atlas_net_client ABI=0x02050000
+LogAtlasUE: AtlasUE module started; atlas_net_client ABI=0x03000000
 LogUEClient: Atlas login host=127.0.0.1 port=20018 user=mvp_<guid>
 LogUEClient: Atlas login succeeded, authenticating
 LogUEClient: Sent Account.SelectAvatar(1) entity_id=<n>
@@ -284,6 +284,9 @@ Left Shift 触发 `Avatar.Dash`，由 cell 脚本写入 server-stamped
 `Avatar` 暴露 cell 方法 `Say(text)`（`exposed="own_client"`，服务端 200 字符上限），通过 `AllClients.OnChat(senderId, text)` 扇出给 AoI 内所有观察者。HUD 左下角是聊天面板（5 行滚动 + 输入框）；点击输入框聚焦后会阻塞 WASD/Space，避免移动和射击混进消息。两个客户端同时连接时彼此可见，端到端验证 own_client → cell → AllClients 广播链路。
 
 ### 持久化覆盖
+
+`SelectAvatar` 等待 `GiveClientToAsync` 确认后才通过 Avatar 发送会话信息；
+所有权确认失败或结果不确定时在服务器日志中明确报告。
 
 `Account.loginCount` 与 `Account.lastLogin` 标记为 `persistent="true"`，会自动经 DBApp 往返：`Account.SelectAvatar` 绑定角色时自增计数、写入 UTC 时间，并在交出客户端前主动刷新 Account。logoff 时 DBApp 仍会持久化最终 Account 快照，下次会话通过 `CheckoutEntity` 重新加载。HUD 的 `SESSION` 行显示 `#N · MM-DD HH:MM`（本次会话编号 + 上次会话的 UTC 时间），是 DBApp 保存/加载循环正常工作的最直观确认。
 

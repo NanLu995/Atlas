@@ -10,6 +10,7 @@ public enum AtlasNetState
     LoginSucceeded  = 2,
     Authenticating  = 3,
     Connected       = 4,
+    Handoff         = 5,
 }
 
 public enum AtlasLoginStatus : byte

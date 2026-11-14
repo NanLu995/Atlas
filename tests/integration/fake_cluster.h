@@ -13,6 +13,10 @@
 #include "network/network_interface.h"
 #include "server/entity_types.h"
 
+namespace atlas::baseapp {
+struct ClientHandoff;
+}
+
 namespace atlas::test {
 
 enum class LoginPolicy : uint8_t {
@@ -62,6 +66,7 @@ class FakeCluster {
   bool PushEntityPositionUpdate(EntityID eid, float px, float py, float pz, float dx, float dy,
                                 float dz, bool on_ground, double server_time);
   bool PushMovementStateAck(EntityID eid, uint32_t acked_input_seq, uint32_t server_tick);
+  bool PushClientHandoff(const baseapp::ClientHandoff& request);
 
  private:
   EventDispatcher disp_loginapp_{"fake_loginapp"};

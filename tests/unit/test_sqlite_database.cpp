@@ -1,11 +1,13 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <limits>
 
 #include <gtest/gtest.h>
 
 #include "db_sqlite/sqlite_database.h"
 #include "entitydef/entity_def_registry.h"
+#include "test_account_session_contract.h"
 
 using namespace atlas;
 
@@ -142,6 +144,134 @@ class SqliteDatabaseTest : public ::testing::Test {
   SqliteDatabase db_;
   std::filesystem::path test_dir_;
 };
+
+TEST_F(SqliteDatabaseTest, AccountSessionOwnershipContract) {
+  atlas::test_support::CheckAccountSessionContract(db_);
+}
+
+TEST_F(SqliteDatabaseTest, SessionClaimAcceptsAProcessCheckoutBeforeEntityAllocation) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_, 0);
+  ASSERT_TRUE(claim.HasValue());
+  auto granted = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(granted.HasValue()) << granted.Error().Message();
+  EXPECT_EQ(granted->owner.entity_id, 100u);
+  db_.GetEntity(claim->account_dbid, 1, [](GetResult result) {
+    ASSERT_TRUE(result.success);
+    ASSERT_TRUE(result.checked_out_by.has_value());
+    EXPECT_EQ(result.checked_out_by->entity_id, 0u);
+  });
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionMustBeReleasedBeforeDeletingAccount) {
+  atlas::test_support::CheckSessionDeletionFence(db_);
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionAbortFencesLateCompletion) {
+  atlas::test_support::CheckSessionAbortContract(db_);
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionRetirementRejectsReceiptReplay) {
+  atlas::test_support::CheckRetiredSessionReplay(db_);
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionCommitFailureCannotGrantControl) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  atlas::SqliteDatabaseTestAccess::RejectCommits(db_, true);
+  auto failed = atlas::test_support::UpdateSession(db_, *claim);
+  atlas::SqliteDatabaseTestAccess::RejectCommits(db_, false);
+  ASSERT_FALSE(failed.HasValue());
+  EXPECT_EQ(failed.Error().Code(), ErrorCode::kCommitUnknown);
+  db_.ReadAccountSession(claim->account_dbid, 1, [](Result<AccountSession> value) {
+    ASSERT_TRUE(value.HasValue());
+    EXPECT_EQ(value->version, 0u);
+  });
+  auto replay = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(replay.HasValue());
+  EXPECT_EQ(replay->version, 1u);
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionBatchCallbackWaitsForCommit) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  bool called = false;
+  db_.BeginBatch();
+  db_.UpdateAccountSession(*claim, [&](Result<AccountSession> value) {
+    called = true;
+    ASSERT_TRUE(value.HasValue());
+    EXPECT_EQ(value->version, 1u);
+  });
+  db_.ProcessResults();
+  EXPECT_FALSE(called);
+  db_.EndBatch();
+  db_.ProcessResults();
+  EXPECT_TRUE(called);
+}
+
+TEST_F(SqliteDatabaseTest, AccountSessionBatchCommitFailureInvalidatesCallback) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  bool called = false;
+  db_.BeginBatch();
+  db_.UpdateAccountSession(*claim, [&](Result<AccountSession> value) {
+    called = true;
+    ASSERT_FALSE(value.HasValue());
+    EXPECT_EQ(value.Error().Code(), ErrorCode::kCommitUnknown);
+  });
+  atlas::SqliteDatabaseTestAccess::RejectCommits(db_, true);
+  db_.EndBatch();
+  atlas::SqliteDatabaseTestAccess::RejectCommits(db_, false);
+  db_.ProcessResults();
+  EXPECT_TRUE(called);
+  db_.ReadAccountSession(claim->account_dbid, 1, [](Result<AccountSession> value) {
+    ASSERT_TRUE(value.HasValue());
+    EXPECT_EQ(value->version, 0u);
+  });
+}
+
+TEST_F(SqliteDatabaseTest, CorruptedAccountSessionIsNotAnOfflineGrant) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  ASSERT_TRUE(atlas::test_support::UpdateSession(db_, *claim).HasValue());
+  ASSERT_TRUE(atlas::SqliteDatabaseTestAccess::Execute(
+      db_, "UPDATE atlas_account_sessions SET payload=X'00'"));
+  db_.ReadAccountSession(claim->account_dbid, 1, [](Result<AccountSession> value) {
+    ASSERT_FALSE(value.HasValue());
+    EXPECT_EQ(value.Error().Code(), ErrorCode::kIoError);
+  });
+  EXPECT_FALSE(atlas::test_support::UpdateSession(db_, *claim).HasValue());
+}
+
+TEST(AccountSessionFormat, TruncationInvalidGrantAndExhaustionAreRejected) {
+  AccountSession session;
+  session.version = 1;
+  session.phase = AccountSessionPhase::kActive;
+  session.owner = {Address(0x7F000001u, 31000), 100, 101};
+  BinaryWriter writer;
+  WriteAccountSession(writer, session);
+  for (std::size_t size = 0; size < writer.Data().size(); ++size) {
+    BinaryReader reader(writer.Data().first(size));
+    EXPECT_FALSE(ReadAccountSession(reader).HasValue()) << size;
+  }
+  BinaryReader reader(writer.Data());
+  auto decoded = ReadAccountSession(reader);
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_EQ(*decoded, session);
+  session.target = session.owner;
+  EXPECT_FALSE(ValidateAccountSession(session).HasValue());
+  session.target = {};
+  session.version = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  AccountSessionOperation release;
+  release.id[0] = std::byte{1};
+  release.account_dbid = 1;
+  release.account_type_id = 1;
+  release.actor = session.owner;
+  release.expected_version = session.version;
+  release.action = AccountSessionAction::kRelease;
+  const auto exhausted = ApplySessionOperation(session, release);
+  ASSERT_FALSE(exhausted.HasValue());
+  EXPECT_EQ(exhausted.Error().Code(), ErrorCode::kOutOfRange);
+}
 
 TEST_F(SqliteDatabaseTest, PutNewEntityAndGet) {
   PutResult put;

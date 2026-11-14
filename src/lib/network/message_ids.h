@@ -46,7 +46,6 @@ enum class Machined : uint16_t {
 enum class BaseApp : uint16_t {
   kCreateBase = 2000,
   kCreateBaseFromDb = 2001,
-  kAcceptClient = 2002,
   kCellEntityCreated = 2010,
   kCellEntityDestroyed = 2011,
   kCurrentCell = 2012,
@@ -82,6 +81,11 @@ enum class BaseApp : uint16_t {
   kMovementCorrectionReport = 2036,
   kMovementCommandStartFromCell = 2037,
   kMovementCommandEndFromCell = 2038,
+  kRevokeAccountSession = 2039,
+  kRevokeAccountSessionReply = 2040,
+  kPrepareClientHandoff = 2041,
+  kPrepareClientHandoffReply = 2042,
+  kClientHandoff = 2043,
 };
 
 // CellApp outbound traffic to BaseApp reuses BaseApp IDs.
@@ -167,6 +171,8 @@ enum class DBApp : uint16_t {
   kGetEntityIdsAck = 4021,
   kPutEntityIds = 4022,
   kPutEntityIdsAck = 4023,
+  kAccountSessionRequest = 4030,
+  kAccountSessionReply = 4031,
 };
 
 enum class DBAppMgr : uint16_t {
@@ -230,7 +236,6 @@ ATLAS_ASSERT_ID_RANGE(Machined::kShutdownTarget, 1000, 1099);
 
 ATLAS_ASSERT_ID_RANGE(BaseApp::kCreateBase, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kCreateBaseFromDb, 2000, 2999);
-ATLAS_ASSERT_ID_RANGE(BaseApp::kAcceptClient, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kCellEntityCreated, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kCellEntityDestroyed, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kCurrentCell, 2000, 2999);
@@ -254,6 +259,11 @@ ATLAS_ASSERT_ID_RANGE(BaseApp::kMovementStateAckFromCell, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kMovementCorrectionReport, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kMovementCommandStartFromCell, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kMovementCommandEndFromCell, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kRevokeAccountSession, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kRevokeAccountSessionReply, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kPrepareClientHandoff, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kPrepareClientHandoffReply, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kClientHandoff, 2000, 2999);
 
 ATLAS_ASSERT_ID_RANGE(CellApp::kCreateCellEntity, 3000, 3999);
 ATLAS_ASSERT_ID_RANGE(CellApp::kSpawnLocalEntity, 3000, 3999);
@@ -316,6 +326,8 @@ ATLAS_ASSERT_ID_RANGE(DBApp::kGetEntityIds, 4000, 4999);
 ATLAS_ASSERT_ID_RANGE(DBApp::kGetEntityIdsAck, 4000, 4999);
 ATLAS_ASSERT_ID_RANGE(DBApp::kPutEntityIds, 4000, 4999);
 ATLAS_ASSERT_ID_RANGE(DBApp::kPutEntityIdsAck, 4000, 4999);
+ATLAS_ASSERT_ID_RANGE(DBApp::kAccountSessionRequest, 4000, 4999);
+ATLAS_ASSERT_ID_RANGE(DBApp::kAccountSessionReply, 4000, 4999);
 
 ATLAS_ASSERT_ID_RANGE(DBAppMgr::kRegisterDbApp, 8000, 8099);
 ATLAS_ASSERT_ID_RANGE(DBAppMgr::kRegisterDbAppAck, 8000, 8099);

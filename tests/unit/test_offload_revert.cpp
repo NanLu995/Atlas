@@ -1,11 +1,4 @@
-// Offload rollback tests.
-//
-// Drives CellApp::RevertPendingOffload directly on a locally-constructed
-// CellApp (ctor only, no Init) with a hand-seeded PendingOffload + a
-// Ghost entity. Verifies that revert promotes the Ghost back to Real,
-// restores haunts / local-Cell membership / controllers, and behaves
-// safely on edge cases.
-
+#include <chrono>
 #include <cstdint>
 #include <memory>
 
@@ -15,6 +8,7 @@
 #include "cell_entity.h"
 #include "cellapp.h"
 #include "controller_codec.h"
+#include "intercell_messages.h"
 #include "math/vector3.h"
 #include "network/channel.h"
 #include "network/event_dispatcher.h"
@@ -28,6 +22,18 @@
 #include "witness.h"
 
 namespace atlas {
+
+struct CellAppMigrationTestAccess {
+  static void TickTimeouts(CellApp& app) { app.TickOffloadAckTimeouts(); }
+
+  static void FillReceipts(CellApp& app) {
+    for (uint32_t id = 1; id <= app.kMaxOffloadReceipts; ++id) {
+      app.offload_receipts_.emplace(
+          id, CellApp::OffloadReceipt{0, {}, cellapp::OffloadRejectReason::kNone});
+    }
+  }
+};
+
 namespace {
 
 using test_support::FakeChannel;
@@ -78,9 +84,132 @@ auto CaptureSnapshot(CellApp::PendingOffload& po, const CellEntity& entity, Spac
   po.controller_blob.assign(buf.begin(), buf.end());
 }
 
-// ============================================================================
-// Successful revert path: Ghost → Real, haunts + cell + controllers restored.
-// ============================================================================
+TEST(OffloadRevert, AckFromAnotherTrustedPeerCannotRevert) {
+  Harness h;
+  const Address target(0x7F000001u, 30002);
+  const Address other(0x7F000001u, 30003);
+  auto* target_channel = FakeChannel(0xBEEF);
+  auto* other_channel = FakeChannel(0xCAFE);
+  h.app.PeerRegistryForTest().InsertForTest(target, target_channel);
+  h.app.PeerRegistryForTest().InsertForTest(other, other_channel);
+  auto* entity = SeedEntityWithState(h, 100, nullptr);
+  auto& pending = h.app.PendingOffloadsForTest()[entity->Id()];
+  CaptureSnapshot(pending, *entity, 42, 7, target, {});
+  entity->ConvertRealToGhost(target_channel, target);
+  entity->GetSpace().FindLocalCell(7)->RemoveRealEntity(entity);
+  cellapp::OffloadEntityAck ack;
+  ack.entity_id = entity->Id();
+
+  h.app.OnOffloadEntityAck(other, other_channel, ack);
+
+  EXPECT_TRUE(entity->IsGhost());
+  EXPECT_EQ(h.app.PendingOffloadsForTest().size(), 1u);
+}
+
+TEST(OffloadRevert, TimeoutKeepsGhostAndRecoverySnapshot) {
+  Harness h;
+  const Address target(0x7F000001u, 30002);
+  auto* entity = SeedEntityWithState(h, 100, nullptr);
+  auto& pending = h.app.PendingOffloadsForTest()[entity->Id()];
+  CaptureSnapshot(pending, *entity, 42, 7, target, {});
+  pending.sent_at -= std::chrono::seconds(6);
+  entity->ConvertRealToGhost(FakeChannel(0xBEEF), target);
+  entity->GetSpace().FindLocalCell(7)->RemoveRealEntity(entity);
+
+  CellAppMigrationTestAccess::TickTimeouts(h.app);
+
+  EXPECT_TRUE(entity->IsGhost());
+  EXPECT_EQ(h.app.PendingOffloadsForTest().size(), 1u);
+  CellAppMigrationTestAccess::TickTimeouts(h.app);
+  EXPECT_TRUE(entity->IsGhost());
+}
+
+TEST(OffloadRevert, LostTargetKeepsGhostAndRecoverySnapshot) {
+  Harness h;
+  const Address target(0x7F000001u, 30002);
+  auto* entity = SeedEntityWithState(h, 100, nullptr);
+  auto& pending = h.app.PendingOffloadsForTest()[entity->Id()];
+  CaptureSnapshot(pending, *entity, 42, 7, target, {});
+  entity->ConvertRealToGhost(FakeChannel(0xBEEF), target);
+  entity->GetSpace().FindLocalCell(7)->RemoveRealEntity(entity);
+
+  h.app.HandlePeerLost(target, false);
+
+  const auto* retained = h.app.FindEntity(100);
+  ASSERT_NE(retained, nullptr);
+  EXPECT_TRUE(retained->IsGhost());
+  EXPECT_EQ(retained->GetRealChannel(), nullptr);
+  EXPECT_EQ(h.app.PendingOffloadsForTest().size(), 1u);
+}
+
+TEST(OffloadRevert, AckMatchesAttemptAndChannelBeforeReverting) {
+  Harness h;
+  const Address target(0x7F000001u, 30002);
+  auto* target_channel = FakeChannel(0xBEEF);
+  h.app.PeerRegistryForTest().InsertForTest(target, target_channel);
+  auto* entity = SeedEntityWithState(h, 100, nullptr);
+  auto& pending = h.app.PendingOffloadsForTest()[entity->Id()];
+  CaptureSnapshot(pending, *entity, 42, 7, target, {});
+  pending.cell_epoch = 7;
+  entity->SetCellEpoch(8);
+  entity->ConvertRealToGhost(target_channel, target);
+  entity->GetSpace().FindLocalCell(7)->RemoveRealEntity(entity);
+  cellapp::OffloadEntityAck ack;
+  ack.entity_id = entity->Id();
+  ack.cell_epoch = 6;
+
+  h.app.OnOffloadEntityAck(target, target_channel, ack);
+  EXPECT_TRUE(entity->IsGhost());
+  ack.cell_epoch = 7;
+  h.app.OnOffloadEntityAck(target, FakeChannel(0xCAFE), ack);
+  EXPECT_TRUE(entity->IsGhost());
+  h.app.OnOffloadEntityAck(target, target_channel, ack);
+  EXPECT_TRUE(entity->IsReal());
+  EXPECT_EQ(entity->CellEpoch(), 8u);
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+}
+
+TEST(OffloadRevert, LateSuccessCompletesUncertainAttemptExactlyOnce) {
+  Harness h;
+  const Address target(0x7F000001u, 30002);
+  auto* target_channel = FakeChannel(0xBEEF);
+  h.app.PeerRegistryForTest().InsertForTest(target, target_channel);
+  auto* entity = SeedEntityWithState(h, 100, nullptr);
+  auto& pending = h.app.PendingOffloadsForTest()[entity->Id()];
+  CaptureSnapshot(pending, *entity, 42, 7, target, {});
+  pending.sent_at -= std::chrono::seconds(6);
+  entity->ConvertRealToGhost(target_channel, target);
+  entity->GetSpace().FindLocalCell(7)->RemoveRealEntity(entity);
+  CellAppMigrationTestAccess::TickTimeouts(h.app);
+  ASSERT_TRUE(pending.outcome_unknown);
+  cellapp::OffloadEntityAck ack;
+  ack.entity_id = entity->Id();
+  ack.success = true;
+  ack.reject_reason = cellapp::OffloadRejectReason::kNone;
+
+  h.app.OnOffloadEntityAck(target, target_channel, ack);
+  h.app.OnOffloadEntityAck(target, target_channel, ack);
+
+  EXPECT_TRUE(entity->IsGhost());
+  EXPECT_TRUE(h.app.PendingOffloadsForTest().empty());
+}
+
+TEST(OffloadRevert, ReceiptCapacityRejectsNewEntityBeforeCreation) {
+  Harness h;
+  const Address source(0x7F000001u, 30002);
+  auto* source_channel = FakeChannel(0xBEEF);
+  h.app.PeerRegistryForTest().InsertForTest(source, source_channel);
+  CellAppMigrationTestAccess::FillReceipts(h.app);
+  cellapp::OffloadEntity msg;
+  msg.entity_id = 70000;
+  msg.type_id = 1;
+  msg.space_id = 42;
+
+  h.app.OnOffloadEntity(source, source_channel, msg);
+
+  EXPECT_EQ(h.app.FindEntity(msg.entity_id), nullptr);
+  EXPECT_EQ(h.app.FindSpace(msg.space_id), nullptr);
+}
 
 TEST(OffloadRevert, RevertRestoresRealWithHauntsCellAndControllers) {
   Harness h;
@@ -254,11 +383,6 @@ TEST(OffloadRevert, RevertOnDestroyedEntity) {
   EXPECT_EQ(h.app.PendingOffloadsForTest().size(), 0u);
 }
 
-// ============================================================================
-// Revert with a malformed (truncated) controller blob — entity becomes Real
-// again, controllers may be partially restored, no crash.
-// ============================================================================
-
 TEST(OffloadRevert, RevertWithMalformedControllerBlob) {
   Harness h;
   auto* peer_channel = FakeChannel(0xBEEF);
@@ -270,7 +394,6 @@ TEST(OffloadRevert, RevertWithMalformedControllerBlob) {
   CaptureSnapshot(po, *entity, /*sid=*/42, /*cid=*/7, target,
                   /*haunt_addrs=*/{});
 
-  // Truncate the controller blob to only 2 bytes — this is malformed.
   ASSERT_GT(po.controller_blob.size(), 2u);
   po.controller_blob.resize(2);
 
@@ -283,14 +406,12 @@ TEST(OffloadRevert, RevertWithMalformedControllerBlob) {
   h.app.PendingOffloadsForTest()[entity->Id()] = std::move(po);
   h.app.RevertPendingOffload(entity->Id(), "malformed-blob");
 
-  // Entity must be Real again — no crash.
-  EXPECT_TRUE(entity->IsReal());
-  EXPECT_EQ(h.app.PendingOffloadsForTest().size(), 0u);
-  // Cell membership should be restored.
-  EXPECT_TRUE(entity->GetSpace().FindLocalCell(7)->HasRealEntity(entity));
-  // Controllers may be partially restored or empty — 0 is acceptable
-  // when the blob is too truncated to decode any controller.
-  EXPECT_LE(entity->GetControllers().Count(), 1u);
+  EXPECT_TRUE(entity->IsGhost());
+  EXPECT_FALSE(entity->IsReal());
+  ASSERT_EQ(h.app.PendingOffloadsForTest().size(), 1u);
+  EXPECT_EQ(h.app.PendingOffloadsForTest().at(entity->Id()).controller_blob.size(), 2u);
+  EXPECT_FALSE(entity->GetSpace().FindLocalCell(7)->HasRealEntity(entity));
+  EXPECT_EQ(entity->GetControllers().Count(), 0u);
 }
 
 }  // namespace

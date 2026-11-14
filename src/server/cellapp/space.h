@@ -51,6 +51,8 @@ class Space {
 
   // Idempotent on missing id.
   void RemoveEntity(EntityID id);
+  // Detaches ownership while retaining RangeList membership until rollback or destruction.
+  auto ExtractEntity(EntityID id) -> std::unique_ptr<CellEntity>;
 
   [[nodiscard]] auto FindEntity(EntityID id) -> CellEntity*;
   [[nodiscard]] auto FindEntity(EntityID id) const -> const CellEntity*;

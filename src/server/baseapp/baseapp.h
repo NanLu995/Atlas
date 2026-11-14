@@ -12,8 +12,13 @@
 #include "baseapp_messages.h"
 #include "baseapp_native_provider.h"
 #include "cellapp/cellapp_messages.h"
+#include "client_handoff_messages.h"
+#include "coro/cancellation.h"
+#include "coro/fire_and_forget.h"
 #include "coro/pending_rpc_registry.h"
+#include "coro/task.h"
 #include "db/idatabase.h"
+#include "dbapp/account_session_messages.h"
 #include "dbapp/dbapp_messages.h"
 #include "dbappmgr/dbappmgr_messages.h"
 #include "delta_forwarder.h"
@@ -27,13 +32,13 @@
 #include "server/entity_app.h"
 #include "server/entity_types.h"
 #include "server/id_client.h"
+#include "session_messages.h"
 
 namespace atlas {
 
 namespace baseapp {
 struct CreateBase;
 struct CreateBaseFromDB;
-struct AcceptClient;
 struct CellEntityCreated;
 struct CellEntityCreateFailed;
 struct CellEntityDestroyed;
@@ -113,7 +118,7 @@ class BaseApp : public EntityApp {
   // Returns 0 if no CellAppMgr connected; else request_id.
   // initial_cell_count > 1 asks CellAppMgr to bootstrap distributed cells.
   auto RequestCreateSpace(SpaceID space_id, SpaceCreatedCallback callback,
-                          uint16_t initial_cell_count = 1) -> uint32_t;
+                          uint16_t initial_cell_count = 1, bool reuse_existing = false) -> uint32_t;
 
   // Empty type_name unregisters. Registration also eagerly fires the
   // CreateSpaceRequest so the space master is alive before any client login.
@@ -152,7 +157,6 @@ class BaseApp : public EntityApp {
 
   void OnCreateBase(Channel& ch, const baseapp::CreateBase& msg);
   void OnCreateBaseFromDb(Channel& ch, const baseapp::CreateBaseFromDB& msg);
-  void OnAcceptClient(Channel& ch, const baseapp::AcceptClient& msg);
   void OnCellEntityCreated(Channel& ch, const baseapp::CellEntityCreated& msg);
   void OnCellEntityCreateFailed(const baseapp::CellEntityCreateFailed& msg);
   void OnCellEntityDestroyed(Channel& ch, const baseapp::CellEntityDestroyed& msg);
@@ -188,6 +192,7 @@ class BaseApp : public EntityApp {
   void OnGetEntityIdsAck(Channel& ch, const dbapp::GetEntityIdsAck& msg);
 
   void OnClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg);
+  void FinishClientAuthenticate(Channel& ch, const baseapp::Authenticate& msg);
   void OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg);
   void OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg);
   void ForwardClientCellRpc(Channel& client, Channel& cell, EntityID source_entity_id,
@@ -197,8 +202,8 @@ class BaseApp : public EntityApp {
 
   friend class BaseAppNativeProvider;
   void DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len);
-  void DoGiveClientToLocal(EntityID src_id, EntityID dest_id);
-  void DoGiveClientToRemote(EntityID src_id, EntityID dest_id, const Address& dest_baseapp);
+  auto DoGiveClientToLocal(EntityID src_id, EntityID dest_id) -> Result<void>;
+  auto NotifyClientCellReady(EntityID entity_id) -> Result<void>;
 
   // Allocates an ID, hydrates C#, and sends CreateCellEntity if cell-bound.
   // Returns the new EntityID, or 0 on failure.
@@ -248,6 +253,93 @@ class BaseApp : public EntityApp {
   [[nodiscard]] auto ResolveDbAppChannel(DatabaseID dbid) -> Channel*;
   [[nodiscard]] auto ConnectDbAppChannel(const Address& addr) -> Channel*;
   [[nodiscard]] auto FindDbAppShard(DatabaseID dbid) const -> const dbappmgr::ShardEntry*;
+  auto QueryAccountSession(DatabaseID dbid, uint16_t type_id,
+                           std::optional<AccountSessionOperation> operation,
+                           CancellationToken token = {}) -> Task<Result<AccountSession>>;
+  void OnAccountSessionReply(Channel* channel, const dbapp::AccountSessionReply& reply);
+  static auto MakeSessionOperation(DatabaseID dbid, uint16_t type_id, const AccountSession& record,
+                                   const AccountSessionOwner& owner, AccountSessionAction action)
+      -> Result<AccountSessionOperation>;
+  struct ClientSession {
+    DatabaseID account_dbid{kInvalidDBID};
+    uint16_t account_type_id{0};
+    uint32_t prepared_request_id{0};
+    EntityID transfer_target{kInvalidEntityID};
+    AccountSessionOwner owner;
+    AccountSession record;
+    std::optional<AccountSessionOperation> pending_operation;
+    CancellationSource wait_cancel;
+    bool busy{false};
+    bool frozen{true};
+    bool revoking{false};
+    bool remote_handoff{false};
+    bool supports_handoff{false};
+    AccountSessionOwner handoff_source;
+    uint64_t handoff_prepared_version{0};
+  };
+  auto AuthenticateClientSession(IntrusivePtr<Channel> channel, baseapp::Authenticate request,
+                                 std::shared_ptr<ClientSession> session) -> FireAndForget;
+  auto ReloginAfterSessionRelease(EntityID entity_id, PendingLogin pending) -> FireAndForget;
+  auto ApplyClientSessionOperation(std::shared_ptr<ClientSession> session,
+                                   AccountSessionOperation operation, CancellationToken token = {})
+      -> Task<Result<AccountSession>>;
+  auto ReleaseClientSession(EntityID entity_id, std::optional<uint64_t> expected_version = {})
+      -> Task<Result<void>>;
+  auto ReleaseClientSessionThen(EntityID entity_id, std::function<void(bool)> complete)
+      -> FireAndForget;
+  auto MoveClientSession(EntityID source, EntityID destination) -> Task<Result<void>>;
+  auto MoveRemoteClientSession(EntityID source, AccountSessionOwner target) -> Task<Result<void>>;
+  auto RecoverClientHandoff(std::shared_ptr<ClientSession> session,
+                            std::array<std::byte, 16> handoff_id, Error error)
+      -> Task<Result<void>>;
+  auto CallClientHandoff(Channel& channel, baseapp::PrepareClientHandoff request,
+                         CancellationToken token) -> Task<Result<AccountSession>>;
+  auto StartClientTransfer(EntityID source, EntityID destination, uint64_t request_id,
+                           AccountSessionOwner target = {}) -> RpcSendResult;
+  auto CompleteClientTransfer(EntityID source, EntityID destination, uint64_t request_id,
+                              intptr_t reply, AccountSessionOwner target) -> FireAndForget;
+  [[nodiscard]] auto HasFrozenClientSession(EntityID entity_id) const -> bool;
+  std::unordered_map<EntityID, std::shared_ptr<ClientSession>> client_sessions_;
+  std::unordered_set<EntityID> client_transfer_targets_;
+  struct IncomingClientHandoff {
+    baseapp::PrepareClientHandoff request;
+    std::shared_ptr<ClientSession> session;
+    SessionKey credential_hash;
+    TimePoint checked_at{Clock::now()};
+    bool authenticating{false};
+    bool expiring{false};
+    struct Waiter {
+      IntrusivePtr<Channel> channel;
+      baseapp::PrepareClientHandoff request;
+    };
+    std::optional<Waiter> waiter;
+  };
+  void RegisterClientHandoffHandlers();
+  auto OnPrepareClientHandoff(IntrusivePtr<Channel> channel, baseapp::PrepareClientHandoff request)
+      -> FireAndForget;
+  void OnAwaitClientHandoff(IntrusivePtr<Channel> channel,
+                            const baseapp::PrepareClientHandoff& request);
+  auto TryAuthenticateClientHandoff(Channel& channel, const baseapp::Authenticate& request) -> bool;
+  auto AuthenticateClientHandoff(IntrusivePtr<Channel> channel, baseapp::Authenticate request,
+                                 std::shared_ptr<IncomingClientHandoff> incoming) -> FireAndForget;
+  void DropIncomingClientHandoff(EntityID entity_id);
+  auto IsCurrentIncomingClientHandoff(const IncomingClientHandoff& incoming) const -> bool;
+  void SweepIncomingClientHandoffs();
+  auto ExpireIncomingClientHandoff(std::shared_ptr<IncomingClientHandoff> incoming)
+      -> FireAndForget;
+  std::unordered_map<EntityID, std::shared_ptr<IncomingClientHandoff>> incoming_client_handoffs_;
+  std::unordered_map<SessionKey, EntityID> incoming_handoff_credentials_;
+  void OnBaseAppBirth(const machined::BirthNotification& notification);
+  void OnBaseAppDeath(const machined::DeathNotification& notification);
+  auto OnRevokeAccountSession(IntrusivePtr<Channel> channel, baseapp::RevokeAccountSession request)
+      -> FireAndForget;
+  void OnRevokeAccountSessionReply(Channel* channel,
+                                   const baseapp::RevokeAccountSessionReply& reply);
+  auto RevokeSessionOwner(DatabaseID dbid, uint16_t type_id, AccountSession record,
+                          CancellationToken token) -> Task<Result<void>>;
+  auto CheckSessionBeforeLogin(PendingLogin pending, uint64_t ticket) -> FireAndForget;
+  std::unordered_map<Address, machined::BirthNotification> baseapp_peers_;
+  std::size_t session_revocations_{0};
 
   NetworkInterface& external_network_;
   IDClient id_client_;
@@ -267,7 +359,14 @@ class BaseApp : public EntityApp {
 
   Channel* cellappmgr_channel_{nullptr};
   uint32_t next_space_request_id_{1};
-  std::unordered_map<uint32_t, SpaceCreatedCallback> pending_space_creates_;
+  struct PendingSpaceCreate {
+    SpaceID space_id;
+    SpaceCreatedCallback callback;
+    IntrusivePtr<Channel> channel;
+    TimePoint started_at;
+  };
+  std::unordered_map<uint32_t, PendingSpaceCreate> pending_space_creates_;
+  void FailPendingSpaceCreates();
   // space_id to space master type name. Lookup populates CreateSpaceRequest.
   std::unordered_map<SpaceID, std::string> space_master_types_;
 
@@ -313,6 +412,13 @@ class BaseApp : public EntityApp {
     // entity finally binds to a client in OnClientAuthenticate.
     std::string username;
   };
+  struct LoginSessionCheck {
+    Address loginapp_addr;
+    uint32_t login_request_id{0};
+    DatabaseID dbid{kInvalidDBID};
+    CancellationSource cancel;
+  };
+  std::unordered_map<uint64_t, LoginSessionCheck> login_session_checks_;
   std::unordered_map<uint32_t, PendingLogin> pending_logins_;
   uint32_t next_prepare_request_id_{1};
 

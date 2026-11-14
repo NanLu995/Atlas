@@ -63,6 +63,7 @@ struct GhostSetReal;
 struct GhostSetNextReal;
 struct OffloadEntity;
 struct OffloadEntityAck;
+enum class OffloadRejectReason : uint8_t;
 struct SpawnLocalEntity;
 struct SpaceDataUpdate;
 struct SpaceDataDelete;
@@ -248,10 +249,12 @@ class CellApp : public EntityApp, public CellMovementHost {
   // yet; OnGetEntityIdsAck drains the queue.
   void SpawnSpaceMaster(SpaceID space_id, const std::string& type_name);
 
-  // Captures enough state to re-install a Real if Offload rejects or times out.
+  // Retains rollback state until a confirmed rejection or acceptance.
   struct PendingOffload {
     Address target_addr;
     TimePoint sent_at;
+    uint32_t cell_epoch{0};
+    bool outcome_unknown{false};
     SpaceID space_id{kInvalidSpaceID};
     cellappmgr::CellID cell_id{0};  // 0 => no local Cell membership to restore
     std::vector<Address> haunt_addrs;
@@ -281,6 +284,7 @@ class CellApp : public EntityApp, public CellMovementHost {
     math::Vector3 position{0.f, 0.f, 0.f};
     math::Vector3 direction{1.f, 0.f, 0.f};
     TimePoint sent_at;
+    uint32_t cell_epoch{0};
   };
 
   // Test hook; production writes happen in Offload send and resolution paths.
@@ -311,6 +315,9 @@ class CellApp : public EntityApp, public CellMovementHost {
   [[nodiscard]] auto CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> override;
 
  private:
+  friend struct CellAppMigrationTestAccess;
+  friend struct CellAppTeleportTestAccess;
+
   // RudpAddress() returns 0.0.0.0 when bound to any-interface; CellAppMgr
   // resolves it to 127.0.0.1 from inbound packet src, so use loopback here.
   [[nodiscard]] auto ResolveSelfAddr() -> Address;
@@ -567,6 +574,13 @@ class CellApp : public EntityApp, public CellMovementHost {
   }
 
  private:
+  struct OffloadReceipt {
+    uint32_t cell_epoch;
+    Address source;
+    cellapp::OffloadRejectReason result;
+  };
+  static constexpr std::size_t kMaxOffloadReceipts = 65536;
+  std::unordered_map<EntityID, OffloadReceipt> offload_receipts_;
   std::unordered_map<EntityID, PendingOffload> pending_offloads_;
   std::unordered_map<uint32_t, PendingTeleport> pending_teleports_;
   uint32_t next_teleport_request_id_{1};
@@ -579,14 +593,15 @@ class CellApp : public EntityApp, public CellMovementHost {
   // OnOffloadEntity's body after the trust gate; rebuilds the Real from `msg`.
   // Called in-process (ch=nullptr) by the same-cellapp teleport re-home.
   void ReceiveOffload(const Address& src, Channel* ch, const cellapp::OffloadEntity& msg);
+  void PreserveOffloadSource(CellEntity& entity, Channel* peer, const Address& target_addr,
+                             const cellapp::OffloadEntity& msg);
 
   // Resolved-host continuation of RequestTeleport: builds a teleport-flavored
   // OffloadEntity (geometry_version=0) and routes it through ProcessOffload.
   void BeginTeleportOffload(CellEntity& entity, const Address& target_addr, SpaceID target_space_id,
                             math::Vector3 pos, math::Vector3 dir);
 
-  // Same-cellapp teleport: no peer channel to self, so tear the source Real
-  // down and rebuild it in the target space via ReceiveOffload.
+  // Retain source ownership until ReceiveOffload confirms the local target.
   void LocalTeleportRehome(CellEntity& entity, cellapp::OffloadEntity&& msg);
 
   // Fires the native teleport-failed callback so script learns of an async

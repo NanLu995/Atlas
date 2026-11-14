@@ -7,6 +7,7 @@
 #include <format>
 #include <fstream>
 #include <future>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -15,6 +16,7 @@
 #include <sqlite3.h>
 
 #include "atdf_account_fixture.h"
+#include "dbapp/account_session_messages.h"
 #include "dbapp/dbapp.h"
 #include "dbapp/dbapp_messages.h"
 #include "network/event_dispatcher.h"
@@ -129,6 +131,10 @@ class TestDBApp final : public DBApp {
 struct DBAppClient {
   explicit DBAppClient(std::string name) : dispatcher(std::move(name)), network(dispatcher) {
     dispatcher.SetMaxPollWait(Milliseconds(1));
+    (void)network.InterfaceTable().RegisterTypedHandler<AccountSessionReply>(
+        [this](const Address&, Channel*, const AccountSessionReply& message) {
+          session_reply = message;
+        });
     (void)network.InterfaceTable().RegisterTypedHandler<WriteEntityAck>(
         [this](const Address&, Channel*, const WriteEntityAck& msg) {
           write_ack = msg;
@@ -186,6 +192,7 @@ struct DBAppClient {
   std::atomic<bool> abort_received{false};
   WriteEntityAck write_ack;
   CheckoutEntityAck checkout_ack;
+  std::optional<AccountSessionReply> session_reply;
   bool drop_checkout_reply{false};
   uint32_t dropped_checkout_count{0};
 };
@@ -194,6 +201,85 @@ auto make_blob(std::string_view text) -> std::vector<std::byte> {
   std::vector<std::byte> blob;
   for (char ch : text) blob.push_back(static_cast<std::byte>(ch));
   return blob;
+}
+
+void CheckAccountSessionProtocol(DBAppClient& first, Channel& first_channel, DBAppClient& next,
+                                 Channel& next_channel, DatabaseID dbid,
+                                 const CheckoutInfo& checkout) {
+  uint64_t request_id = uint64_t{1} << 40;
+  auto exchange = [&](DBAppClient& client, Channel& channel,
+                      std::optional<AccountSessionOperation> operation) -> Result<AccountSession> {
+    client.session_reply.reset();
+    AccountSessionRequest request;
+    request.request_id = ++request_id;
+    request.process_instance = 111;
+    request.account_dbid = dbid;
+    request.account_type_id = 1;
+    request.operation = std::move(operation);
+    if (auto sent = channel.SendMessage(request); !sent) return sent.Error();
+    if (!poll_until(client.dispatcher, [&] { return client.session_reply.has_value(); }))
+      return Error{ErrorCode::kTimeout, "account session reply missing"};
+    const auto& reply = *client.session_reply;
+    EXPECT_EQ(reply.request_id, request.request_id);
+    EXPECT_EQ(reply.requester_instance, request.process_instance);
+    EXPECT_EQ(reply.account_dbid, dbid);
+    EXPECT_EQ(reply.account_type_id, 1);
+    if (request.operation) {
+      EXPECT_EQ(reply.operation_id, request.operation->id);
+    }
+    if (reply.status != ErrorCode::kNone) return Error{reply.status, reply.error};
+    return reply.session;
+  };
+  auto initial = exchange(first, first_channel, {});
+  ASSERT_TRUE(initial.HasValue()) << initial.Error().Message();
+  EXPECT_EQ(initial->phase, AccountSessionPhase::kOffline);
+  AccountSessionOperation operation;
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  operation.account_dbid = dbid;
+  operation.account_type_id = 1;
+  operation.expected_version = initial->version;
+  operation.actor = {checkout.base_addr, checkout.entity_id, checkout.process_instance};
+  operation.claim_checkout = checkout;
+  auto active = exchange(first, first_channel, operation);
+  ASSERT_TRUE(active.HasValue()) << active.Error().Message();
+  const auto source = operation.actor;
+  operation.claim_checkout.reset();
+  operation.expected_version = active->version;
+  operation.action = AccountSessionAction::kPrepare;
+  operation.target = {next.local_addr(), 2002, 111};
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  ASSERT_TRUE(FillSecureRandom(operation.handoff_id));
+  ASSERT_TRUE(FillSecureRandom(operation.credential_hash));
+  auto preparing = exchange(first, first_channel, operation);
+  ASSERT_TRUE(preparing.HasValue()) << preparing.Error().Message();
+  operation.actor = operation.target;
+  operation.expected_version = preparing->version;
+  operation.action = AccountSessionAction::kAccept;
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  auto accepted = exchange(next, next_channel, operation);
+  ASSERT_TRUE(accepted.HasValue()) << accepted.Error().Message();
+  operation.actor = source;
+  operation.expected_version = accepted->version;
+  operation.action = AccountSessionAction::kAwaitClient;
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  auto awaiting = exchange(first, first_channel, operation);
+  ASSERT_TRUE(awaiting.HasValue()) << awaiting.Error().Message();
+  operation.actor = operation.target;
+  operation.expected_version = awaiting->version;
+  operation.action = AccountSessionAction::kComplete;
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  auto transferred = exchange(next, next_channel, operation);
+  ASSERT_TRUE(transferred.HasValue()) << transferred.Error().Message();
+  EXPECT_EQ(transferred->owner, operation.actor);
+  auto repeated = exchange(next, next_channel, operation);
+  ASSERT_TRUE(repeated.HasValue()) << repeated.Error().Message();
+  EXPECT_EQ(*repeated, *transferred);
+  operation.expected_version = transferred->version;
+  operation.action = AccountSessionAction::kRelease;
+  ASSERT_TRUE(FillSecureRandom(operation.id));
+  auto offline = exchange(next, next_channel, operation);
+  ASSERT_TRUE(offline.HasValue()) << offline.Error().Message();
+  EXPECT_EQ(offline->phase, AccountSessionPhase::kOffline);
 }
 
 }  // namespace
@@ -453,12 +539,27 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   std::promise<Address> ready;
   auto address = ready.get_future();
   std::atomic<bool> stop{false};
+  DBAppClient machined_client{"session_machined"};
+  ASSERT_TRUE(machined_client.network.StartTcpServer(Address("127.0.0.1", 0)));
+  Channel* machined_channel = nullptr;
+  ASSERT_TRUE(
+      machined_client.network.InterfaceTable().RegisterTypedHandler<machined::RegisterMessage>(
+          [&](const Address&, Channel* channel, const machined::RegisterMessage&) {
+            machined_channel = channel;
+            (void)channel->SendMessage(machined::RegisterAck{});
+          }));
   std::jthread server([&] {
     EventDispatcher dispatcher{"dbapp_shared"};
     dispatcher.SetMaxPollWait(Milliseconds(1));
     NetworkInterface network(dispatcher);
     TestDBApp app(dispatcher, network, ready, stop);
     DBAppArgv args(port, definitions, database_path, backend);
+    for (std::size_t i = 0; i + 1 < args.storage.size(); ++i) {
+      if (args.storage[i] == "--machined") {
+        args.storage[i + 1] = machined_client.network.TcpAddress().ToString();
+        args.ptrs[i + 1] = args.storage[i + 1].data();
+      }
+    }
     EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
   });
   struct StopServer {
@@ -490,6 +591,29 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   const auto dbid = first.write_ack.dbid;
   ASSERT_GT(first.write_ack.owner.ownership_version, 0u);
   const auto first_save_owner = first.write_ack.owner;
+  ASSERT_TRUE(poll_until(machined_client.dispatcher, [&] { return machined_channel != nullptr; }));
+  machined::BirthNotification birth;
+  birth.process_type = ProcessType::kBaseApp;
+  birth.process_instance = 111;
+  birth.name = "session-first";
+  birth.internal_addr = first.local_addr();
+  ASSERT_TRUE((*first_channel)->SendMessage(birth));
+  AccountSessionRequest probe;
+  probe.request_id = (uint64_t{1} << 40) - 1;
+  probe.process_instance = 111;
+  probe.account_dbid = dbid;
+  probe.account_type_id = 1;
+  ASSERT_TRUE((*first_channel)->SendMessage(probe));
+  ASSERT_TRUE(poll_until(first.dispatcher, [&] { return first.session_reply.has_value(); }));
+  EXPECT_EQ(first.session_reply->status, ErrorCode::kPermissionDenied);
+  ASSERT_TRUE(machined_channel->SendMessage(birth));
+  birth.name = "session-next";
+  birth.internal_addr = next.local_addr();
+  ASSERT_TRUE(machined_channel->SendMessage(birth));
+  ASSERT_TRUE(machined_channel->SendMessage(probe));
+  ASSERT_TRUE(poll_until(machined_client.dispatcher,
+                         [&] { return machined_client.session_reply.has_value(); }));
+  CheckAccountSessionProtocol(first, **first_channel, next, **next_channel, dbid, first_save_owner);
   auto changed_write = write;
   changed_write.request_id = 109;
   changed_write.blob.push_back(std::byte{1});

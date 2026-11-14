@@ -3,6 +3,7 @@
 if(ATLAS_DB_MYSQL)
   add_library(atlas_db_mysql STATIC
     mysql_database.cc
+    mysql_account_session.cc
   )
   target_include_directories(atlas_db_mysql
     PUBLIC "${CMAKE_SOURCE_DIR}/src/lib"

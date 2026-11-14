@@ -3,6 +3,10 @@
 add_library(atlas_baseapp_lib STATIC
   base_entity.cc
   baseapp.cc
+  account_session.cc
+  session_revocation.cc
+  client_handoff.cc
+  outgoing_client_handoff.cc
   baseapp_native_provider.cc
   delta_forwarder.cc
   entity_manager.cc

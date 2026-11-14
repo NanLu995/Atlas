@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "baseapp/baseapp_messages.h"
+#include "baseapp/client_handoff_messages.h"
 #include "foundation/log.h"
 #include "loginapp/login_messages.h"
 #include "movement_sim/movement_sim.h"
@@ -61,10 +62,15 @@ auto FormatHostOnly(const Address& addr) -> std::string {
 
 ClientSession::ClientSession() {
   network_.SetDisconnectCallback([this](Channel& channel) {
+    if (&channel == handoff_source_channel_) {
+      handoff_source_channel_ = nullptr;
+      return;
+    }
     if (&channel != loginapp_channel_ && &channel != baseapp_channel_) return;
     if (&channel == loginapp_channel_) loginapp_channel_ = nullptr;
     if (&channel == baseapp_channel_) baseapp_channel_ = nullptr;
     connection_lost_ = true;
+    if (state_ == ATLAS_NET_STATE_HANDOFF) last_error_ = "Client handoff target disconnected";
     if (!pending_disconnect_) pending_disconnect_ = ATLAS_DISCONNECT_INTERNAL;
   });
 }
@@ -83,9 +89,10 @@ auto ClientSession::Poll() -> int32_t {
   polling_ = false;
   if (auto reason = std::exchange(pending_disconnect_, std::nullopt)) {
     const bool lost = std::exchange(connection_lost_, false);
+    const bool handoff = state_ == ATLAS_NET_STATE_HANDOFF;
     (void)Disconnect(lost ? ATLAS_DISCONNECT_INTERNAL : *reason);
     if (lost) {
-      last_error_ = "Server channel disconnected";
+      if (!handoff) last_error_ = "Server channel disconnected";
       FireLoginCallback(ATLAS_LOGIN_INTERNAL_ERROR, {}, 0, last_error_);
       FireAuthCallback(false, kInvalidEntityID, 0, last_error_);
       callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_ConnectionLost);
@@ -222,7 +229,8 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
   ApplyTransportImpairment(baseapp_channel_);
 
   auto reg = network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::AuthenticateResult>(
-      [this](const Address&, Channel*, const ::atlas::baseapp::AuthenticateResult& msg) {
+      [this](const Address&, Channel* channel, const ::atlas::baseapp::AuthenticateResult& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
         OnAuthResult(msg);
       });
   if (!reg) {
@@ -235,6 +243,7 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
   }
 
   ::atlas::baseapp::Authenticate auth_msg;
+  auth_msg.supports_handoff = true;
   std::memcpy(auth_msg.session_key.bytes, session_key_.data(), session_key_.size());
   auto send_result = baseapp_channel_->SendMessage(auth_msg);
   ATLAS_LOG_INFO("ClientSession: sent Authenticate to {} (send_ok={})",
@@ -260,6 +269,27 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
 void ClientSession::OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg) {
   ATLAS_LOG_INFO("ClientSession: received AuthenticateResult success={} entity_id={} type_id={}",
                  msg.success, msg.entity_id, msg.type_id);
+  if (state_ == ATLAS_NET_STATE_HANDOFF) {
+    if (!msg.success || msg.entity_id != handoff_entity_id_ ||
+        msg.process_instance != handoff_instance_ || msg.type_id == 0) {
+      FailClientHandoff(msg.error.empty() ? "Client handoff authentication mismatch" : msg.error);
+      return;
+    }
+    CancelAuthTimeout();
+    std::memcpy(session_key_.data(), handoff_credential_.bytes, session_key_.size());
+    SecureZero(handoff_credential_.bytes, sizeof(handoff_credential_.bytes));
+    player_entity_id_ = msg.entity_id;
+    player_type_id_ = msg.type_id;
+    state_ = ATLAS_NET_STATE_CONNECTED;
+    CloseHandoffSourceChannel();
+    uint8_t body[sizeof(uint32_t) + sizeof(uint16_t)];
+    std::memcpy(body, &player_entity_id_, sizeof(uint32_t));
+    std::memcpy(body + sizeof(uint32_t), &player_type_id_, sizeof(uint16_t));
+    callbacks_.on_deliver(reinterpret_cast<AtlasNetContext*>(this),
+                          msg_id::Id(msg_id::BaseApp::kEntityTransferred), body,
+                          static_cast<int32_t>(sizeof(body)));
+    return;
+  }
   if (state_ != ATLAS_NET_STATE_AUTHENTICATING) return;
   CancelAuthTimeout();
 
@@ -280,6 +310,52 @@ void ClientSession::OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg
   FireAuthCallback(true, player_entity_id_, player_type_id_, {});
 }
 
+void ClientSession::FailClientHandoff(std::string error) {
+  last_error_ = std::move(error);
+  connection_lost_ = true;
+  if (!pending_disconnect_) pending_disconnect_ = ATLAS_DISCONNECT_INTERNAL;
+}
+
+void ClientSession::OnClientHandoff(const ::atlas::baseapp::ClientHandoff& msg) {
+  if (state_ != ATLAS_NET_STATE_CONNECTED || pending_disconnect_ || !baseapp_channel_) return;
+  if (msg.target.base_addr == baseapp_addr_) {
+    state_ = ATLAS_NET_STATE_HANDOFF;
+    FailClientHandoff("Client handoff must target a different BaseApp");
+    return;
+  }
+  state_ = ATLAS_NET_STATE_HANDOFF;
+  auto target = network_.ConnectRudp(msg.target.base_addr, NetworkInterface::InternetRudpProfile());
+  if (!target) {
+    FailClientHandoff("Client handoff connection failed");
+    return;
+  }
+  handoff_source_channel_ = baseapp_channel_;
+  baseapp_channel_ = *target;
+  baseapp_addr_ = msg.target.base_addr;
+  handoff_entity_id_ = msg.target.entity_id;
+  handoff_instance_ = msg.target.process_instance;
+  handoff_credential_ = msg.credential;
+  ApplyTransportImpairment(baseapp_channel_);
+  ::atlas::baseapp::Authenticate authenticate;
+  authenticate.supports_handoff = true;
+  authenticate.session_key = msg.credential;
+  if (auto sent = baseapp_channel_->SendMessage(authenticate); !sent) {
+    FailClientHandoff("Client handoff authentication send failed");
+    return;
+  }
+  auth_timeout_ = dispatcher_.AddTimer(kAuthTimeout, [this](TimerHandle) {
+    if (state_ == ATLAS_NET_STATE_HANDOFF)
+      FailClientHandoff("Client handoff authentication timeout");
+  });
+  callbacks_.on_deliver(reinterpret_cast<AtlasNetContext*>(this),
+                        msg_id::Id(msg_id::BaseApp::kClientHandoff), nullptr, 0);
+}
+
+void ClientSession::CloseHandoffSourceChannel() {
+  if (auto* source = std::exchange(handoff_source_channel_, nullptr))
+    network_.DisconnectChannel(source->RemoteAddress());
+}
+
 void ClientSession::FireAuthCallback(bool success, EntityID eid, uint16_t tid,
                                      std::string_view error) {
   auto cb = std::exchange(auth_callback_, nullptr);
@@ -298,6 +374,11 @@ void ClientSession::CancelAuthTimeout() {
 }
 
 void ClientSession::InstallDefaultHandler() {
+  (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::ClientHandoff>(
+      [this](const Address&, Channel* channel, const ::atlas::baseapp::ClientHandoff& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
+        OnClientHandoff(msg);
+      });
   // Typed handlers for fixed-length BaseApp-to-client msgs; the default handler's
   // packed-int fallback would misparse the first body byte as a length prefix.
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::EntityTransferred>(
@@ -391,6 +472,7 @@ auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
   CancelAuthTimeout();
   CloseLoginAppChannel();
   CloseBaseAppChannel();
+  CloseHandoffSourceChannel();
   ClearSessionKey();
   // Same-id re-registration returns kAlreadyExists; clear so the next
   // StartLogin / OnAuthResult can re-install its typed handlers.
@@ -422,6 +504,7 @@ auto ClientSession::SetTransportImpairment(uint32_t one_way_latency_ms, uint32_t
   transport_impairment_seed_ = seed != 0 ? seed : 1u;
   ApplyTransportImpairment(loginapp_channel_);
   ApplyTransportImpairment(baseapp_channel_);
+  ApplyTransportImpairment(handoff_source_channel_);
   return ATLAS_NET_OK;
 }
 
@@ -563,7 +646,8 @@ auto ClientSession::FillStats(AtlasNetStats* out) const -> int32_t {
   // Only read channel state while live; after a long Editor pause, the
   // dispatcher may reap timed-out RUDP before stats code sees the pointer.
   if (state_ != ATLAS_NET_STATE_CONNECTED && state_ != ATLAS_NET_STATE_AUTHENTICATING &&
-      state_ != ATLAS_NET_STATE_LOGGING_IN && state_ != ATLAS_NET_STATE_LOGIN_SUCCEEDED) {
+      state_ != ATLAS_NET_STATE_LOGGING_IN && state_ != ATLAS_NET_STATE_LOGIN_SUCCEEDED &&
+      state_ != ATLAS_NET_STATE_HANDOFF) {
     return ATLAS_NET_OK;
   }
   Channel* ch = baseapp_channel_ ? baseapp_channel_ : loginapp_channel_;
@@ -604,6 +688,9 @@ void ClientSession::CloseBaseAppChannel() {
 
 void ClientSession::ClearSessionKey() {
   SecureZero(session_key_.data(), session_key_.size());
+  SecureZero(handoff_credential_.bytes, sizeof(handoff_credential_.bytes));
+  handoff_entity_id_ = kInvalidEntityID;
+  handoff_instance_ = 0;
   baseapp_addr_ = Address{};
 }
 

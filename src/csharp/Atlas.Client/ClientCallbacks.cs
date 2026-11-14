@@ -12,6 +12,7 @@ public static class ClientCallbacks
     public const ushort kClientBaselineMessageId = 0xF002;
     public const ushort kClientReliableDeltaMessageId = 0xF003;
     public const ushort kEntityTransferredMessageId = 2024;
+    public const ushort kClientHandoffMessageId = 2043;
     public const ushort kCellReadyMessageId = 2025;
     public const ushort kClientRpcMessageId = 0xF004;
     public const ushort kClientMovementStateAckMessageId = 0xF005;

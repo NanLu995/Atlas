@@ -390,7 +390,7 @@ existing build outputs without recompiling.
   ["UNITY_2022_3_OR_NEWER"]`). On older Unity the assembly is silently
   skipped — check **Project Settings → Player → Other Settings**.
 
-### `atlas_net_client.AtlasNetCreate failed (abi=0x02050000): ABI version mismatch`
+### `atlas_net_client.AtlasNetCreate failed (abi=0x03000000): ABI version mismatch`
 
 - The native DLL and the C# bindings disagree. Re-run
   `setup_unity_client` with the same `--config` to rebuild both

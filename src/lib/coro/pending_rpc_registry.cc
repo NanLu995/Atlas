@@ -9,6 +9,15 @@
 
 namespace atlas {
 
+namespace {
+auto Uses64BitRequestId(MessageID id) -> bool {
+  return id == msg_id::Id(msg_id::Common::kEntityRpcReply) ||
+         id == msg_id::Id(msg_id::DBApp::kAccountSessionReply) ||
+         id == msg_id::Id(msg_id::BaseApp::kRevokeAccountSessionReply) ||
+         id == msg_id::Id(msg_id::BaseApp::kPrepareClientHandoffReply);
+}
+}  // namespace
+
 PendingRpcRegistry::PendingRpcRegistry(EventDispatcher& dispatcher) : dispatcher_(dispatcher) {}
 
 auto PendingRpcRegistry::AllocateRequestId() -> uint64_t {
@@ -43,8 +52,7 @@ auto PendingRpcRegistry::RegisterPending(MessageID reply_id, uint64_t request_id
 
 auto PendingRpcRegistry::TryDispatch(MessageID id, std::span<const std::byte> payload,
                                      Channel* source) -> bool {
-  const bool entity_reply = id == msg_id::Id(msg_id::Common::kEntityRpcReply);
-  if (payload.size() < (entity_reply ? sizeof(uint64_t) : sizeof(uint32_t))) return false;
+  if (payload.size() < (Uses64BitRequestId(id) ? sizeof(uint64_t) : sizeof(uint32_t))) return false;
 
   auto request_id = ExtractRequestId(id, payload);
   auto key = PendingKey{id, request_id};
@@ -199,7 +207,7 @@ auto PendingRpcRegistry::PendingCount() const -> size_t {
 
 auto PendingRpcRegistry::ExtractRequestId(MessageID id, std::span<const std::byte> payload)
     -> uint64_t {
-  if (id == msg_id::Id(msg_id::Common::kEntityRpcReply)) {
+  if (Uses64BitRequestId(id)) {
     uint64_t id_le = 0;
     std::memcpy(&id_le, payload.data(), sizeof(id_le));
     return endian::FromLittle(id_le);

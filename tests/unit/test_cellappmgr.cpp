@@ -87,6 +87,19 @@ class RecordingChannel final : public Channel {
   std::vector<std::vector<std::byte>> sends_;
 };
 
+auto LastSpaceReply(const RecordingChannel& channel) -> cellappmgr::SpaceCreatedResult {
+  if (channel.Sends().empty()) {
+    ADD_FAILURE() << "missing space result";
+    return {};
+  }
+  BinaryReader reader(channel.Sends().back());
+  auto id = reader.ReadPackedInt();
+  EXPECT_TRUE(id && *id == cellappmgr::SpaceCreatedResult::Descriptor().id);
+  auto result = cellappmgr::SpaceCreatedResult::Deserialize(reader);
+  EXPECT_TRUE(result.HasValue());
+  return result ? *result : cellappmgr::SpaceCreatedResult{};
+}
+
 // Decode the first baseapp::CellAppDeath payload from captured outbound frames.
 // Rehome also emits SpaceBspGeometry, so scan by msg_id.
 auto FirstCellAppDeath(const RecordingChannel& ch) -> baseapp::CellAppDeath {
@@ -690,6 +703,82 @@ TEST(CellAppMgr, CreateSpace_DuplicateIsDropped) {
   h.mgr.OnCreateSpaceRequest(Address{}, nullptr, csr);
   h.mgr.OnCreateSpaceRequest(Address{}, nullptr, csr);
   EXPECT_EQ(h.mgr.Spaces().size(), 1u);
+}
+
+TEST(CellAppMgr, BootstrapReusesExistingSpaceButRejectsConflictingMasterAndStrictCreate) {
+  CellAppMgrHarness h;
+  cellappmgr::RegisterCellApp host;
+  host.internal_addr = MakePeerAddr(30001);
+  h.mgr.OnRegisterCellApp(host.internal_addr, nullptr, host);
+  auto requester = make_intrusive<RecordingChannel>(h.dispatcher, h.network.InterfaceTable(),
+                                                    MakePeerAddr(31001));
+  cellappmgr::CreateSpaceRequest request;
+  request.space_id = 78;
+  request.space_master_type = "Master";
+  h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  const auto created = LastSpaceReply(*requester);
+  ASSERT_TRUE(created.success);
+  request.reuse_existing = true;
+  ++request.request_id;
+  h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  const auto reused = LastSpaceReply(*requester);
+  EXPECT_TRUE(reused.success);
+  EXPECT_EQ(reused.cell_id, created.cell_id);
+  EXPECT_EQ(reused.host_addr, created.host_addr);
+  request.space_master_type = "DifferentMaster";
+  h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  EXPECT_FALSE(LastSpaceReply(*requester).success);
+  request.space_master_type.clear();
+  request.reuse_existing = false;
+  h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  EXPECT_FALSE(LastSpaceReply(*requester).success);
+  EXPECT_EQ(h.mgr.Spaces().size(), 1u);
+}
+
+TEST(CellAppMgr, ConcurrentBootstrapWaitsForTheSameSpaceCreation) {
+  CellAppMgrHarness h;
+  auto first = make_intrusive<RecordingChannel>(h.dispatcher, h.network.InterfaceTable(),
+                                                MakePeerAddr(31001));
+  auto second = make_intrusive<RecordingChannel>(h.dispatcher, h.network.InterfaceTable(),
+                                                 MakePeerAddr(31002));
+  cellappmgr::CreateSpaceRequest request;
+  request.space_id = 79;
+  request.reuse_existing = true;
+  h.mgr.OnCreateSpaceRequest(first->RemoteAddress(), first.get(), request);
+  ++request.request_id;
+  h.mgr.OnCreateSpaceRequest(second->RemoteAddress(), second.get(), request);
+  EXPECT_TRUE(first->Sends().empty());
+  EXPECT_TRUE(second->Sends().empty());
+  cellappmgr::RegisterCellApp host;
+  host.internal_addr = MakePeerAddr(30001);
+  h.mgr.OnRegisterCellApp(host.internal_addr, nullptr, host);
+  cellappmgr::InformCellLoad load;
+  load.app_id = h.mgr.CellApps().at(host.internal_addr).app_id;
+  h.mgr.OnInformCellLoad(host.internal_addr, nullptr, load);
+  const auto first_reply = LastSpaceReply(*first);
+  const auto second_reply = LastSpaceReply(*second);
+  EXPECT_TRUE(first_reply.success);
+  EXPECT_TRUE(second_reply.success);
+  EXPECT_EQ(first_reply.cell_id, second_reply.cell_id);
+  EXPECT_EQ(first_reply.host_addr, second_reply.host_addr);
+  EXPECT_EQ(h.mgr.Spaces().size(), 1u);
+}
+
+TEST(CellAppMgr, SpaceBootstrapQueueIsBoundedWithoutCellHosts) {
+  CellAppMgrHarness h;
+  h.mgr.RegisterWatchersForTest();
+  auto requester = make_intrusive<RecordingChannel>(h.dispatcher, h.network.InterfaceTable(),
+                                                    MakePeerAddr(31001));
+  cellappmgr::CreateSpaceRequest request;
+  for (uint32_t id = 1; id <= 1024; ++id) {
+    request.space_id = id;
+    h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  }
+  EXPECT_TRUE(requester->Sends().empty());
+  request.space_id = 1025;
+  h.mgr.OnCreateSpaceRequest(requester->RemoteAddress(), requester.get(), request);
+  EXPECT_FALSE(LastSpaceReply(*requester).success);
+  EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("cellappmgr/lb/pending_space_creates"), "1024");
 }
 
 TEST(CellAppMgr, CreateSpace_MultiCellBootstrapHandlesSixteenCells) {

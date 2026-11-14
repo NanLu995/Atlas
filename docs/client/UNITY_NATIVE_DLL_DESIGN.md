@@ -1,6 +1,6 @@
 # Unity Native Network DLL 设计文档
 
-**Status:** ✅ 已落地。当前 C API ABI 为 `0x02050000`: Login/Auth 保持
+**Status:** ✅ 已落地。当前 C API ABI 为 `0x03000000`: Login/Auth 保持
 专用一次性回调,服务端下行消息通过 `on_deliver` 原样透传到 C#。Unity
 Plugins 由 `tools/bin/setup_unity_client.{bat,sh}` 为宿主平台 staging,
 跨平台产物由 CI workflow 生成。`AtlasNetSetTransportImpairment` 可给当前和后续 RUDP
@@ -526,7 +526,7 @@ static void OnRpc(nint ctx, uint entId, uint rpcId, byte* payload, int len) {
 
 ```cpp
 // 每次 ABI-breaking 变更递增；布局: [MAJOR:8][MINOR:8][PATCH:16]
-#define ATLAS_NET_ABI_VERSION 0x02050000u   // v2.5.0
+#define ATLAS_NET_ABI_VERSION 0x03000000u   // v3.0.0
 ```
 
 版本号变更规则:
@@ -617,7 +617,7 @@ ATLAS_NET_CALL void AtlasNetDestroy(AtlasNetContext* ctx);
 
 ```csharp
 public static class AtlasNet {
-    const uint kExpectedAbi = 0x02050000u;  // 与 C 头文件同步
+    const uint kExpectedAbi = 0x03000000u;  // 与 C 头文件同步
 
     public static nint Create() {
         var ctx = AtlasNetNative.AtlasNetCreate(kExpectedAbi);
@@ -802,6 +802,7 @@ typedef enum {
     ATLAS_NET_STATE_LOGIN_SUCCEEDED   = 2,   // 已收 LoginResult,等待 authenticate 调用
     ATLAS_NET_STATE_AUTHENTICATING    = 3,
     ATLAS_NET_STATE_CONNECTED         = 4,
+    ATLAS_NET_STATE_HANDOFF           = 5,
 } AtlasNetState;
 
 ATLAS_NET_CALL AtlasNetState AtlasNetGetState(AtlasNetContext* ctx);
@@ -1097,6 +1098,11 @@ AtlasNetContext (不透明, C++ 内部)
 
 ### 5.2 ClientSession 状态机
 
+连接中的客户端可收到服务器移交消息并进入 `Handoff=5`。首次认证声明支持，
+切换期间暂停发送并清理旧实体、空间数据及 RPC 等待；目标认证回复必须匹配目标通道、实体和进程身份。
+成功后切换缓存的地址与会话密钥，关闭旧通道，依次派发 `EntityTransferred`、`CellReady`。
+认证超时或失败会断开两端连接，通过重新登录确认归属，不自动恢复旧通道。
+
 这里的 `ClientSession` 指 C++ native session,位置为
 `src/lib/net_client/client_session.{h,cc}`;托管侧另有
 `Atlas.Client.ClientSession` 负责实体、space-data 和 RPC 解码。
@@ -1251,7 +1257,7 @@ public:
 ```csharp
 public static unsafe class AtlasNetNative
 {
-    public const uint AbiVersion = 0x02050000u;
+    public const uint AbiVersion = 0x03000000u;
 
 #if UNITY_IOS && !UNITY_EDITOR
     private const string LibName = "__Internal";

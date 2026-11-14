@@ -11,4 +11,5 @@ public static class RpcErrorCodes
     public const int SendFailed       = -5;
     public const int MethodNotFound   = -6;
     public const int PayloadMalformed = -7;
+    public const int OutcomeUnknown   = -8;
 }

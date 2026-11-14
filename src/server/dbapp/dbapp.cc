@@ -81,6 +81,11 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
         OnWriteEntity(src, ch, msg);
       });
 
+  (void)table.RegisterTypedHandler<dbapp::AccountSessionRequest>(
+      [this](const Address& src, Channel* ch, const dbapp::AccountSessionRequest& msg) {
+        OnAccountSession(src, ch, msg);
+      });
+
   (void)table.RegisterTypedHandler<dbapp::CheckoutEntity>(
       [this](const Address& src, Channel* ch, const dbapp::CheckoutEntity& msg) {
         OnCheckoutEntity(src, ch, msg);
@@ -131,11 +136,18 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
         OnShardTableUpdate(src, ch, msg);
       });
 
-  GetMachinedClient().Subscribe(machined::ListenerType::kDeath, ProcessType::kBaseApp,
-                                nullptr,  // no birth callback needed
-                                [this](const machined::DeathNotification& notif) {
-                                  OnBaseappDeath(notif.internal_addr, notif.process_instance);
-                                });
+  GetMachinedClient().Subscribe(
+      machined::ListenerType::kBoth, ProcessType::kBaseApp,
+      [this](const machined::BirthNotification& notif) {
+        if (notif.process_instance != 0)
+          baseapp_instances_[notif.internal_addr] = notif.process_instance;
+      },
+      [this](const machined::DeathNotification& notif) {
+        auto found = baseapp_instances_.find(notif.internal_addr);
+        if (found != baseapp_instances_.end() && found->second == notif.process_instance)
+          baseapp_instances_.erase(found);
+        OnBaseappDeath(notif.internal_addr, notif.process_instance);
+      });
   GetMachinedClient().Subscribe(
       machined::ListenerType::kBoth, ProcessType::kDbAppMgr,
       [this](const machined::BirthNotification& notif) { OnDbAppMgrBirth(notif); },

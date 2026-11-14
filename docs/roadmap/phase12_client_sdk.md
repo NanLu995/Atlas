@@ -1,7 +1,7 @@
 # Phase 12: 客户端 SDK
 
 **Status:** ✅ 已落地。`atlas_net_client.dll` 单 `on_deliver` C API
-(ABI 0x02050000)、`Atlas.Client` 实体管理 + `AvatarFilter` peer 路径、
+(ABI 0x03000000)、`Atlas.Client` 实体管理 + `AvatarFilter` peer 路径、
 `Atlas.Client.Desktop`（`AtlasClient` / `LoginClient`）、Unity
 `AtlasNetworkManager` 和控制台 `atlas_client.exe` 已共用
 `ClientSession.DeliverFromServer` 解码。FakeCluster / RealCluster 集成测试

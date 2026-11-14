@@ -22,6 +22,7 @@
 #include "db_mysql/mysql_database.h"
 #include "entitydef/entity_def_registry.h"
 #include "network/socket.h"
+#include "test_account_session_contract.h"
 
 using namespace atlas;
 
@@ -124,7 +125,7 @@ auto reset_schema(const DatabaseConfig& cfg) -> bool {
   if (!admin) return false;
   static constexpr const char* kDrop =
       "DROP TABLE IF EXISTS entities, meta, atlas_entity_id_counter, atlas_write_receipts, "
-      "atlas_checkout_versions, atlas_checkout_processes";
+      "atlas_checkout_versions, atlas_checkout_processes, atlas_account_sessions";
   const bool ok =
       mysql_real_query(admin.get(), kDrop, static_cast<unsigned long>(std::strlen(kDrop))) == 0;
   return ok;
@@ -132,7 +133,11 @@ auto reset_schema(const DatabaseConfig& cfg) -> bool {
 
 auto RelayUntilCommittedReply(Socket listener, const Address& upstream, const DatabaseConfig& cfg,
                               std::stop_token stop, const std::atomic<bool>& armed,
-                              std::atomic<bool>& dropped) -> Result<void> {
+                              std::atomic<bool>& dropped,
+                              std::string_view committed_query =
+                                  "SELECT COUNT(*) FROM entities e JOIN atlas_write_receipts r "
+                                  "ON r.result_dbid=e.dbid WHERE e.identifier='lost_commit_reply'")
+    -> Result<void> {
   auto admin = connect_admin(cfg);
   if (!admin) return Error{ErrorCode::kIoError, "proxy observer connection failed"};
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -163,10 +168,8 @@ auto RelayUntilCommittedReply(Socket listener, const Address& upstream, const Da
     }
     if (*read == 0) return Error{ErrorCode::kIoError, "proxy connection closed before fault"};
     if (server_reply && armed.load()) {
-      constexpr const char* kCommitted =
-          "SELECT COUNT(*) FROM entities e JOIN atlas_write_receipts r "
-          "ON r.result_dbid=e.dbid WHERE e.identifier='lost_commit_reply'";
-      if (mysql_query(admin.get(), kCommitted) != 0)
+      if (mysql_real_query(admin.get(), committed_query.data(),
+                           static_cast<unsigned long>(committed_query.size())) != 0)
         return Error{ErrorCode::kIoError, "proxy commit observer query failed"};
       std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(admin.get()),
                                                                     mysql_free_result);
@@ -263,6 +266,157 @@ class MysqlDatabaseTest : public ::testing::Test {
   MysqlDatabase db_;
   DatabaseConfig cfg_;
 };
+
+TEST_F(MysqlDatabaseTest, AccountSessionOwnershipContract) {
+  atlas::test_support::CheckAccountSessionContract(db_);
+}
+
+TEST_F(MysqlDatabaseTest, SessionClaimAcceptsAProcessCheckoutBeforeEntityAllocation) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_, 0);
+  ASSERT_TRUE(claim.HasValue());
+  auto granted = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(granted.HasValue()) << granted.Error().Message();
+  EXPECT_EQ(granted->owner.entity_id, 100u);
+  db_.GetEntity(claim->account_dbid, 1, [](GetResult result) {
+    ASSERT_TRUE(result.success);
+    ASSERT_TRUE(result.checked_out_by.has_value());
+    EXPECT_EQ(result.checked_out_by->entity_id, 0u);
+  });
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionMustBeReleasedBeforeDeletingAccount) {
+  atlas::test_support::CheckSessionDeletionFence(db_);
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionAbortFencesLateCompletion) {
+  atlas::test_support::CheckSessionAbortContract(db_);
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionRetirementRejectsReceiptReplay) {
+  atlas::test_support::CheckRetiredSessionReplay(db_);
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionReceiptFailureRollsBackGrant) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  auto admin = connect_admin(cfg_);
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(
+      mysql_query(admin.get(),
+                  "CREATE TRIGGER reject_session_receipt BEFORE UPDATE ON atlas_write_receipts "
+                  "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='session receipt fault'"),
+      0);
+  auto failed = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_FALSE(failed.HasValue());
+  db_.ReadAccountSession(claim->account_dbid, 1, [](Result<AccountSession> value) {
+    ASSERT_TRUE(value.HasValue());
+    EXPECT_EQ(value->version, 0u);
+  });
+  ASSERT_EQ(mysql_query(admin.get(), "DROP TRIGGER reject_session_receipt"), 0);
+  auto replay = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(replay.HasValue());
+  EXPECT_EQ(replay->version, 1u);
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionConcurrentChangesHaveOneWinner) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  auto active = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(active.HasValue());
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(cfg_, EntityDefRegistry::Instance()));
+  auto prepare = *claim;
+  prepare.id[0] = std::byte{2};
+  prepare.claim_checkout.reset();
+  prepare.expected_version = active->version;
+  prepare.action = AccountSessionAction::kPrepare;
+  prepare.target = {Address(0x7F000001u, 32000), 200, 202};
+  prepare.handoff_id = prepare.id;
+  prepare.credential_hash[0] = std::byte{1};
+  auto release = prepare;
+  release.id[0] = std::byte{3};
+  release.action = AccountSessionAction::kRelease;
+  std::optional<Result<AccountSession>> first;
+  std::optional<Result<AccountSession>> second;
+  db_.SetDeferredMode(true);
+  peer.SetDeferredMode(true);
+  db_.UpdateAccountSession(prepare,
+                           [&](Result<AccountSession> value) { first = std::move(value); });
+  peer.UpdateAccountSession(release,
+                            [&](Result<AccountSession> value) { second = std::move(value); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while ((!first || !second) && std::chrono::steady_clock::now() < deadline) {
+    db_.ProcessResults();
+    peer.ProcessResults();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_NE(first->HasValue(), second->HasValue());
+  const auto& rejected = first->HasValue() ? *second : *first;
+  ASSERT_FALSE(rejected.HasValue());
+  EXPECT_EQ(rejected.Error().Code(), ErrorCode::kPermissionDenied);
+  peer.Shutdown();
+}
+
+TEST_F(MysqlDatabaseTest, AccountSessionLostCommitReplyCanResolveAcrossInstancesAndRestart) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  auto upstream = Address::Resolve(cfg_.mysql_host, cfg_.mysql_port);
+  ASSERT_TRUE(upstream.HasValue());
+  auto listener = Socket::CreateTcp();
+  ASSERT_TRUE(listener.HasValue());
+  ASSERT_TRUE(listener->Bind(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(listener->Listen());
+  auto local = listener->LocalAddress();
+  ASSERT_TRUE(local.HasValue());
+  std::atomic<bool> armed{false};
+  std::atomic<bool> dropped{false};
+  std::string proxy_error;
+  std::jthread proxy([&, socket = std::move(*listener)](std::stop_token stop) mutable {
+    auto result = RelayUntilCommittedReply(
+        std::move(socket), *upstream, cfg_, stop, armed, dropped,
+        "SELECT COUNT(*) FROM atlas_account_sessions WHERE dbid=10000 AND version=1");
+    if (!result) proxy_error = result.Error().Message();
+  });
+  auto config = cfg_;
+  config.mysql_host = "127.0.0.1";
+  config.mysql_port = local->Port();
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(config, EntityDefRegistry::Instance()));
+  armed.store(true);
+  auto unknown = atlas::test_support::UpdateSession(peer, *claim);
+  peer.Shutdown();
+  proxy.request_stop();
+  proxy.join();
+  ASSERT_TRUE(proxy_error.empty()) << proxy_error;
+  ASSERT_TRUE(dropped.load());
+  ASSERT_FALSE(unknown.HasValue());
+  EXPECT_EQ(unknown.Error().Code(), ErrorCode::kCommitUnknown);
+  auto resolved = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(resolved.HasValue());
+  EXPECT_EQ(resolved->owner, claim->actor);
+  EXPECT_EQ(resolved->version, 1u);
+  db_.Shutdown();
+  ASSERT_TRUE(db_.Startup(cfg_, EntityDefRegistry::Instance()));
+  resolved = atlas::test_support::UpdateSession(db_, *claim);
+  ASSERT_TRUE(resolved.HasValue());
+  EXPECT_EQ(resolved->version, 1u);
+}
+
+TEST_F(MysqlDatabaseTest, CorruptedAccountSessionIsNotAnOfflineGrant) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  ASSERT_TRUE(atlas::test_support::UpdateSession(db_, *claim).HasValue());
+  auto admin = connect_admin(cfg_);
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(mysql_query(admin.get(), "UPDATE atlas_account_sessions SET payload=X'00'"), 0);
+  db_.ReadAccountSession(claim->account_dbid, 1, [](Result<AccountSession> value) {
+    ASSERT_FALSE(value.HasValue());
+    EXPECT_EQ(value.Error().Code(), ErrorCode::kIoError);
+  });
+  EXPECT_FALSE(atlas::test_support::UpdateSession(db_, *claim).HasValue());
+}
 
 TEST_F(MysqlDatabaseTest, PutNewEntityAndGet) {
   PutResult put;

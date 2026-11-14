@@ -725,8 +725,7 @@ void CellAppMgr::OnCreateSpaceRequest(const Address& src, Channel* ch,
     return;
   }
   if (spaces_.contains(msg.space_id)) {
-    ATLAS_LOG_WARNING("CellAppMgr: CreateSpaceRequest for existing space_id={}", msg.space_id);
-    SendCreateSpaceReply(msg, src, ch, /*ok=*/false, 0, Address{});
+    ExecuteCreateSpace(msg, src, ch);
     return;
   }
   const auto pending_it = std::find_if(
@@ -735,9 +734,15 @@ void CellAppMgr::OnCreateSpaceRequest(const Address& src, Channel* ch,
       [space_id = msg.space_id](const PendingSpaceCreate& pending) {
         return pending.msg.space_id == space_id;
       });
-  if (pending_it != pending_space_creates_awaiting_cellapps_.end()) {
+  if (pending_it != pending_space_creates_awaiting_cellapps_.end() &&
+      (!msg.reuse_existing || (!msg.space_master_type.empty() &&
+                               msg.space_master_type != pending_it->msg.space_master_type))) {
     ATLAS_LOG_WARNING("CellAppMgr: CreateSpaceRequest for pending space_id={}", msg.space_id);
     SendCreateSpaceReply(msg, src, ch, /*ok=*/false, 0, Address{});
+    return;
+  }
+  if (pending_space_creates_awaiting_cellapps_.size() >= 1024) {
+    SendCreateSpaceReply(msg, src, ch, false, 0, Address{});
     return;
   }
 
@@ -747,17 +752,21 @@ void CellAppMgr::OnCreateSpaceRequest(const Address& src, Channel* ch,
       std::chrono::duration_cast<std::chrono::milliseconds>(startup_quiescence_window_).count());
   const auto now = Clock::now();
   pending_space_creates_awaiting_cellapps_.push_back(
-      {msg, src, ch, now, now + startup_quiescence_window_});
+      {msg, src, IntrusivePtr<Channel>{ch}, now, now + startup_quiescence_window_});
   // Zero-window path (tests) fires synchronously rather than next tick.
   DrainExpiredCreateSpaceRequests();
 }
 
 void CellAppMgr::ExecuteCreateSpace(const cellappmgr::CreateSpaceRequest& msg, const Address& src,
                                     Channel* ch) {
-  if (spaces_.contains(msg.space_id)) {
-    ATLAS_LOG_WARNING("CellAppMgr: deferred CreateSpace space_id={} already created — drop",
-                      msg.space_id);
-    SendCreateSpaceReply(msg, src, ch, /*ok=*/false, 0, Address{});
+  if (const auto existing = spaces_.find(msg.space_id); existing != spaces_.end()) {
+    const auto& partition = existing->second;
+    const auto* primary = partition.bsp.FindCellById(partition.bsp.PrimaryCellId());
+    const bool reusable =
+        msg.reuse_existing && primary != nullptr && cellapps_.contains(primary->cellapp_addr) &&
+        (msg.space_master_type.empty() || msg.space_master_type == partition.space_master_type);
+    SendCreateSpaceReply(msg, src, ch, reusable, reusable ? primary->cell_id : 0,
+                         reusable ? primary->cellapp_addr : Address{});
     return;
   }
   if (cellapps_.empty()) {
@@ -825,7 +834,7 @@ void CellAppMgr::DrainExpiredCreateSpaceRequests() {
     if (now >= it->quiescence_deadline && AssignableCellAppCount() > 0) {
       auto entry = std::move(*it);
       it = q.erase(it);
-      ExecuteCreateSpace(entry.msg, entry.src, entry.ch);
+      ExecuteCreateSpace(entry.msg, entry.src, entry.ch.get());
     } else {
       ++it;
     }

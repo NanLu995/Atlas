@@ -7,13 +7,11 @@ namespace Atlas.Mvp.Base;
 [Entity("Account")]
 public partial class Account : BaseServerEntity
 {
-    public partial void SelectAvatar(int avatarIndex)
+    public async partial void SelectAvatar(int avatarIndex)
     {
         const uint kSpaceId = 1;
 
-        // Captured BEFORE += so the label shows the previous session time stamp,
-        // and computed in SelectAvatar (not OnInit) because Atlas reuses the
-        // Account entity on fast relogin and skips OnInit on that path.
+        // Fast relogin reuses the Account and skips OnInit.
         string previousLastLogin = LastLogin;
         LoginCount += 1;
         LastLogin = DateTime.UtcNow.ToString("o");
@@ -29,7 +27,12 @@ public partial class Account : BaseServerEntity
             return;
         }
 
-        GiveClientTo(avatar.EntityId);
+        var moved = await GiveClientToAsync(avatar.EntityId);
+        if (!moved.IsOk)
+        {
+            Log.Error($"[Mvp.Base] Client transfer failed: {moved.ErrorMessage}");
+            return;
+        }
 
         // PublishReplicationFrame is no-op on BaseApp (no base→client delta path);
         // push session info via the owner-targeted ClientRpc instead.

@@ -117,17 +117,30 @@ class BaseAppInflightRpcTest : public ::testing::Test {
     app_.OnClientCellRpc(*client_ch_, msg);
   }
 
-  void DeliverCurrentCell(EntityID entity_id) {
+  void DeliverCurrentCell(EntityID entity_id, uint32_t epoch = 1) {
+    DeliverCurrentCellFrom(entity_id, *cell_ch_, cell_addr_, epoch);
+  }
+
+  void DeliverCurrentCellFrom(EntityID entity_id, Channel& channel, const Address& address,
+                              uint32_t epoch) {
     baseapp::CurrentCell cc;
     cc.entity_id = entity_id;
-    cc.cell_addr = cell_addr_;
-    cc.epoch = 1;
-    app_.OnCurrentCell(*cell_ch_, cc);
+    cc.cell_addr = address;
+    cc.epoch = epoch;
+    app_.OnCurrentCell(channel, cc);
   }
 
   void ForwardReplyRequest(Channel& client, EntityID source,
                            const baseapp::ClientCellRpc& request) {
     app_.ForwardClientCellRpc(client, *cell_ch_, source, request);
+  }
+
+  auto BindOtherClient(EntityID entity_id, const Address& address) -> bool {
+    return app_.BindClient(entity_id, address);
+  }
+
+  void TransferClient(EntityID source, EntityID destination) {
+    app_.DoGiveClientToLocal(source, destination);
   }
 
   EventDispatcher dispatcher_;
@@ -177,6 +190,164 @@ TEST_F(BaseAppInflightRpcTest, BuffersDuringNoCellThenDrainsInOrderOnCurrentCell
     EXPECT_EQ(f.source_entity_id, eid);
     EXPECT_EQ(f.rpc_id, kCellRpcId);
   }
+}
+
+TEST_F(BaseAppInflightRpcTest, StaleCurrentCellCannotDrainToTheOldHost) {
+  const auto id = SeedClientEntityWithoutCell();
+  SendCellRpc(id, std::byte{1});
+  auto* entity = app_.GetEntityManager().Find(id);
+  const Address current(0x7F000001u, 31001);
+  entity->SetCell(current, 2);
+
+  DeliverCurrentCell(id);
+
+  EXPECT_EQ(entity->CellAddr(), current);
+  EXPECT_TRUE(ForwardedRpcs(*cell_ch_).empty());
+  DeliverCurrentCell(id, 3);
+  ASSERT_EQ(ForwardedRpcs(*cell_ch_).size(), 1u);
+}
+
+TEST_F(BaseAppInflightRpcTest, CurrentCellRequiresRegisteredChannelAndMatchingAddress) {
+  const auto id = SeedClientEntityWithoutCell();
+  SendCellRpc(id, std::byte{1});
+  auto* entity = app_.GetEntityManager().Find(id);
+  auto impostor = make_intrusive<RecordingChannel>(dispatcher_, table_, cell_addr_);
+
+  DeliverCurrentCellFrom(id, *impostor, cell_addr_, 1);
+  DeliverCurrentCellFrom(id, *cell_ch_, Address(0x7F000001u, 31001), 1);
+
+  EXPECT_FALSE(entity->HasCell());
+  EXPECT_TRUE(ForwardedRpcs(*cell_ch_).empty());
+  DeliverCurrentCell(id);
+  EXPECT_EQ(ForwardedRpcs(*cell_ch_).size(), 1u);
+}
+
+TEST_F(BaseAppInflightRpcTest, EqualEpochCannotMoveCurrentCellToAnotherHost) {
+  const auto id = SeedClientEntityWithoutCell();
+  SendCellRpc(id, std::byte{1});
+  auto* entity = app_.GetEntityManager().Find(id);
+  const Address current(0x7F000001u, 31001);
+  entity->SetCell(current, 2);
+
+  DeliverCurrentCell(id, 2);
+
+  EXPECT_EQ(entity->CellAddr(), current);
+  EXPECT_TRUE(ForwardedRpcs(*cell_ch_).empty());
+}
+
+TEST_F(BaseAppInflightRpcTest, DestroyingEntityCannotAcquireCurrentCell) {
+  const auto id = SeedClientEntityWithoutCell();
+  auto* entity = app_.GetEntityManager().Find(id);
+  entity->MarkForDestroy();
+
+  DeliverCurrentCell(id);
+
+  EXPECT_FALSE(entity->HasCell());
+}
+
+TEST_F(BaseAppInflightRpcTest, LocalTransferCannotDisplaceAnotherClient) {
+  const auto src = SeedClientEntityWithoutCell();
+  auto& manager = app_.GetEntityManager();
+  auto* source = manager.FindProxy(src);
+  auto* destination = dynamic_cast<Proxy*>(manager.Create(7, true));
+  ASSERT_NE(destination, nullptr);
+  const auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  ASSERT_TRUE(manager.AssignSessionKey(src, *key));
+  const Address other(0x7F000001u, 32001);
+  ASSERT_TRUE(BindOtherClient(destination->EntityId(), other));
+
+  TransferClient(src, destination->EntityId());
+
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_EQ(source->ClientAddr(), client_addr_);
+  EXPECT_EQ(manager.FindProxyBySession(*key), source);
+  EXPECT_TRUE(destination->HasClient());
+  EXPECT_EQ(destination->ClientAddr(), other);
+}
+
+TEST_F(BaseAppInflightRpcTest, LocalTransferRejectsDestroyingDestination) {
+  const auto src = SeedClientEntityWithoutCell();
+  auto& manager = app_.GetEntityManager();
+  auto* source = manager.FindProxy(src);
+  auto* destination = dynamic_cast<Proxy*>(manager.Create(7, true));
+  ASSERT_NE(destination, nullptr);
+  const auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  ASSERT_TRUE(manager.AssignSessionKey(src, *key));
+  destination->MarkForDestroy();
+
+  TransferClient(src, destination->EntityId());
+
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_EQ(manager.FindProxyBySession(*key), source);
+  EXPECT_FALSE(destination->HasClient());
+}
+
+TEST_F(BaseAppInflightRpcTest, LocalTransferMovesBindingAndSessionTogether) {
+  const auto src = SeedClientEntityWithoutCell();
+  auto& manager = app_.GetEntityManager();
+  auto* source = manager.FindProxy(src);
+  auto* destination = dynamic_cast<Proxy*>(manager.Create(7, true));
+  ASSERT_NE(destination, nullptr);
+  const auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  ASSERT_TRUE(manager.AssignSessionKey(src, *key));
+
+  TransferClient(src, destination->EntityId());
+
+  EXPECT_FALSE(source->HasClient());
+  EXPECT_TRUE(source->GetSessionKey().IsZero());
+  EXPECT_TRUE(destination->HasClient());
+  EXPECT_EQ(destination->ClientAddr(), client_addr_);
+  EXPECT_EQ(manager.FindProxyBySession(*key), destination);
+}
+
+TEST_F(BaseAppInflightRpcTest, TransferToAnAlreadyCreatedCellSendsReadyAfterIdentityChange) {
+  const auto source = SeedClientEntityWithoutCell();
+  auto& manager = app_.GetEntityManager();
+  auto* destination = dynamic_cast<Proxy*>(manager.Create(7, true));
+  ASSERT_NE(destination, nullptr);
+  destination->SetCell(cell_addr_, 1);
+  const auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  ASSERT_TRUE(manager.AssignSessionKey(source, *key));
+  std::vector<std::string> events;
+  ASSERT_TRUE(client_network_.InterfaceTable().RegisterTypedHandler<baseapp::EntityTransferred>(
+      [&](const Address&, Channel*, const baseapp::EntityTransferred& message) {
+        EXPECT_EQ(message.new_entity_id, destination->EntityId());
+        events.emplace_back("transferred");
+      }));
+  ASSERT_TRUE(client_network_.InterfaceTable().RegisterTypedHandler<baseapp::CellReady>(
+      [&](const Address&, Channel*, const baseapp::CellReady& message) {
+        EXPECT_EQ(message.entity_id, destination->EntityId());
+        events.emplace_back("ready");
+      }));
+  TransferClient(source, destination->EntityId());
+  const auto deadline = Clock::now() + std::chrono::seconds(2);
+  while (events.size() < 2 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+  EXPECT_EQ(events, (std::vector<std::string>{"transferred", "ready"}));
+}
+
+TEST_F(BaseAppInflightRpcTest, LocalTransferPreservesPreparedDestinationSession) {
+  const auto src = SeedClientEntityWithoutCell();
+  auto& manager = app_.GetEntityManager();
+  auto* source = manager.FindProxy(src);
+  auto* destination = dynamic_cast<Proxy*>(manager.Create(7, true));
+  ASSERT_NE(destination, nullptr);
+  const auto source_key = SessionKey::Generate();
+  const auto target_key = SessionKey::Generate();
+  ASSERT_TRUE(source_key.HasValue());
+  ASSERT_TRUE(target_key.HasValue());
+  ASSERT_TRUE(manager.AssignSessionKey(src, *source_key));
+  ASSERT_TRUE(manager.AssignSessionKey(destination->EntityId(), *target_key));
+
+  TransferClient(src, destination->EntityId());
+
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_FALSE(destination->HasClient());
+  EXPECT_EQ(manager.FindProxyBySession(*source_key), source);
+  EXPECT_EQ(manager.FindProxyBySession(*target_key), destination);
 }
 
 TEST_F(BaseAppInflightRpcTest, SameClientRequestIdsRelayIndependentlyAndRestoreOriginalIds) {

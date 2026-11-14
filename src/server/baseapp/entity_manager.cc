@@ -64,14 +64,16 @@ auto EntityManager::FindProxy(EntityID id) const -> Proxy* {
 auto EntityManager::FindProxyBySession(const SessionKey& session_key) -> Proxy* {
   auto it = session_index_.find(session_key);
   if (it != session_index_.end()) {
-    return this->FindProxy(it->second);
+    auto* proxy = this->FindProxy(it->second);
+    return proxy && !proxy->IsPendingDestroy() ? proxy : nullptr;
   }
 
   auto rit = retired_sessions_.find(session_key);
   if (rit != retired_sessions_.end() && Clock::now() <= rit->second.expires_at) {
     const EntityID kEid = rit->second.entity_id;
     retired_sessions_.erase(rit);
-    return this->FindProxy(kEid);
+    auto* proxy = this->FindProxy(kEid);
+    return proxy && !proxy->IsPendingDestroy() ? proxy : nullptr;
   }
 
   return nullptr;
@@ -144,7 +146,10 @@ auto EntityManager::AssignSessionKey(EntityID id, const SessionKey& session_key)
 }
 
 auto EntityManager::ClearSessionKey(EntityID id) -> bool {
-  return this->AssignSessionKey(id, SessionKey{});
+  if (!this->AssignSessionKey(id, SessionKey{})) return false;
+  std::erase_if(retired_sessions_,
+                [id](const auto& entry) { return entry.second.entity_id == id; });
+  return true;
 }
 
 void EntityManager::Destroy(EntityID id) {
@@ -191,6 +196,8 @@ void EntityManager::EraseIndexesFor(const BaseEntity& ent) {
   }
 
   if (const auto* proxy = dynamic_cast<const Proxy*>(&ent)) {
+    std::erase_if(retired_sessions_,
+                  [&ent](const auto& entry) { return entry.second.entity_id == ent.EntityId(); });
     if (proxy_count_ > 0) {
       --proxy_count_;
     }

@@ -58,7 +58,17 @@ struct MockProvider final : public INativeApiProvider {
   void SetEntityDefDigest(const std::byte*, int32_t) override { ++set_digest_count; }
 
   void WriteToDb(uint32_t, const std::byte*, int32_t) override {}
-  void GiveClientTo(uint32_t, uint32_t) override {}
+  auto TransferClient(uint32_t, uint32_t, uint32_t, uint16_t, uint64_t, uint64_t)
+      -> RpcSendResult override {
+    return RpcSendResult::kInvalidTarget;
+  }
+  auto GetClientHandoffTarget(uint32_t, uint32_t& ip, uint16_t& port, uint64_t& instance)
+      -> bool override {
+    ip = 0;
+    port = 0;
+    instance = 0;
+    return false;
+  }
   void SetSpaceMasterType(uint32_t, const char*, int32_t) override {}
   auto CreateBaseEntity(uint16_t, uint32_t) -> uint32_t override { return 0; }
   auto CreateLocalCellEntity(uint16_t, uint32_t, float, float, float, float, float, float, bool)
@@ -226,6 +236,17 @@ TEST(BaseNativeProvider, LogMessageRoutesToAtlasLog) {
   for (int32_t level = 0; level <= 5; ++level) {
     EXPECT_NO_FATAL_FAILURE(p.LogMessage(level, msg, len));
   }
+}
+
+TEST(BaseNativeProvider, HandoffTargetIsExplicitlyUnavailableOutsideBaseApp) {
+  ConcreteProvider provider;
+  uint32_t ip = 17;
+  uint16_t port = 19;
+  uint64_t instance = 23;
+  EXPECT_FALSE(provider.GetClientHandoffTarget(100, ip, port, instance));
+  EXPECT_EQ(ip, 0u);
+  EXPECT_EQ(port, 0u);
+  EXPECT_EQ(instance, 0u);
 }
 
 TEST(BaseNativeProvider, ServerTimeAdvances) {

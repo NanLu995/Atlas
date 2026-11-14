@@ -116,6 +116,7 @@ class MachinedClient {
     DeathCallback on_death;
   };
   std::vector<Subscription> subscriptions_;
+  std::unordered_map<Address, uint64_t> peer_instances_;
 
   // Cached registration for replay after reconnect.
   struct RegistrationInfo {

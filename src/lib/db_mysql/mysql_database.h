@@ -89,6 +89,11 @@ class MysqlDatabase : public IDatabase {
   void ReserveEntityIds(uint32_t count,
                         std::function<void(Result<EntityIdRange>)> callback) override;
 
+  void ReadAccountSession(DatabaseID dbid, uint16_t type_id,
+                          std::function<void(Result<AccountSession>)> callback) override;
+  void UpdateAccountSession(const AccountSessionOperation& operation,
+                            std::function<void(Result<AccountSession>)> callback) override;
+
   void ProcessResults() override;
 
   [[nodiscard]] auto SupportsMultiDbapp() const -> bool override { return true; }
@@ -173,13 +178,15 @@ class MysqlDatabase : public IDatabase {
   // write_password preserves the stored credential for ordinary entity updates.
   static auto DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                     std::span<const std::byte> blob, const std::string& identifier,
-                    bool write_password, const std::string& password_hash) -> PutResult;
+                    bool write_password, const std::string& password_hash,
+                    bool transaction_open = false) -> PutResult;
   static auto DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperation& operation,
                                  DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                                  std::span<const std::byte> blob, const std::string& identifier)
       -> PutResult;
   static auto DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> GetResult;
-  static auto DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> DelResult;
+  static auto DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+                    bool transaction_open = false) -> DelResult;
   static auto DoLookup(st_mysql* conn, uint16_t type_id, const std::string& identifier)
       -> LookupResult;
   static auto DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
@@ -196,6 +203,10 @@ class MysqlDatabase : public IDatabase {
   static void DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load);
   static auto DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high) -> DbidRangeResult;
   static auto DoReserveEntityIds(st_mysql* conn, uint32_t count) -> Result<EntityIdRange>;
+  static auto DoReadAccountSession(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+                                   bool for_update = false) -> Result<AccountSession>;
+  static auto DoUpdateAccountSession(st_mysql* conn, const AccountSessionOperation& operation)
+      -> Result<AccountSession>;
 
   st_mysql* conn_{nullptr};  // bootstrap + inline (non-deferred) connection
   const EntityDefRegistry* entity_defs_{nullptr};

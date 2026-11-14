@@ -39,6 +39,7 @@ struct CreateGhost {
   uint64_t volatile_seq{0};
   std::vector<std::byte> other_snapshot;
   std::vector<std::byte> persistent_blob;
+  uint32_t cell_epoch{0};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kCreateGhost),
@@ -71,6 +72,7 @@ struct CreateGhost {
     if (!other_snapshot.empty()) w.WriteBytes(std::span<const std::byte>(other_snapshot));
     w.WritePackedInt(static_cast<uint32_t>(persistent_blob.size()));
     if (!persistent_blob.empty()) w.WriteBytes(std::span<const std::byte>(persistent_blob));
+    w.Write(cell_epoch);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CreateGhost> {
@@ -110,7 +112,6 @@ struct CreateGhost {
       if (!data) return Error{ErrorCode::kInvalidArgument, "CreateGhost: snapshot truncated"};
       msg.other_snapshot.assign(data->begin(), data->end());
     }
-    if (r.Remaining() == 0) return msg;
     auto pblen = r.ReadPackedInt();
     if (!pblen)
       return Error{ErrorCode::kInvalidArgument, "CreateGhost: persistent blob len truncated"};
@@ -120,6 +121,9 @@ struct CreateGhost {
         return Error{ErrorCode::kInvalidArgument, "CreateGhost: persistent blob truncated"};
       msg.persistent_blob.assign(data->begin(), data->end());
     }
+    auto epoch = r.Read<uint32_t>();
+    if (!epoch) return Error{ErrorCode::kInvalidArgument, "CreateGhost: epoch truncated"};
+    msg.cell_epoch = *epoch;
     return msg;
   }
 };
@@ -128,23 +132,30 @@ static_assert(NetworkMessage<CreateGhost>);
 struct DeleteGhost {
   EntityID entity_id{kInvalidEntityID};
 
+  uint32_t cell_epoch{0};
+
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kDeleteGhost),
                                    "cellapp::DeleteGhost",
                                    MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(EntityID)),
+                                   static_cast<int>(sizeof(EntityID) + sizeof(uint32_t)),
                                    MessageReliability::kReliable,
                                    MessageUrgency::kBatched};
     return kDesc;
   }
 
-  void Serialize(BinaryWriter& w) const { w.Write(entity_id); }
+  void Serialize(BinaryWriter& w) const {
+    w.Write(entity_id);
+    w.Write(cell_epoch);
+  }
 
   static auto Deserialize(BinaryReader& r) -> Result<DeleteGhost> {
     auto eid = r.Read<uint32_t>();
-    if (!eid) return Error{ErrorCode::kInvalidArgument, "DeleteGhost: truncated"};
+    auto epoch = r.Read<uint32_t>();
+    if (!epoch || !eid) return Error{ErrorCode::kInvalidArgument, "DeleteGhost: truncated"};
     DeleteGhost msg;
     msg.entity_id = *eid;
+    msg.cell_epoch = *epoch;
     return msg;
   }
 };
@@ -161,19 +172,22 @@ struct GhostPositionUpdate {
   bool on_ground{false};
   uint64_t volatile_seq{0};
 
+  uint32_t cell_epoch{0};
+
   static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{
-        msg_id::Id(msg_id::CellApp::kGhostPositionUpdate),
-        "cellapp::GhostPositionUpdate",
-        MessageLengthStyle::kFixed,
-        static_cast<int>(sizeof(uint32_t) + 6 * sizeof(float) + sizeof(uint8_t) + sizeof(uint64_t)),
-        MessageReliability::kReliable,
-        MessageUrgency::kBatched};
+    static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kGhostPositionUpdate),
+                                   "cellapp::GhostPositionUpdate",
+                                   MessageLengthStyle::kFixed,
+                                   static_cast<int>(2 * sizeof(uint32_t) + 6 * sizeof(float) +
+                                                    sizeof(uint8_t) + sizeof(uint64_t)),
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kBatched};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
     w.Write(entity_id);
+    w.Write(cell_epoch);
     w.Write(position.x);
     w.Write(position.y);
     w.Write(position.z);
@@ -186,6 +200,7 @@ struct GhostPositionUpdate {
 
   static auto Deserialize(BinaryReader& r) -> Result<GhostPositionUpdate> {
     auto eid = r.Read<uint32_t>();
+    auto epoch = r.Read<uint32_t>();
     auto px = r.Read<float>();
     auto py = r.Read<float>();
     auto pz = r.Read<float>();
@@ -194,10 +209,11 @@ struct GhostPositionUpdate {
     auto dz = r.Read<float>();
     auto og = r.Read<uint8_t>();
     auto vs = r.Read<uint64_t>();
-    if (!eid || !px || !py || !pz || !dx || !dy || !dz || !og || !vs)
+    if (!epoch || !eid || !px || !py || !pz || !dx || !dy || !dz || !og || !vs)
       return Error{ErrorCode::kInvalidArgument, "GhostPositionUpdate: truncated"};
     GhostPositionUpdate msg;
     msg.entity_id = *eid;
+    msg.cell_epoch = *epoch;
     msg.position = {*px, *py, *pz};
     msg.direction = {*dx, *dy, *dz};
     msg.on_ground = (*og != 0);
@@ -215,6 +231,8 @@ struct GhostDelta {
   uint64_t event_seq{0};
   std::vector<std::byte> other_delta;
 
+  uint32_t cell_epoch{0};
+
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kGhostDelta),
                                    "cellapp::GhostDelta",
@@ -227,6 +245,7 @@ struct GhostDelta {
 
   void Serialize(BinaryWriter& w) const {
     w.Write(entity_id);
+    w.Write(cell_epoch);
     w.Write(event_seq);
     w.WritePackedInt(static_cast<uint32_t>(other_delta.size()));
     if (!other_delta.empty()) w.WriteBytes(std::span<const std::byte>(other_delta));
@@ -234,11 +253,14 @@ struct GhostDelta {
 
   static auto Deserialize(BinaryReader& r) -> Result<GhostDelta> {
     auto eid = r.Read<uint32_t>();
+    auto epoch = r.Read<uint32_t>();
     auto es = r.Read<uint64_t>();
     auto dlen = r.ReadPackedInt();
-    if (!eid || !es || !dlen) return Error{ErrorCode::kInvalidArgument, "GhostDelta: truncated"};
+    if (!epoch || !eid || !es || !dlen)
+      return Error{ErrorCode::kInvalidArgument, "GhostDelta: truncated"};
     GhostDelta msg;
     msg.entity_id = *eid;
+    msg.cell_epoch = *epoch;
     msg.event_seq = *es;
     if (*dlen > 0) {
       auto data = r.ReadBytes(*dlen);
@@ -258,6 +280,8 @@ struct GhostSnapshotRefresh {
   std::vector<std::byte> other_snapshot;
   std::vector<std::byte> persistent_blob;
 
+  uint32_t cell_epoch{0};
+
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kGhostSnapshotRefresh),
                                    "cellapp::GhostSnapshotRefresh",
@@ -270,6 +294,7 @@ struct GhostSnapshotRefresh {
 
   void Serialize(BinaryWriter& w) const {
     w.Write(entity_id);
+    w.Write(cell_epoch);
     w.Write(event_seq);
     w.WritePackedInt(static_cast<uint32_t>(other_snapshot.size()));
     if (!other_snapshot.empty()) w.WriteBytes(std::span<const std::byte>(other_snapshot));
@@ -279,12 +304,14 @@ struct GhostSnapshotRefresh {
 
   static auto Deserialize(BinaryReader& r) -> Result<GhostSnapshotRefresh> {
     auto eid = r.Read<uint32_t>();
+    auto epoch = r.Read<uint32_t>();
     auto es = r.Read<uint64_t>();
     auto snlen = r.ReadPackedInt();
-    if (!eid || !es || !snlen)
+    if (!epoch || !eid || !es || !snlen)
       return Error{ErrorCode::kInvalidArgument, "GhostSnapshotRefresh: truncated"};
     GhostSnapshotRefresh msg;
     msg.entity_id = *eid;
+    msg.cell_epoch = *epoch;
     msg.event_seq = *es;
     if (*snlen > 0) {
       auto data = r.ReadBytes(*snlen);
@@ -292,7 +319,6 @@ struct GhostSnapshotRefresh {
         return Error{ErrorCode::kInvalidArgument, "GhostSnapshotRefresh: snapshot truncated"};
       msg.other_snapshot.assign(data->begin(), data->end());
     }
-    if (r.Remaining() == 0) return msg;
     auto pblen = r.ReadPackedInt();
     if (!pblen)
       return Error{ErrorCode::kInvalidArgument,
@@ -315,15 +341,16 @@ static_assert(NetworkMessage<GhostSnapshotRefresh>);
 struct GhostSetReal {
   EntityID entity_id{kInvalidEntityID};
   Address new_real_addr;
+  Address previous_real_addr;
+  uint32_t cell_epoch{0};
 
   static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{
-        msg_id::Id(msg_id::CellApp::kGhostSetReal),
-        "cellapp::GhostSetReal",
-        MessageLengthStyle::kFixed,
-        static_cast<int>(sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint16_t)),
-        MessageReliability::kReliable,
-        MessageUrgency::kImmediate};
+    static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kGhostSetReal),
+                                   "cellapp::GhostSetReal",
+                                   MessageLengthStyle::kFixed,
+                                   static_cast<int>(4 * sizeof(uint32_t) + 2 * sizeof(uint16_t)),
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
     return kDesc;
   }
 
@@ -331,36 +358,44 @@ struct GhostSetReal {
     w.Write(entity_id);
     w.Write(new_real_addr.Ip());
     w.Write(new_real_addr.Port());
+    w.Write(previous_real_addr.Ip());
+    w.Write(previous_real_addr.Port());
+    w.Write(cell_epoch);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<GhostSetReal> {
     auto eid = r.Read<uint32_t>();
     auto ip = r.Read<uint32_t>();
     auto port = r.Read<uint16_t>();
-    if (!eid || !ip || !port) return Error{ErrorCode::kInvalidArgument, "GhostSetReal: truncated"};
+    auto previous_ip = r.Read<uint32_t>();
+    auto previous_port = r.Read<uint16_t>();
+    auto epoch = r.Read<uint32_t>();
+    if (!eid || !ip || !port || !previous_ip || !previous_port || !epoch)
+      return Error{ErrorCode::kInvalidArgument, "GhostSetReal: truncated"};
     GhostSetReal msg;
     msg.entity_id = *eid;
     msg.new_real_addr = Address(*ip, *port);
+    msg.previous_real_addr = Address(*previous_ip, *previous_port);
+    msg.cell_epoch = *epoch;
     return msg;
   }
 };
 static_assert(NetworkMessage<GhostSetReal>);
 
-// Pre-Offload notification; lets ghosts buffer traffic for the
-// transition window rather than drop it.
+// Pre-Offload ownership hint; the epoch rejects hints from an earlier migration.
 
 struct GhostSetNextReal {
   EntityID entity_id{kInvalidEntityID};
   Address next_real_addr;
+  uint32_t cell_epoch{0};
 
   static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{
-        msg_id::Id(msg_id::CellApp::kGhostSetNextReal),
-        "cellapp::GhostSetNextReal",
-        MessageLengthStyle::kFixed,
-        static_cast<int>(sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint16_t)),
-        MessageReliability::kReliable,
-        MessageUrgency::kImmediate};
+    static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kGhostSetNextReal),
+                                   "cellapp::GhostSetNextReal",
+                                   MessageLengthStyle::kFixed,
+                                   static_cast<int>(3 * sizeof(uint32_t) + sizeof(uint16_t)),
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
     return kDesc;
   }
 
@@ -368,17 +403,20 @@ struct GhostSetNextReal {
     w.Write(entity_id);
     w.Write(next_real_addr.Ip());
     w.Write(next_real_addr.Port());
+    w.Write(cell_epoch);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<GhostSetNextReal> {
     auto eid = r.Read<uint32_t>();
     auto ip = r.Read<uint32_t>();
     auto port = r.Read<uint16_t>();
-    if (!eid || !ip || !port)
+    auto epoch = r.Read<uint32_t>();
+    if (!eid || !ip || !port || !epoch)
       return Error{ErrorCode::kInvalidArgument, "GhostSetNextReal: truncated"};
     GhostSetNextReal msg;
     msg.entity_id = *eid;
     msg.next_real_addr = Address(*ip, *port);
+    msg.cell_epoch = *epoch;
     return msg;
   }
 };
@@ -663,26 +701,30 @@ enum class OffloadRejectReason : uint8_t {
   kStaleGeometry = 2,
   kTargetMissing = 3,
   kRestoreFailed = 4,
+  kOutcomeUnknown = 5,
+  kOverloaded = 6,
 };
 
 struct OffloadEntityAck {
   EntityID entity_id{kInvalidEntityID};
+  uint32_t cell_epoch{0};
   bool success{false};
   OffloadRejectReason reject_reason{OffloadRejectReason::kRejected};
 
   static auto Descriptor() -> const MessageDesc& {
-    static const MessageDesc kDesc{msg_id::Id(msg_id::CellApp::kOffloadEntityAck),
-                                   "cellapp::OffloadEntityAck",
-                                   MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(uint32_t) + sizeof(uint8_t) +
-                                                    sizeof(uint8_t)),
-                                   MessageReliability::kReliable,
-                                   MessageUrgency::kImmediate};
+    static const MessageDesc kDesc{
+        msg_id::Id(msg_id::CellApp::kOffloadEntityAck),
+        "cellapp::OffloadEntityAck",
+        MessageLengthStyle::kFixed,
+        static_cast<int>(2 * sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint8_t)),
+        MessageReliability::kReliable,
+        MessageUrgency::kImmediate};
     return kDesc;
   }
 
   void Serialize(BinaryWriter& w) const {
     w.Write(entity_id);
+    w.Write(cell_epoch);
     w.Write(static_cast<uint8_t>(success ? 1 : 0));
     const auto reason = success ? OffloadRejectReason::kNone : reject_reason;
     w.Write(static_cast<uint8_t>(reason));
@@ -690,14 +732,17 @@ struct OffloadEntityAck {
 
   static auto Deserialize(BinaryReader& r) -> Result<OffloadEntityAck> {
     auto eid = r.Read<uint32_t>();
+    auto epoch = r.Read<uint32_t>();
     auto ok = r.Read<uint8_t>();
     auto reason = r.Read<uint8_t>();
-    if (!eid || !ok || !reason)
+    if (!eid || !epoch || !ok || !reason)
       return Error{ErrorCode::kInvalidArgument, "OffloadEntityAck: truncated"};
     OffloadEntityAck msg;
     msg.entity_id = *eid;
+    msg.cell_epoch = *epoch;
     msg.success = (*ok != 0);
-    if (*reason > static_cast<uint8_t>(OffloadRejectReason::kRestoreFailed)) {
+    if (*ok > 1 || *reason > static_cast<uint8_t>(OffloadRejectReason::kOverloaded) ||
+        (*ok != 0) != (*reason == static_cast<uint8_t>(OffloadRejectReason::kNone))) {
       return Error{ErrorCode::kInvalidArgument, "OffloadEntityAck: bad reason"};
     }
     msg.reject_reason = static_cast<OffloadRejectReason>(*reason);

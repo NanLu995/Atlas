@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -15,10 +16,14 @@ public sealed class RealClusterFixture : IDisposable
     private readonly StringBuilder _stdoutBuf = new();
     public ushort LoginAppPort { get; private set; }
     public ushort BaseAppExternalPort { get; private set; }
+    public ushort MachinedPort { get; private set; }
+    internal string HandoffFixtureDirectory { get; } = Path.Combine(ResolveRepoRoot(), ".tmp",
+        "rpc_handoff_" + Guid.NewGuid().ToString("N"));
+    private readonly List<ushort> _baseInternalPorts = new();
 
     public RealClusterFixture() : this(null) { }
 
-    internal RealClusterFixture(string? assembly, string? cellAssembly = null)
+    internal RealClusterFixture(string? assembly, string? cellAssembly = null, int baseapps = 1)
     {
         var repoRoot = ResolveRepoRoot();
         var launcher = Path.Combine(repoRoot, "tools", "cluster_control", "test_cluster.py");
@@ -39,10 +44,17 @@ public sealed class RealClusterFixture : IDisposable
             },
         };
 
+        if (baseapps == 2)
+        {
+            Directory.CreateDirectory(HandoffFixtureDirectory);
+            _launcher.StartInfo.Environment["ATLAS_RPC_FIXTURE_DIR"] = HandoffFixtureDirectory;
+        }
         var arguments = _launcher.StartInfo.ArgumentList;
         arguments.Add(launcher);
         arguments.Add("--db-backend");
         arguments.Add(Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql");
+        arguments.Add("--baseapps");
+        arguments.Add(baseapps.ToString());
         arguments.Add("--build-dir");
         arguments.Add(Path.GetFileName(Environment.GetEnvironmentVariable("ATLAS_BIN_DIR") ?? "debug"));
         if (!string.IsNullOrEmpty(assembly))
@@ -66,8 +78,7 @@ public sealed class RealClusterFixture : IDisposable
         _launcher.Start();
         _launcher.BeginErrorReadLine();
 
-        // Outer deadline ≥ launcher's per-process registration timeout × N
-        // so a slow cold-start cluster (dbapp first-init dominates) still fits.
+        // Include database initialization and script-host cold startup.
         var deadline = DateTime.UtcNow.AddSeconds(180);
         string? line = null;
         while (DateTime.UtcNow < deadline)
@@ -107,6 +118,9 @@ public sealed class RealClusterFixture : IDisposable
             var value = tok.AsSpan(eq + 1);
             if (key.SequenceEqual("loginapp_port")) LoginAppPort = ushort.Parse(value);
             else if (key.SequenceEqual("baseapp_external_port")) BaseAppExternalPort = ushort.Parse(value);
+            else if (key.SequenceEqual("machined_port")) MachinedPort = ushort.Parse(value);
+            else if (key.SequenceEqual("baseapp_internal_ports"))
+                foreach (var port in value.ToString().Split(',')) _baseInternalPorts.Add(ushort.Parse(port));
         }
         if (LoginAppPort == 0)
             TeardownAndThrow("READY line missing loginapp_port");
@@ -116,6 +130,63 @@ public sealed class RealClusterFixture : IDisposable
     {
         Dispose();
         throw new InvalidOperationException(message);
+    }
+
+    internal void KillBaseApp(ushort internalPort)
+        => ControlBaseApp("kill-baseapp", "KILLED", internalPort);
+
+    internal void RestartBaseApp(ushort internalPort)
+        => ControlBaseApp("restart-baseapp", "RESTARTED", internalPort);
+
+    private void ControlBaseApp(string command, string status, ushort internalPort)
+    {
+        if (!_baseInternalPorts.Contains(internalPort) || _launcher is null)
+            throw new InvalidOperationException("BaseApp is not in this test topology");
+        _launcher.StandardInput.WriteLine($"{command} {internalPort}");
+        _launcher.StandardInput.Flush();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var reply = _launcher.StandardOutput.ReadLineAsync()
+                .WaitAsync(deadline - DateTime.UtcNow).GetAwaiter().GetResult();
+            if (reply == $"{status} baseapp_internal_port={internalPort}") return;
+            if (reply is null || !reply.StartsWith("[", StringComparison.Ordinal))
+                throw new InvalidOperationException($"BaseApp {command} not confirmed: {reply}");
+        }
+        throw new TimeoutException($"BaseApp {command} confirmation expired");
+    }
+
+    internal int ClientBindingCount(ushort internalPort)
+    {
+        var index = _baseInternalPorts.IndexOf(internalPort);
+        if (index < 0) throw new InvalidOperationException("BaseApp is not in this test topology");
+        return WatcherCount(index == 0 ? "baseapp:baseapp" : "baseapp:baseapp-2",
+            "baseapp/client_binding_count");
+    }
+
+    internal int BaseAppCount() => WatcherCount("baseappmgr:baseappmgr", "baseappmgr/baseapp_count");
+
+    private int WatcherCount(string target, string path)
+    {
+        var root = ResolveRepoRoot();
+        var bin = Environment.GetEnvironmentVariable("ATLAS_BIN_DIR")
+            ?? throw new InvalidOperationException("ATLAS_BIN_DIR is required");
+        using var process = new Process { StartInfo = new ProcessStartInfo {
+            FileName = Path.Combine(bin, OperatingSystem.IsWindows() ? "atlas_tool.exe" : "atlas_tool"),
+            WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true } };
+        foreach (var argument in new[] { "--machined", $"127.0.0.1:{MachinedPort}", "watch",
+            target, path })
+            process.StartInfo.ArgumentList.Add(argument);
+        process.Start();
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        var fields = output.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (process.ExitCode != 0 || fields.Length != 2 || !int.TryParse(fields[1], out var count))
+            throw new InvalidOperationException(
+                $"Watcher {target} {path} failed (exit={process.ExitCode}): {output} {error}");
+        return count;
     }
 
     public void Dispose()

@@ -3,6 +3,7 @@
 add_library(atlas_dbapp_lib STATIC
   checkout_manager.cc
   dbapp.cc
+  account_session.cc
   entity_id_allocator.cc
 )
 

@@ -54,10 +54,9 @@ class CellEntity : public IEntityMotion {
   [[nodiscard]] auto GetSpace() -> Space& { return space_; }
   [[nodiscard]] auto GetSpace() const -> const Space& { return space_; }
 
-  // Real (real_data_ set) XOR Ghost (real_channel_ set). Ghosts are
-  // passive - writes must log+skip (see cellapp_native_provider.cc).
+  // A Ghost keeps its role even when its remote channel is unavailable.
   [[nodiscard]] auto IsReal() const -> bool { return real_data_ != nullptr; }
-  [[nodiscard]] auto IsGhost() const -> bool { return real_channel_ != nullptr; }
+  [[nodiscard]] auto IsGhost() const -> bool { return real_data_ == nullptr; }
 
   [[nodiscard]] auto GetRealData() -> RealEntityData* { return real_data_.get(); }
   [[nodiscard]] auto GetRealData() const -> const RealEntityData* { return real_data_.get(); }
@@ -91,6 +90,8 @@ class CellEntity : public IEntityMotion {
   // Used by GhostSetReal post-Offload; clears next_real_addr_. No-op
   // on a Real (no back-channel to rebind).
   void RebindRealChannel(Channel* new_real_channel, const Address& new_real_addr = {});
+  void UpdateGhostOwner(Channel* channel, const Address& previous_addr, const Address& new_addr,
+                        uint32_t epoch);
 
   // Both setters update the field AND the RangeList sort position.
   [[nodiscard]] auto Position() const -> const math::Vector3& override { return position_; }
@@ -235,6 +236,13 @@ class CellEntity : public IEntityMotion {
   Address real_addr_{};
   // In-flight Offload hint between GhostSetNextReal and GhostSetReal.
   Address next_real_addr_{};
+  struct GhostOwnershipUpdate {
+    IntrusivePtr<Channel> channel;
+    Address previous_addr;
+    Address new_addr;
+    uint32_t epoch;
+  };
+  std::vector<GhostOwnershipUpdate> pending_ghost_owners_;
 
   bool destroyed_{false};
   bool linked_to_range_list_{false};

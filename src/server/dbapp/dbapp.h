@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "account_session_messages.h"
 #include "checkout_manager.h"
 #include "db/database_factory.h"
 #include "db/idatabase.h"
@@ -50,6 +51,7 @@ class DBApp : public ManagerApp {
   void OnDeleteEntity(const Address& src, Channel* ch, const dbapp::DeleteEntity& msg);
   void OnLookupEntity(const Address& src, Channel* ch, const dbapp::LookupEntity& msg);
   void OnAbortCheckout(const Address& src, Channel* ch, const dbapp::AbortCheckout& msg);
+  void OnAccountSession(const Address& src, Channel* ch, const dbapp::AccountSessionRequest& msg);
 
   void OnGetEntityIds(const Address& src, Channel* ch, const dbapp::GetEntityIds& msg);
   void OnPutEntityIds(const Address& src, Channel* ch, const dbapp::PutEntityIds& msg);
@@ -109,6 +111,9 @@ class DBApp : public ManagerApp {
   };
   std::vector<ProcessRetirement> process_retirements_;
   std::unique_ptr<IDatabase> database_;
+  std::unordered_map<Address, uint64_t> baseapp_instances_;
+  std::size_t account_session_requests_{0};
+  static constexpr std::size_t kMaxAccountSessionRequests = 1024;
   std::unique_ptr<EntityIdAllocator> id_allocator_;
   CheckoutManager checkout_mgr_;
   struct PendingCheckoutRequest {

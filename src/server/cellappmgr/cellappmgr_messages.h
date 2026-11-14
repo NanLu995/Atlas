@@ -324,6 +324,7 @@ struct CreateSpaceRequest {
   // Empty = no space-owner entity; non-empty resolves via CellApp's EntityDef
   // registry on the primary host and is auto-spawned at AddCellToSpace time.
   std::string space_master_type;
+  bool reuse_existing{false};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::CellAppMgr::kCreateSpaceRequest),
@@ -342,6 +343,7 @@ struct CreateSpaceRequest {
     w.Write(reply_addr.Port());
     w.Write(initial_cell_count);
     w.WriteString(space_master_type);
+    w.Write<uint8_t>(reuse_existing ? 1 : 0);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CreateSpaceRequest> {
@@ -351,7 +353,8 @@ struct CreateSpaceRequest {
     auto port = r.Read<uint16_t>();
     auto cc = r.Read<uint16_t>();
     auto mt = r.ReadString();
-    if (!sid || !rid || !ip || !port || !cc || !mt)
+    auto reuse = r.Read<uint8_t>();
+    if (!sid || !rid || !ip || !port || !cc || !mt || !reuse || *reuse > 1)
       return Error{ErrorCode::kInvalidArgument, "CreateSpaceRequest: truncated"};
     CreateSpaceRequest msg;
     msg.space_id = *sid;
@@ -359,6 +362,7 @@ struct CreateSpaceRequest {
     msg.reply_addr = Address(*ip, *port);
     msg.initial_cell_count = *cc;
     msg.space_master_type = std::move(*mt);
+    msg.reuse_existing = *reuse != 0;
     return msg;
   }
 };

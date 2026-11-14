@@ -109,6 +109,66 @@ TEST(RealGhost, RebindRealChannel_UpdatesBackChannelAndClearsNextRealAddr) {
   EXPECT_EQ(e->NextRealAddr().Port(), 0u);
 }
 
+TEST(RealGhost, QueuedOwnershipDropsCondemnedChannelsAndClearsOnPromotion) {
+  Space space(1);
+  const Address first("127.0.0.1", 30101), second("127.0.0.1", 30102);
+  const Address third("127.0.0.1", 30103), fourth("127.0.0.1", 30104);
+  auto* original = FakeChannel(0xAA10);
+  auto* next = FakeChannel(0xBB10);
+  auto* lost = FakeChannel(0xCC10);
+  CellEntity entity(CellEntity::GhostTag{}, 43, 1, space, {}, {}, original, first);
+  entity.UpdateGhostOwner(lost, second, third, 2);
+  lost->Condemn();
+  entity.UpdateGhostOwner(next, first, second, 1);
+  EXPECT_EQ(entity.GetRealAddr(), second);
+  EXPECT_EQ(entity.CellEpoch(), 1u);
+  auto* restored = FakeChannel(0xDD10);
+  entity.UpdateGhostOwner(restored, second, third, 2);
+  EXPECT_EQ(entity.GetRealAddr(), third);
+  entity.UpdateGhostOwner(FakeChannel(0xEE10), fourth, first, 100);
+  entity.ConvertGhostToReal();
+  entity.ConvertRealToGhost(next, second);
+  entity.UpdateGhostOwner(original, second, fourth, 3);
+  EXPECT_EQ(entity.GetRealAddr(), fourth);
+  EXPECT_EQ(entity.CellEpoch(), 3u);
+}
+
+TEST(RealGhost, QueuedOwnershipIsBoundedAndKeepsAValidChain) {
+  Space space(1);
+  const Address first("127.0.0.1", 30200);
+  CellEntity entity(CellEntity::GhostTag{}, 44, 1, space, {}, {}, FakeChannel(0xAA20), first);
+  auto* channel = FakeChannel(0xBB20);
+  for (uint16_t i = 2; i <= 18; ++i) {
+    entity.UpdateGhostOwner(channel, Address("127.0.0.1", 30200 + i - 1),
+                            Address("127.0.0.1", 30200 + i), i);
+  }
+  EXPECT_EQ(entity.CellEpoch(), 0u);
+  entity.UpdateGhostOwner(channel, first, Address("127.0.0.1", 30201), 1);
+  EXPECT_EQ(entity.CellEpoch(), 17u);
+  EXPECT_EQ(entity.GetRealAddr(), Address("127.0.0.1", 30217));
+  entity.UpdateGhostOwner(channel, Address("127.0.0.1", 30217), Address("127.0.0.1", 30218), 18);
+  EXPECT_EQ(entity.CellEpoch(), 18u);
+}
+
+TEST(RealGhost, GhostRemainsPassiveWithoutAChannel) {
+  Space space(1);
+  auto* entity = space.AddEntity(std::make_unique<CellEntity>(CellEntity::GhostTag{}, 42,
+                                                              uint16_t{1}, space, math::Vector3{},
+                                                              math::Vector3{}, FakeChannel(0xAA)));
+  const Address target(0x7F000001u, 30002);
+
+  entity->RebindRealChannel(nullptr, target);
+
+  EXPECT_TRUE(entity->IsGhost());
+  EXPECT_FALSE(entity->IsReal());
+  EXPECT_EQ(entity->GetRealChannel(), nullptr);
+  EXPECT_EQ(entity->GetRealAddr(), target);
+  EXPECT_EQ(entity->GetRealData(), nullptr);
+  entity->ConvertGhostToReal();
+  EXPECT_TRUE(entity->IsReal());
+  EXPECT_FALSE(entity->IsGhost());
+}
+
 TEST(RealGhost, RebindRealChannel_IgnoredOnReal) {
   Space space(1);
   auto* e = space.AddEntity(std::make_unique<CellEntity>(
@@ -551,6 +611,17 @@ TEST(RealGhost, GhostApplyDelta_OutOfOrderDropped) {
   e->GhostApplyDelta(5, std::span<const std::byte>(dup));
   EXPECT_EQ(e->GetReplicationState()->latest_event_seq, 5u);
   EXPECT_EQ(e->GetReplicationState()->history.size(), 1u);
+}
+
+TEST(RealEntityData, GhostDataBuildersUseCurrentMigrationEpoch) {
+  Space space(1);
+  auto* entity = space.AddEntity(
+      std::make_unique<CellEntity>(900, uint16_t{1}, space, math::Vector3{}, math::Vector3{}));
+  entity->SetCellEpoch(42);
+  const auto* data = entity->GetRealData();
+  EXPECT_EQ(data->BuildPositionUpdate().cell_epoch, 42u);
+  EXPECT_EQ(data->BuildDelta().cell_epoch, 42u);
+  EXPECT_EQ(data->BuildSnapshotRefresh().cell_epoch, 42u);
 }
 
 }  // namespace

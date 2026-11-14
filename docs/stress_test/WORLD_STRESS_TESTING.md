@@ -17,7 +17,7 @@ client
    │                       ├── CreateBaseEntity native API
    │                       │   ├── RestoreEntity (C# 实例化)
    │                       │   └── CreateCellEntity → CellApp  (cell 实体上，尚无 witness)
-   │                       ├── GiveClientTo(avatar)
+   │                       ├── await GiveClientToAsync(avatar.EntityId)
    │                       │   └── BaseApp::BindClient → cellapp::EnableWitness
    │                       │         (witness 用 CellAppConfig 默认 500 m / 5 m)
    │                       └── avatar.SetAoIRadius(50, 5)

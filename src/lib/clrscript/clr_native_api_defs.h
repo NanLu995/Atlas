@@ -79,9 +79,17 @@
         atlas::GetNativeApiProvider().WriteToDb( \
             entity_id, reinterpret_cast<const std::byte*>(entity_data), len)) \
  \
-    X(void, GiveClientTo, \
-        (uint32_t src_entity_id, uint32_t dest_entity_id), \
-        atlas::GetNativeApiProvider().GiveClientTo(src_entity_id, dest_entity_id)) \
+    X(int32_t, TransferClient, \
+        (uint32_t src_entity_id, uint32_t dest_entity_id, uint32_t base_ip, uint16_t base_port, \
+         uint64_t base_instance, uint64_t request_id), \
+        return static_cast<int32_t>(atlas::GetNativeApiProvider().TransferClient( \
+            src_entity_id, dest_entity_id, base_ip, base_port, base_instance, request_id))) \
+ \
+    X(int32_t, GetClientHandoffTarget, \
+        (uint32_t entity_id, uint32_t* base_ip, uint16_t* base_port, uint64_t* base_instance), \
+        if (!base_ip || !base_port || !base_instance) return 0; \
+        return atlas::GetNativeApiProvider().GetClientHandoffTarget( \
+            entity_id, *base_ip, *base_port, *base_instance) ? 1 : 0) \
  \
     X(void, SetSpaceMasterType, \
         (uint32_t space_id, const char* name, int32_t len), \

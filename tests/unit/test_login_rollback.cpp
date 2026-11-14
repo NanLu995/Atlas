@@ -10,10 +10,14 @@
 #include <gtest/gtest.h>
 
 #include "baseapp/baseapp.h"
+#include "cellappmgr/cellappmgr_messages.h"
 #include "coro/cancellation.h"
+#include "coro/fire_and_forget.h"
+#include "coro/rpc_call.h"
 #include "db/idatabase.h"
 #include "dbapp/dbapp.h"
 #include "dbappmgr/dbappmgr_messages.h"
+#include "foundation/intrusive_ptr.h"
 #include "loginapp/loginapp.h"
 #include "network/reliable_udp.h"
 #include "serialization/binary_stream.h"
@@ -31,15 +35,21 @@ class CapturingChannel final : public Channel {
   [[nodiscard]] auto Fd() const -> FdHandle override { return kInvalidFd; }
   [[nodiscard]] auto send_count() const -> std::size_t { return sends_.size(); }
   [[nodiscard]] auto Sends() const -> const std::vector<std::vector<std::byte>>& { return sends_; }
+  void FailNextSend() { fail_next_send_ = true; }
 
  protected:
   [[nodiscard]] auto DoSend(std::span<const std::byte> data) -> Result<std::size_t> override {
+    if (fail_next_send_) {
+      fail_next_send_ = false;
+      return Error{ErrorCode::kInternalError, "injected send failure"};
+    }
     sends_.emplace_back(data.begin(), data.end());
     return data.size();
   }
 
  private:
   std::vector<std::vector<std::byte>> sends_;
+  bool fail_next_send_{false};
 };
 
 template <typename Msg>
@@ -302,6 +312,21 @@ class BaseAppRollbackTest : public ::testing::Test {
   void TearDown() override {
     if (checkout_type_registered_) EntityDefRegistry::Instance().clear();
   }
+  void set_space_manager(Channel* channel) { app_.cellappmgr_channel_ = channel; }
+  void answer_space(Channel& channel, const cellappmgr::SpaceCreatedResult& reply) {
+    app_.OnSpaceCreatedResult(channel, reply);
+  }
+  auto pending_spaces() const -> std::size_t { return app_.pending_space_creates_.size(); }
+  void expire_spaces() {
+    for (auto& [_, pending] : app_.pending_space_creates_)
+      pending.started_at = Clock::now() - std::chrono::seconds(6);
+    app_.CleanupExpiredPendingRequests();
+  }
+  void fail_spaces() { app_.FailPendingSpaceCreates(); }
+  void exhaust_space_ids() { app_.next_space_request_id_ = 0; }
+  auto request_space(SpaceID id, BaseApp::SpaceCreatedCallback callback) -> uint32_t {
+    return app_.RequestCreateSpace(id, std::move(callback));
+  }
   void load_from_db(Channel& channel, const baseapp::CreateBaseFromDB& request) {
     app_.OnCreateBaseFromDb(channel, request);
   }
@@ -316,6 +341,490 @@ class BaseAppRollbackTest : public ::testing::Test {
   }
 
   void cleanup_expired() { app_.CleanupExpiredPendingRequests(); }
+
+  auto query_session(std::shared_ptr<std::optional<Result<AccountSession>>> result,
+                     std::optional<AccountSessionOperation> operation = {},
+                     CancellationToken token = {}) -> FireAndForget {
+    *result = co_await app_.QueryAccountSession(42, 7, std::move(operation), std::move(token));
+  }
+  void session_reply(Channel* channel, const dbapp::AccountSessionReply& reply) {
+    app_.OnAccountSessionReply(channel, reply);
+  }
+  auto session_pending_count() const -> std::size_t { return app_.rpc_registry_.PendingCount(); }
+  void disconnect_session_channel(Channel* channel) { app_.rpc_registry_.CancelByChannel(channel); }
+
+  auto new_proxy(DatabaseID dbid = kInvalidDBID) -> Proxy* {
+    app_.entity_mgr_.SetIdClient(&app_.id_client_);
+    if (!ids_seeded_) {
+      app_.id_client_.AddIds(1000, 1100);
+      ids_seeded_ = true;
+    }
+    auto* entity = app_.entity_mgr_.Create(7, true, dbid);
+    return entity ? app_.entity_mgr_.FindProxy(entity->EntityId()) : nullptr;
+  }
+  auto handoff_target(EntityID entity_id) -> std::optional<AccountSessionOwner> {
+    BaseAppNativeProvider provider(app_);
+    uint32_t ip = 17;
+    uint16_t port = 19;
+    uint64_t instance = 23;
+    if (!provider.GetClientHandoffTarget(entity_id, ip, port, instance)) {
+      EXPECT_EQ(ip, 0u);
+      EXPECT_EQ(port, 0u);
+      EXPECT_EQ(instance, 0u);
+      return {};
+    }
+    return AccountSessionOwner{Address(ip, port), entity_id, instance};
+  }
+  auto prepare_auth_proxy(DatabaseID dbid = 42) -> Proxy* {
+    auto* proxy = new_proxy(dbid);
+    if (!proxy) return nullptr;
+    auto key = SessionKey::Generate();
+    EXPECT_TRUE(key.HasValue());
+    if (!key) return nullptr;
+    EXPECT_TRUE(app_.entity_mgr_.AssignSessionKey(proxy->EntityId(), *key));
+    CheckoutInfo checkout{Address("127.0.0.1", 25001), 7, proxy->EntityId(), 9, 111};
+    proxy->SetCheckoutOwner(checkout);
+    const auto request_id = proxy->EntityId() + 100;
+    app_.prepared_login_entities_[request_id] = BaseApp::PreparedLoginEntity{
+        proxy->EntityId(), dbid, 7, Clock::now(), std::format("session-test-{}", dbid), checkout};
+    app_.prepared_login_requests_by_entity_[proxy->EntityId()] = request_id;
+    return proxy;
+  }
+  void authenticate(Channel& channel, const SessionKey& key, bool supports_handoff = false) {
+    baseapp::Authenticate request;
+    request.session_key = key;
+    request.supports_handoff = supports_handoff;
+    app_.OnClientAuthenticate(channel, request);
+  }
+  auto handoff_request(Proxy& target, const SessionKey& credential)
+      -> baseapp::PrepareClientHandoff {
+    baseapp::PrepareClientHandoff request;
+    request.request_id = (uint64_t{1} << 40) + 5;
+    request.requester_instance = 222;
+    request.account_dbid = 42;
+    request.account_type_id = 7;
+    request.username = "handoff-test";
+    request.expected.version = 5;
+    request.expected.phase = AccountSessionPhase::kPreparing;
+    request.expected.owner = {Address("127.0.0.1", 25002), 600, 222};
+    request.expected.target = {Address("127.0.0.1", 25001), target.EntityId(), 111};
+    request.expected.handoff_id[0] = std::byte{1};
+    auto hash = Sha256(std::as_bytes(std::span{credential.bytes}));
+    EXPECT_TRUE(hash.HasValue());
+    if (hash) request.expected.credential_hash = *hash;
+    std::ranges::copy(std::as_bytes(EntityDefRegistry::Instance().Digest()),
+                      request.entity_def_digest.begin());
+    register_base_peer(request.expected.owner.base_addr, 222);
+    register_base_peer(request.expected.target.base_addr, 111);
+    return request;
+  }
+  void prepare_handoff(Channel& channel, const baseapp::PrepareClientHandoff& request) {
+    app_.OnPrepareClientHandoff(IntrusivePtr<Channel>{&channel}, request);
+  }
+  auto dispatch_internal(Channel& channel, MessageID id, std::span<const std::byte> bytes) -> bool {
+    BinaryReader reader(bytes);
+    return internal_network_.InterfaceTable()
+        .Dispatch(channel.RemoteAddress(), &channel, id, reader)
+        .HasValue();
+  }
+  auto incoming_handoff_count() const -> std::size_t {
+    return app_.incoming_client_handoffs_.size();
+  }
+  void fill_handoff_queue() {
+    const auto incoming = app_.incoming_client_handoffs_.begin()->second;
+    for (EntityID id = 2000; app_.incoming_client_handoffs_.size() < 1024; ++id)
+      app_.incoming_client_handoffs_.emplace(id, incoming);
+  }
+  void expire_handoffs() {
+    for (auto& [_, incoming] : app_.incoming_client_handoffs_)
+      incoming->checked_at = Clock::now() - std::chrono::seconds(21);
+    app_.SweepIncomingClientHandoffs();
+  }
+  auto apply_latest(CapturingChannel& database, const AccountSession& current) -> AccountSession {
+    const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(database);
+    EXPECT_FALSE(requests.empty());
+    if (requests.empty() || !requests.back().operation) {
+      ADD_FAILURE() << "expected session mutation";
+      return current;
+    }
+    auto next = ApplySessionOperation(current, *requests.back().operation);
+    EXPECT_TRUE(next.HasValue());
+    return next ? *next : current;
+  }
+  void answer_session(CapturingChannel& channel, const AccountSession& record,
+                      ErrorCode status = ErrorCode::kNone) {
+    const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(channel);
+    ASSERT_FALSE(requests.empty());
+    const auto& request = requests.back();
+    dbapp::AccountSessionReply reply;
+    reply.request_id = request.request_id;
+    reply.requester_instance = request.process_instance;
+    reply.account_dbid = request.account_dbid;
+    reply.account_type_id = request.account_type_id;
+    if (request.operation) reply.operation_id = request.operation->id;
+    reply.session = record;
+    reply.status = status;
+    if (status != ErrorCode::kNone) reply.error = "injected session failure";
+    app_.OnAccountSessionReply(&channel, reply);
+  }
+  auto active_session(Proxy& proxy, uint64_t version = 1) -> AccountSession {
+    AccountSession record;
+    record.version = version;
+    record.phase = AccountSessionPhase::kActive;
+    const auto& checkout = *proxy.CheckoutOwner();
+    record.owner = {checkout.base_addr, proxy.EntityId(), checkout.process_instance};
+    return record;
+  }
+  void retain_client_channel(const Address& address) {
+    ASSERT_TRUE(external_network_.ConnectRudp(address).HasValue());
+  }
+  auto move_session(EntityID source, EntityID destination,
+                    std::shared_ptr<std::optional<Result<void>>> result) -> FireAndForget {
+    *result = co_await app_.MoveClientSession(source, destination);
+  }
+  auto move_remote_session(EntityID source, AccountSessionOwner target,
+                           std::shared_ptr<std::optional<Result<void>>> result) -> FireAndForget {
+    *result = co_await app_.MoveRemoteClientSession(source, target);
+  }
+  auto recover_remote_session(EntityID source, std::shared_ptr<std::optional<Result<void>>> result)
+      -> FireAndForget {
+    auto session = app_.client_sessions_.at(source);
+    session->frozen = true;
+    session->remote_handoff = true;
+    *result = co_await app_.RecoverClientHandoff(session, {}, Error{ErrorCode::kReceiverGone});
+  }
+  auto release_session(EntityID entity_id, std::shared_ptr<std::optional<Result<void>>> result)
+      -> FireAndForget {
+    *result = co_await app_.ReleaseClientSession(entity_id);
+  }
+  auto session_frozen(EntityID entity_id) const -> bool {
+    return app_.HasFrozenClientSession(entity_id);
+  }
+  auto transfer_target_reserved(EntityID entity_id) const -> bool {
+    return app_.client_transfer_targets_.contains(entity_id);
+  }
+  auto finalize_proxy(EntityID entity_id) -> bool { return app_.FinalizeForceLogoff(entity_id); }
+  auto rollback_auth_proxy(Proxy& proxy) -> bool {
+    return app_.RollbackPreparedLoginEntity(proxy.EntityId() + 100);
+  }
+  void register_base_peer(const Address& address, uint64_t instance) {
+    machined::BirthNotification birth;
+    birth.process_type = ProcessType::kBaseApp;
+    birth.internal_addr = address;
+    birth.process_instance = instance;
+    app_.OnBaseAppBirth(birth);
+  }
+  void retire_base_peer(const Address& address, uint64_t instance) {
+    machined::DeathNotification death;
+    death.internal_addr = address;
+    death.process_instance = instance;
+    app_.OnBaseAppDeath(death);
+  }
+  auto base_peer_instance(const Address& address) const -> uint64_t {
+    const auto peer = app_.baseapp_peers_.find(address);
+    return peer == app_.baseapp_peers_.end() ? 0 : peer->second.process_instance;
+  }
+  void revoke_session(Channel& channel, const baseapp::RevokeAccountSession& request) {
+    app_.OnRevokeAccountSession(IntrusivePtr<Channel>{&channel}, request);
+  }
+  auto revocation_count() const -> std::size_t { return app_.session_revocations_; }
+  void set_revocations_full(bool full) { app_.session_revocations_ = full ? 1024 : 0; }
+  void prepare_login(Channel& channel, uint32_t request_id = 17) {
+    login::PrepareLogin request;
+    request.request_id = request_id;
+    request.dbid = 42;
+    request.type_id = 7;
+    request.username = "preflight-test";
+    const auto digest = EntityDefRegistry::Instance().Digest();
+    std::copy(digest.begin(), digest.end(), request.entity_def_digest.begin());
+    app_.OnPrepareLogin(channel, request);
+  }
+  void cancel_login(Channel& channel, uint32_t request_id = 17) {
+    login::CancelPrepareLogin request;
+    request.request_id = request_id;
+    request.dbid = 42;
+    app_.OnCancelPrepareLogin(channel, request);
+  }
+  auto login_session_check_count() const -> std::size_t {
+    return app_.login_session_checks_.size();
+  }
+  void check_remote_revocation_roundtrip() {
+    ASSERT_TRUE(internal_network_.StartRudpServer(Address("127.0.0.1", 0)));
+    NetworkInterface remote_network(dispatcher_);
+    NetworkInterface remote_external(dispatcher_);
+    ASSERT_TRUE(remote_network.StartRudpServer(Address("127.0.0.1", 0)));
+    BaseApp remote(dispatcher_, remote_network, remote_external);
+    const_cast<ServerConfig&>(remote.Config()).process_instance = 222;
+    remote.RegisterInternalHandlers();
+    InterfaceTable table;
+    auto database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+    auto remote_database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24003));
+    auto login = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 28001));
+    set_legacy_dbapp_channel(database.get());
+    remote.dbapp_channel_ = remote_database.get();
+    const auto source_addr = internal_network_.RudpAddress();
+    const auto target_addr = remote_network.RudpAddress();
+    register_base_peer(source_addr, 111);
+    register_base_peer(target_addr, 222);
+    for (const auto& [_, peer] : app_.baseapp_peers_) remote.OnBaseAppBirth(peer);
+    prepare_login(*login);
+    AccountSession grant;
+    grant.version = 9;
+    grant.phase = AccountSessionPhase::kActive;
+    grant.owner = {target_addr, 600, 222};
+    answer_session(*database, grant);
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    while (remote_database->send_count() == 0 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+    auto reads = DecodeSentMessages<dbapp::AccountSessionRequest>(*remote_database);
+    ASSERT_EQ(reads.size(), 1u);
+    EXPECT_EQ(login_session_check_count(), 1u);
+    EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+    auto answer_remote = [&](const AccountSession& record) {
+      const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*remote_database);
+      const auto& request = requests.back();
+      dbapp::AccountSessionReply reply;
+      reply.request_id = request.request_id;
+      reply.requester_instance = 222;
+      reply.account_dbid = request.account_dbid;
+      reply.account_type_id = request.account_type_id;
+      if (request.operation) reply.operation_id = request.operation->id;
+      reply.session = record;
+      remote.OnAccountSessionReply(remote_database.get(), reply);
+    };
+    answer_remote(grant);
+    auto writes = DecodeSentMessages<dbapp::AccountSessionRequest>(*remote_database);
+    ASSERT_EQ(writes.size(), 2u);
+    ASSERT_TRUE(writes.back().operation.has_value());
+    EXPECT_EQ(writes.back().operation->expected_version, grant.version);
+    EXPECT_EQ(writes.back().operation->actor, grant.owner);
+    EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+    AccountSession offline;
+    offline.version = 10;
+    answer_remote(offline);
+    const auto complete_deadline = Clock::now() + std::chrono::seconds(2);
+    while (login_session_check_count() != 0 && Clock::now() < complete_deadline)
+      dispatcher_.ProcessOnce();
+    EXPECT_EQ(login_session_check_count(), 0u);
+    EXPECT_EQ(DecodeSentMessages<dbapp::CheckoutEntity>(*database).size(), 1u);
+    EXPECT_EQ(remote.session_revocations_, 0u);
+  }
+  auto wait_handoff_reply(
+      Channel* channel, baseapp::PrepareClientHandoff request,
+      std::shared_ptr<std::optional<Result<baseapp::PrepareClientHandoffReply>>> result)
+      -> FireAndForget {
+    *result = co_await RpcCall<baseapp::PrepareClientHandoffReply>(
+        app_.rpc_registry_, *channel, request, std::chrono::seconds(2));
+  }
+  void check_handoff_roundtrip() {
+    ASSERT_TRUE(internal_network_.StartRudpServer(Address("127.0.0.1", 0)));
+    NetworkInterface remote_network(dispatcher_);
+    NetworkInterface remote_external(dispatcher_);
+    ASSERT_TRUE(remote_network.StartRudpServer(Address("127.0.0.1", 0)));
+    BaseApp remote(dispatcher_, remote_network, remote_external);
+    const_cast<ServerConfig&>(remote.Config()).process_instance = 222;
+    remote.RegisterInternalHandlers();
+    remote.entity_mgr_.SetIdClient(&remote.id_client_);
+    remote.id_client_.AddIds(2000, 2100);
+    ASSERT_NE(remote.entity_mgr_.Create(7, true), nullptr);
+    auto* target = remote.entity_mgr_.FindProxy(2000);
+    ASSERT_NE(target, nullptr);
+    auto key = SessionKey::Generate();
+    ASSERT_TRUE(key.HasValue());
+    auto request = handoff_request(*target, *key);
+    const auto source_addr = internal_network_.RudpAddress();
+    const auto target_addr = remote_network.RudpAddress();
+    request.requester_instance = 111;
+    request.expected.owner = {source_addr, 600, 111};
+    request.expected.target = {target_addr, 2000, 222};
+    register_base_peer(source_addr, 111);
+    register_base_peer(target_addr, 222);
+    for (const auto& [_, peer] : app_.baseapp_peers_) remote.OnBaseAppBirth(peer);
+    InterfaceTable table;
+    auto database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+    remote.dbapp_channel_ = database.get();
+    auto channel = internal_network_.ConnectRudpNocwnd(target_addr);
+    ASSERT_TRUE(channel.HasValue());
+    auto result = std::make_shared<std::optional<Result<baseapp::PrepareClientHandoffReply>>>();
+    wait_handoff_reply(*channel, request, result);
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    while (database->send_count() == 0 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+    ASSERT_EQ(database->send_count(), 1u);
+    EXPECT_FALSE(result->has_value());
+    baseapp::PrepareClientHandoffReply wrong;
+    wrong.request_id = request.request_id;
+    wrong.requester_instance = 999;
+    wrong.account_dbid = request.account_dbid;
+    wrong.account_type_id = request.account_type_id;
+    BinaryWriter bytes;
+    wrong.Serialize(bytes);
+    EXPECT_TRUE(dispatch_internal(**channel, wrong.Descriptor().id, bytes.Data()));
+    EXPECT_FALSE(result->has_value());
+    auto answer = [&](const AccountSession& record) {
+      const auto pending = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+      dbapp::AccountSessionReply reply;
+      reply.request_id = pending.request_id;
+      reply.requester_instance = 222;
+      reply.account_dbid = pending.account_dbid;
+      reply.account_type_id = pending.account_type_id;
+      if (pending.operation) reply.operation_id = pending.operation->id;
+      reply.session = record;
+      remote.OnAccountSessionReply(database.get(), reply);
+    };
+    answer(request.expected);
+    EXPECT_FALSE(result->has_value());
+    auto accepted = apply_latest(*database, request.expected);
+    answer(accepted);
+    const auto complete_deadline = Clock::now() + std::chrono::seconds(2);
+    while (!result->has_value() && Clock::now() < complete_deadline) dispatcher_.ProcessOnce();
+    ASSERT_TRUE(result->has_value());
+    ASSERT_TRUE((*result)->HasValue());
+    EXPECT_EQ((**result)->status, ErrorCode::kNone);
+    EXPECT_EQ((**result)->session, accepted);
+    EXPECT_FALSE(target->HasClient());
+    EXPECT_EQ(app_.rpc_registry_.PendingCount(), 0u);
+    EXPECT_EQ(remote.rpc_registry_.PendingCount(), 0u);
+  }
+  void check_outgoing_handoff(bool occupied = false, bool unknown = false,
+                              bool unsupported = false) {
+    ASSERT_TRUE(internal_network_.StartRudpServer(Address("127.0.0.1", 0)));
+    ASSERT_TRUE(external_network_.StartRudpServer(Address("127.0.0.1", 0)));
+    NetworkInterface remote_network(dispatcher_);
+    NetworkInterface remote_external(dispatcher_);
+    NetworkInterface client_network(dispatcher_);
+    ASSERT_TRUE(remote_network.StartRudpServer(Address("127.0.0.1", 0)));
+    ASSERT_TRUE(remote_external.StartRudpServer(Address("127.0.0.1", 0)));
+    ASSERT_TRUE(client_network.StartRudpServer(Address("127.0.0.1", 0)));
+    BaseApp remote(dispatcher_, remote_network, remote_external);
+    const_cast<ServerConfig&>(remote.Config()).process_instance = 222;
+    remote.RegisterInternalHandlers();
+    remote.entity_mgr_.SetIdClient(&remote.id_client_);
+    remote.id_client_.AddIds(2000, 2100);
+    ASSERT_NE(remote.entity_mgr_.Create(7, true), nullptr);
+    auto* target = remote.entity_mgr_.FindProxy(2000);
+    ASSERT_NE(target, nullptr);
+    if (occupied) target->BindClient(Address("127.0.0.1", 29001));
+    const auto source_addr = internal_network_.RudpAddress();
+    const auto target_addr = remote_network.RudpAddress();
+    register_base_peer(source_addr, 111);
+    register_base_peer(target_addr, 222);
+    app_.baseapp_peers_.at(target_addr).external_addr = remote_external.RudpAddress();
+    for (const auto& [_, peer] : app_.baseapp_peers_) remote.OnBaseAppBirth(peer);
+    InterfaceTable table;
+    auto database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+    auto remote_database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24003));
+    auto client =
+        make_intrusive<CapturingChannel>(dispatcher_, table, client_network.RudpAddress());
+    set_legacy_dbapp_channel(database.get());
+    remote.dbapp_channel_ = remote_database.get();
+    auto* source = prepare_auth_proxy();
+    ASSERT_NE(source, nullptr);
+    auto checkout = *source->CheckoutOwner();
+    checkout.base_addr = source_addr;
+    source->SetCheckoutOwner(checkout);
+    app_.prepared_login_entities_.at(source->EntityId() + 100).checkout_owner = checkout;
+    retain_client_channel(client_network.RudpAddress());
+    authenticate(*client, source->GetSessionKey(), !unsupported);
+    answer_session(*database, {});
+    const auto active = active_session(*source);
+    answer_session(*database, active);
+    std::optional<baseapp::ClientHandoff> redirect;
+    ASSERT_TRUE(client_network.InterfaceTable().RegisterTypedHandler<baseapp::ClientHandoff>(
+        [&](const Address&, Channel*, const baseapp::ClientHandoff& request) {
+          redirect = request;
+        }));
+    auto result = std::make_shared<std::optional<Result<void>>>();
+    move_remote_session(source->EntityId(), {target_addr, target->EntityId(), 222}, result);
+    if (unsupported) {
+      ASSERT_TRUE(result->has_value());
+      ASSERT_FALSE((*result)->HasValue());
+      EXPECT_EQ((*result)->Error().Code(), ErrorCode::kNotSupported);
+      EXPECT_EQ(database->send_count(), 2u);
+      EXPECT_TRUE(source->HasClient());
+      EXPECT_FALSE(session_frozen(source->EntityId()));
+      return;
+    }
+    EXPECT_TRUE(source->HasClient());
+    EXPECT_TRUE(session_frozen(source->EntityId()));
+    const auto prepared = apply_latest(*database, active);
+    answer_session(*database, prepared);
+    auto pump = [&](auto predicate) {
+      const auto deadline = Clock::now() + std::chrono::seconds(2);
+      while (!predicate() && Clock::now() < deadline) dispatcher_.ProcessOnce();
+      return predicate();
+    };
+    if (occupied) {
+      ASSERT_TRUE(pump([&] { return database->send_count() == 4; }));
+      answer_session(*database, prepared);
+      const auto aborted = apply_latest(*database, prepared);
+      answer_session(*database, aborted);
+      ASSERT_TRUE(result->has_value());
+      EXPECT_FALSE((*result)->HasValue());
+      EXPECT_FALSE(session_frozen(source->EntityId()));
+      EXPECT_TRUE(source->HasClient());
+      EXPECT_FALSE(redirect.has_value());
+      EXPECT_EQ(remote_database->send_count(), 0u);
+      return;
+    }
+    ASSERT_TRUE(pump([&] { return remote_database->send_count() != 0; }));
+    auto answer_remote = [&](const AccountSession& record, ErrorCode status = ErrorCode::kNone) {
+      const auto pending =
+          DecodeSentMessages<dbapp::AccountSessionRequest>(*remote_database).back();
+      dbapp::AccountSessionReply reply;
+      reply.request_id = pending.request_id;
+      reply.requester_instance = 222;
+      reply.account_dbid = pending.account_dbid;
+      reply.account_type_id = pending.account_type_id;
+      if (pending.operation) reply.operation_id = pending.operation->id;
+      reply.session = record;
+      reply.status = status;
+      remote.OnAccountSessionReply(remote_database.get(), reply);
+    };
+    answer_remote(prepared);
+    const auto accepted = apply_latest(*remote_database, prepared);
+    answer_remote(accepted);
+    ASSERT_TRUE(pump([&] { return database->send_count() == 4; }));
+    const auto awaiting = apply_latest(*database, accepted);
+    answer_session(*database, awaiting);
+    ASSERT_TRUE(pump([&] {
+      return redirect.has_value() && remote.incoming_client_handoffs_.at(2000)->waiter.has_value();
+    }));
+    EXPECT_EQ(redirect->target.base_addr, remote_external.RudpAddress());
+    EXPECT_EQ(redirect->target.process_instance, 222u);
+    EXPECT_TRUE(source->HasClient());
+    EXPECT_FALSE(target->HasClient());
+    remote.OnClientAuthenticate(*client, baseapp::Authenticate{redirect->credential});
+    answer_remote(awaiting);
+    const auto completed = apply_latest(*remote_database, awaiting);
+    if (unknown) {
+      answer_remote({}, ErrorCode::kCommitUnknown);
+      app_.rpc_registry_.CancelByChannel(internal_network_.FindChannel(target_addr));
+      answer_session(*database, completed);
+      ASSERT_TRUE(result->has_value());
+      EXPECT_FALSE((*result)->HasValue());
+      EXPECT_EQ((*result)->Error().Code(), ErrorCode::kCommitUnknown);
+      EXPECT_TRUE(source->HasClient());
+      EXPECT_TRUE(session_frozen(source->EntityId()));
+      EXPECT_FALSE(target->HasClient());
+      return;
+    }
+    answer_remote(completed);
+    EXPECT_TRUE(source->HasClient());
+    ASSERT_TRUE(pump([&] { return result->has_value(); }));
+    EXPECT_TRUE((*result)->HasValue());
+    EXPECT_FALSE(source->HasClient());
+    EXPECT_TRUE(source->GetSessionKey().IsZero());
+    EXPECT_TRUE(target->HasClient());
+    EXPECT_EQ(source->CheckoutOwner(), checkout);
+    EXPECT_EQ(source->Dbid(), 42);
+    EXPECT_EQ(target->Dbid(), kInvalidDBID);
+    EXPECT_EQ(session_pending_count(), 0u);
+    EXPECT_EQ(remote.rpc_registry_.PendingCount(), 0u);
+  }
 
   auto has_prepared(uint32_t login_request_id) const -> bool {
     return app_.prepared_login_entities_.contains(login_request_id);
@@ -563,6 +1072,1217 @@ class BaseAppRollbackTest : public ::testing::Test {
   bool ids_seeded_{false};
   bool checkout_type_registered_{false};
 };
+
+TEST_F(BaseAppRollbackTest, SpaceReplyMustMatchManagerChannelAndSpaceAndCompletesOnce) {
+  InterfaceTable table;
+  auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 26001));
+  auto impostor = make_intrusive<CapturingChannel>(dispatcher_, table, manager->RemoteAddress());
+  set_space_manager(manager.get());
+  int completed = 0;
+  const auto id = request_space(99, [&](bool success, SpaceID space, const Address& host) {
+    EXPECT_TRUE(success);
+    EXPECT_EQ(space, 99u);
+    EXPECT_EQ(host.Port(), 26002u);
+    ++completed;
+  });
+  ASSERT_NE(id, 0u);
+  cellappmgr::SpaceCreatedResult reply{id, 99, true, 1, Address("127.0.0.1", 26002)};
+  answer_space(*impostor, reply);
+  reply.space_id = 100;
+  answer_space(*manager, reply);
+  EXPECT_EQ(completed, 0);
+  EXPECT_EQ(pending_spaces(), 1u);
+  reply.space_id = 99;
+  answer_space(*manager, reply);
+  answer_space(*manager, reply);
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(pending_spaces(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, SpaceTimeoutDisconnectSendFailureAndExhaustionReportOriginalSpace) {
+  InterfaceTable table;
+  auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 26001));
+  set_space_manager(manager.get());
+  int failures = 0;
+  auto failed = [&](bool success, SpaceID space, const Address& host) {
+    EXPECT_FALSE(success);
+    EXPECT_EQ(space, 99u);
+    EXPECT_EQ(host, Address{});
+    ++failures;
+  };
+  ASSERT_NE(request_space(99, failed), 0u);
+  expire_spaces();
+  expire_spaces();
+  EXPECT_EQ(failures, 1);
+  ASSERT_NE(request_space(99, failed), 0u);
+  fail_spaces();
+  fail_spaces();
+  EXPECT_EQ(failures, 2);
+  manager->FailNextSend();
+  EXPECT_EQ(request_space(99, failed), 0u);
+  EXPECT_EQ(failures, 3);
+  exhaust_space_ids();
+  EXPECT_EQ(request_space(99, failed), 0u);
+  EXPECT_EQ(failures, 4);
+  EXPECT_EQ(pending_spaces(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, SpaceCreationRefusesOverloadWithoutAddingWaiters) {
+  InterfaceTable table;
+  auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 26001));
+  set_space_manager(manager.get());
+  int failed = 0;
+  auto callback = [&](bool success, SpaceID, const Address&) {
+    EXPECT_FALSE(success);
+    ++failed;
+  };
+  for (SpaceID id = 1; id <= 1024; ++id) ASSERT_NE(request_space(id, callback), 0u);
+  EXPECT_EQ(request_space(1025, callback), 0u);
+  EXPECT_EQ(pending_spaces(), 1024u);
+  EXPECT_EQ(manager->send_count(), 1024u);
+  EXPECT_EQ(failed, 1);
+  fail_spaces();
+  EXPECT_EQ(failed, 1025);
+}
+
+class ClientHandoffTest : public BaseAppRollbackTest {
+ protected:
+  void SetUp() override {
+    target_ = new_proxy();
+    ASSERT_NE(target_, nullptr);
+    auto key = SessionKey::Generate();
+    ASSERT_TRUE(key.HasValue());
+    credential_ = *key;
+    request_ = handoff_request(*target_, credential_);
+    database_ = make_intrusive<CapturingChannel>(dispatcher_, table_, Address("127.0.0.1", 24001));
+    source_ =
+        make_intrusive<CapturingChannel>(dispatcher_, table_, request_.expected.owner.base_addr);
+    client_ = make_intrusive<CapturingChannel>(dispatcher_, table_, Address("127.0.0.1", 28001));
+    set_legacy_dbapp_channel(database_.get());
+    retain_client_channel(client_->RemoteAddress());
+  }
+  auto accept_target() -> AccountSession {
+    prepare_handoff(*source_, request_);
+    answer_session(*database_, request_.expected);
+    auto accepted = apply_latest(*database_, request_.expected);
+    answer_session(*database_, accepted);
+    return accepted;
+  }
+  auto awaiting_client(AccountSession record) -> AccountSession {
+    record.phase = AccountSessionPhase::kAwaitingClient;
+    ++record.version;
+    return record;
+  }
+  auto handoff_replies() const -> std::vector<baseapp::PrepareClientHandoffReply> {
+    return DecodeSentMessages<baseapp::PrepareClientHandoffReply>(*source_);
+  }
+  InterfaceTable table_;
+  IntrusivePtr<CapturingChannel> database_;
+  IntrusivePtr<CapturingChannel> source_;
+  IntrusivePtr<CapturingChannel> client_;
+  Proxy* target_{nullptr};
+  SessionKey credential_;
+  baseapp::PrepareClientHandoff request_;
+};
+
+TEST_F(ClientHandoffTest, AcceptanceWaitsForCommitAndDoesNotBind) {
+  prepare_handoff(*source_, request_);
+  EXPECT_TRUE(handoff_replies().empty());
+  EXPECT_TRUE(transfer_target_reserved(target_->EntityId()));
+  EXPECT_FALSE(finalize_proxy(target_->EntityId()));
+  answer_session(*database_, request_.expected);
+  EXPECT_TRUE(handoff_replies().empty());
+  const auto accepted = apply_latest(*database_, request_.expected);
+  EXPECT_EQ(accepted.phase, AccountSessionPhase::kAccepted);
+  answer_session(*database_, accepted);
+  ASSERT_EQ(handoff_replies().size(), 1u);
+  EXPECT_EQ(handoff_replies().front().status, ErrorCode::kNone);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_TRUE(target_->GetSessionKey().IsZero());
+}
+
+TEST_F(ClientHandoffTest, LegacyAcceptMessageCannotOverwriteAnotherProxysSessionKey) {
+  auto* active = prepare_auth_proxy(43);
+  ASSERT_NE(active, nullptr);
+  const auto original = active->GetSessionKey();
+  BinaryWriter payload;
+  payload.Write(active->EntityId());
+  payload.WriteBytes(std::as_bytes(std::span{credential_.bytes}));
+  EXPECT_FALSE(dispatch_internal(*source_, 2002, payload.Data()));
+  EXPECT_TRUE(active->GetSessionKey() == original);
+}
+
+TEST_F(ClientHandoffTest, InvalidProcessAndDefinitionDoNotContactDatabase) {
+  auto invalid = request_;
+  ++invalid.requester_instance;
+  prepare_handoff(*source_, invalid);
+  invalid = request_;
+  invalid.entity_def_digest[0] ^= std::byte{1};
+  prepare_handoff(*source_, invalid);
+  invalid = request_;
+  ++invalid.expected.target.process_instance;
+  prepare_handoff(*source_, invalid);
+  EXPECT_EQ(database_->send_count(), 0u);
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  ASSERT_EQ(handoff_replies().size(), 3u);
+  for (const auto& reply : handoff_replies()) EXPECT_NE(reply.status, ErrorCode::kNone);
+}
+
+TEST_F(ClientHandoffTest, OccupiedAndPreparedTargetsAreRejected) {
+  seed_expired_prepared_login(100, target_->EntityId());
+  prepare_handoff(*source_, request_);
+  ASSERT_EQ(handoff_replies().size(), 1u);
+  EXPECT_EQ(handoff_replies().front().status, ErrorCode::kAlreadyExists);
+  EXPECT_EQ(database_->send_count(), 0u);
+}
+
+TEST_F(ClientHandoffTest, QueueLimitRejectsAnotherTargetWithoutSending) {
+  (void)accept_target();
+  fill_handoff_queue();
+  auto* another = new_proxy();
+  ASSERT_NE(another, nullptr);
+  auto request = request_;
+  request.expected.target.entity_id = another->EntityId();
+  const auto sends = database_->send_count();
+  prepare_handoff(*source_, request);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kRateLimited);
+  EXPECT_EQ(database_->send_count(), sends);
+  EXPECT_EQ(incoming_handoff_count(), 1024u);
+}
+
+TEST_F(ClientHandoffTest, OccupiedTargetCannotBeAccepted) {
+  target_->BindClient(client_->RemoteAddress());
+  prepare_handoff(*source_, request_);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kAlreadyExists);
+  EXPECT_EQ(database_->send_count(), 0u);
+  EXPECT_TRUE(target_->HasClient());
+}
+
+TEST_F(ClientHandoffTest, DuplicateWhilePendingIsBoundedAndConfirmedReplayDoesNotMutate) {
+  prepare_handoff(*source_, request_);
+  prepare_handoff(*source_, request_);
+  EXPECT_EQ(DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).size(), 1u);
+  ASSERT_EQ(handoff_replies().size(), 1u);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kWouldBlock);
+  answer_session(*database_, request_.expected);
+  const auto accepted = apply_latest(*database_, request_.expected);
+  answer_session(*database_, accepted);
+  prepare_handoff(*source_, request_);
+  auto reads = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_);
+  ASSERT_EQ(reads.size(), 3u);
+  EXPECT_FALSE(reads.back().operation.has_value());
+  answer_session(*database_, accepted);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kNone);
+  EXPECT_EQ(incoming_handoff_count(), 1u);
+}
+
+TEST_F(ClientHandoffTest, AcceptanceCommitUnknownKeepsTargetReservedAndUnbound) {
+  prepare_handoff(*source_, request_);
+  answer_session(*database_, request_.expected);
+  const auto accepted = apply_latest(*database_, request_.expected);
+  answer_session(*database_, {}, ErrorCode::kCommitUnknown);
+  ASSERT_EQ(handoff_replies().size(), 1u);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kCommitUnknown);
+  EXPECT_TRUE(transfer_target_reserved(target_->EntityId()));
+  EXPECT_FALSE(target_->HasClient());
+  prepare_handoff(*source_, request_);
+  answer_session(*database_, accepted);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kNone);
+}
+
+TEST_F(ClientHandoffTest, FailedInitialReadDoesNotLeaveAnUnusedReservation) {
+  prepare_handoff(*source_, request_);
+  answer_session(*database_, {}, ErrorCode::kNotFound);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kNotFound);
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(transfer_target_reserved(target_->EntityId()));
+  EXPECT_EQ(session_pending_count(), 0u);
+  EXPECT_FALSE(target_->HasClient());
+}
+
+TEST_F(ClientHandoffTest, ReauthenticationOnlyBindsAfterCompleteCommit) {
+  const auto accepted = accept_target();
+  const auto awaiting = awaiting_client(accepted);
+  authenticate(*client_, credential_);
+  EXPECT_FALSE(target_->HasClient());
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  EXPECT_EQ(active.owner, request_.expected.target);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_TRUE(DecodeSentMessages<baseapp::AuthenticateResult>(*client_).empty());
+  answer_session(*database_, active);
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client_);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_TRUE(replies.front().success);
+  EXPECT_TRUE(target_->HasClient());
+  EXPECT_FALSE(session_frozen(target_->EntityId()));
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(transfer_target_reserved(target_->EntityId()));
+}
+
+TEST_F(ClientHandoffTest, CredentialAndAwaitingPhaseAreBothRequired) {
+  const auto accepted = accept_target();
+  auto wrong = credential_;
+  wrong.bytes[0] ^= 1;
+  const auto sends = database_->send_count();
+  authenticate(*client_, wrong);
+  EXPECT_EQ(database_->send_count(), sends);
+  authenticate(*client_, credential_);
+  answer_session(*database_, accepted);
+  const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_);
+  EXPECT_FALSE(requests.back().operation.has_value());
+  EXPECT_FALSE(target_->HasClient());
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client_);
+  ASSERT_EQ(replies.size(), 2u);
+  EXPECT_FALSE(replies[0].success);
+  EXPECT_FALSE(replies[1].success);
+}
+
+TEST_F(ClientHandoffTest, EmptyCredentialDoesNotInitiateAConfirmation) {
+  credential_ = {};
+  const auto hash = Sha256(std::as_bytes(std::span{credential_.bytes}));
+  ASSERT_TRUE(hash.HasValue());
+  request_.expected.credential_hash = *hash;
+  (void)accept_target();
+  const auto sends = database_->send_count();
+  authenticate(*client_, credential_);
+  EXPECT_EQ(database_->send_count(), sends);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_FALSE(DecodeSentMessages<baseapp::AuthenticateResult>(*client_).back().success);
+}
+
+TEST_F(ClientHandoffTest, WaiterCompletesOnlyAfterBindingAndDuplicateWaitIsIgnored) {
+  const auto awaiting = awaiting_client(accept_target());
+  request_.wait_for_client = true;
+  ++request_.request_id;
+  prepare_handoff(*source_, request_);
+  prepare_handoff(*source_, request_);
+  EXPECT_EQ(handoff_replies().size(), 1u);
+  authenticate(*client_, credential_);
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  EXPECT_EQ(handoff_replies().size(), 1u);
+  answer_session(*database_, active);
+  ASSERT_EQ(handoff_replies().size(), 2u);
+  EXPECT_EQ(handoff_replies().back().request_id, request_.request_id);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kNone);
+  EXPECT_TRUE(target_->HasClient());
+  prepare_handoff(*source_, request_);
+  EXPECT_EQ(handoff_replies().size(), 3u);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kNone);
+  auto forged = request_;
+  forged.expected.owner = {Address("127.0.0.1", 25003), 600, 333};
+  forged.requester_instance = 333;
+  register_base_peer(forged.expected.owner.base_addr, 333);
+  auto other =
+      make_intrusive<CapturingChannel>(dispatcher_, table_, forged.expected.owner.base_addr);
+  prepare_handoff(*other, forged);
+  const auto replies = DecodeSentMessages<baseapp::PrepareClientHandoffReply>(*other);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_NE(replies.back().status, ErrorCode::kNone);
+}
+
+TEST_F(ClientHandoffTest, ExpiredWaiterCannotReportSuccessfulAuthentication) {
+  const auto accepted = accept_target();
+  request_.wait_for_client = true;
+  ++request_.request_id;
+  prepare_handoff(*source_, request_);
+  expire_handoffs();
+  answer_session(*database_, accepted);
+  answer_session(*database_, accepted);
+  const auto aborted = apply_latest(*database_, accepted);
+  answer_session(*database_, aborted);
+  ASSERT_EQ(handoff_replies().size(), 2u);
+  EXPECT_NE(handoff_replies().back().status, ErrorCode::kNone);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+}
+
+TEST_F(ClientHandoffTest, ChangedHandoffCannotGrantControl) {
+  auto awaiting = awaiting_client(accept_target());
+  awaiting.handoff_id[0] ^= std::byte{2};
+  authenticate(*client_, credential_);
+  answer_session(*database_, awaiting);
+  EXPECT_FALSE(DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back().operation);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_FALSE(DecodeSentMessages<baseapp::AuthenticateResult>(*client_).back().success);
+}
+
+TEST_F(ClientHandoffTest, ChangedDatabasePreparationCannotBeAccepted) {
+  prepare_handoff(*source_, request_);
+  auto changed = request_.expected;
+  ++changed.version;
+  changed.credential_hash[0] ^= std::byte{1};
+  answer_session(*database_, changed);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kPermissionDenied);
+  EXPECT_FALSE(DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back().operation);
+  EXPECT_FALSE(target_->HasClient());
+}
+
+TEST_F(ClientHandoffTest, LateAcceptanceCannotReviveDestroyedTarget) {
+  prepare_handoff(*source_, request_);
+  answer_session(*database_, request_.expected);
+  const auto accepted = apply_latest(*database_, request_.expected);
+  target_->MarkForDestroy();
+  answer_session(*database_, accepted);
+  EXPECT_EQ(handoff_replies().back().status, ErrorCode::kCommitUnknown);
+  authenticate(*client_, credential_);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_FALSE(DecodeSentMessages<baseapp::AuthenticateResult>(*client_).back().success);
+}
+
+TEST_F(ClientHandoffTest, CompleteUnknownRetainsOperationForCredentialRetry) {
+  const auto awaiting = awaiting_client(accept_target());
+  authenticate(*client_, credential_);
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  const auto original = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back();
+  answer_session(*database_, {}, ErrorCode::kCommitUnknown);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_TRUE(transfer_target_reserved(target_->EntityId()));
+  authenticate(*client_, credential_);
+  const auto replay = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back();
+  ASSERT_TRUE(replay.operation.has_value());
+  ASSERT_TRUE(original.operation.has_value());
+  EXPECT_EQ(replay.operation->id, original.operation->id);
+  answer_session(*database_, active);
+  EXPECT_TRUE(target_->HasClient());
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+}
+
+TEST_F(ClientHandoffTest, ConcurrentCredentialRequestsDoNotCreateTwoCompletions) {
+  const auto awaiting = awaiting_client(accept_target());
+  authenticate(*client_, credential_);
+  const auto sends = database_->send_count();
+  authenticate(*client_, credential_);
+  EXPECT_EQ(database_->send_count(), sends);
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  answer_session(*database_, active);
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client_);
+  ASSERT_EQ(replies.size(), 2u);
+  EXPECT_FALSE(replies.front().success);
+  EXPECT_TRUE(replies.back().success);
+}
+
+TEST_F(ClientHandoffTest, DisconnectedClientAfterCompleteDoesNotBindAndExpiresSafely) {
+  const auto awaiting = awaiting_client(accept_target());
+  authenticate(*client_, credential_);
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  client_->Condemn();
+  answer_session(*database_, active);
+  EXPECT_FALSE(target_->HasClient());
+  expire_handoffs();
+  answer_session(*database_, active);
+  answer_session(*database_, active);
+  const auto offline = apply_latest(*database_, active);
+  EXPECT_EQ(offline.phase, AccountSessionPhase::kOffline);
+  answer_session(*database_, offline);
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(transfer_target_reserved(target_->EntityId()));
+}
+
+TEST_F(ClientHandoffTest, ExpirationWaitsForAbortConfirmationAndRetainsUnknownState) {
+  const auto accepted = accept_target();
+  expire_handoffs();
+  answer_session(*database_, accepted);
+  answer_session(*database_, accepted);
+  const auto aborted = apply_latest(*database_, accepted);
+  EXPECT_EQ(aborted.owner, request_.expected.owner);
+  EXPECT_EQ(aborted.phase, AccountSessionPhase::kActive);
+  answer_session(*database_, {}, ErrorCode::kCommitUnknown);
+  EXPECT_EQ(incoming_handoff_count(), 1u);
+  EXPECT_TRUE(transfer_target_reserved(target_->EntityId()));
+  expire_handoffs();
+  answer_session(*database_, aborted);
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(target_->HasClient());
+}
+
+TEST_F(ClientHandoffTest, ExpirationCanCleanADestroyedOrCancelledCandidate) {
+  const auto accepted = accept_target();
+  target_->MarkForDestroy();
+  auto released = std::make_shared<std::optional<Result<void>>>();
+  release_session(target_->EntityId(), released);
+  answer_session(*database_, {}, ErrorCode::kReceiverGone);
+  ASSERT_TRUE(released->has_value());
+  EXPECT_FALSE((*released)->HasValue());
+  expire_handoffs();
+  answer_session(*database_, accepted);
+  answer_session(*database_, accepted);
+  const auto aborted = apply_latest(*database_, accepted);
+  answer_session(*database_, aborted);
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(transfer_target_reserved(target_->EntityId()));
+  EXPECT_FALSE(target_->HasClient());
+}
+
+TEST_F(ClientHandoffTest, RevocationDuringAuthenticationPreventsLateBinding) {
+  const auto awaiting = awaiting_client(accept_target());
+  authenticate(*client_, credential_);
+  auto released = std::make_shared<std::optional<Result<void>>>();
+  release_session(target_->EntityId(), released);
+  answer_session(*database_, awaiting);
+  EXPECT_FALSE(released->has_value());
+  const auto aborted = apply_latest(*database_, awaiting);
+  answer_session(*database_, aborted);
+  ASSERT_TRUE(released->has_value());
+  EXPECT_TRUE((*released)->HasValue());
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_FALSE(target_->HasClient());
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(ClientHandoffTest, RevocationResolvesUncertainCompleteBeforeReleasing) {
+  const auto awaiting = awaiting_client(accept_target());
+  authenticate(*client_, credential_);
+  answer_session(*database_, awaiting);
+  const auto active = apply_latest(*database_, awaiting);
+  const auto completion = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back();
+  auto released = std::make_shared<std::optional<Result<void>>>();
+  release_session(target_->EntityId(), released);
+  const auto replay = DecodeSentMessages<dbapp::AccountSessionRequest>(*database_).back();
+  ASSERT_TRUE(replay.operation.has_value());
+  ASSERT_TRUE(completion.operation.has_value());
+  EXPECT_EQ(replay.operation->id, completion.operation->id);
+  answer_session(*database_, active);
+  EXPECT_FALSE(target_->HasClient());
+  answer_session(*database_, active);
+  const auto offline = apply_latest(*database_, active);
+  answer_session(*database_, offline);
+  ASSERT_TRUE(released->has_value());
+  EXPECT_TRUE((*released)->HasValue());
+  EXPECT_EQ(incoming_handoff_count(), 0u);
+  EXPECT_EQ(session_pending_count(), 0u);
+  EXPECT_FALSE(target_->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, HandoffTargetRequiresARegisteredInstanceAndLiveProxy) {
+  ASSERT_TRUE(internal_network_.StartRudpServer(Address("127.0.0.1", 0)));
+  auto* proxy = new_proxy();
+  ASSERT_NE(proxy, nullptr);
+  EXPECT_FALSE(handoff_target(proxy->EntityId()));
+  const auto address = internal_network_.RudpAddress();
+  register_base_peer(address, 111);
+  const auto target = handoff_target(proxy->EntityId());
+  ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(target->base_addr, address);
+  EXPECT_EQ(target->process_instance, 111u);
+  EXPECT_EQ(target->entity_id, proxy->EntityId());
+  EXPECT_FALSE(handoff_target(0));
+  proxy->MarkForDestroy();
+  EXPECT_FALSE(handoff_target(proxy->EntityId()));
+  auto* next = new_proxy();
+  ASSERT_NE(next, nullptr);
+  retire_base_peer(address, 111);
+  EXPECT_FALSE(handoff_target(next->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, BasePeerDeathCannotEraseAReplacementInstance) {
+  const Address address("127.0.0.1", 25002);
+  register_base_peer(address, 222);
+  register_base_peer(address, 333);
+  retire_base_peer(address, 222);
+  EXPECT_EQ(base_peer_instance(address), 333u);
+  retire_base_peer(address, 333);
+  EXPECT_EQ(base_peer_instance(address), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, RemoteHandoffAcceptanceRoundTripRequiresCommitAndReplyProcess) {
+  check_handoff_roundtrip();
+}
+
+TEST_F(BaseAppRollbackTest, RemoteHandoffKeepsSourceBoundUntilTargetAuthentication) {
+  check_outgoing_handoff();
+}
+
+TEST_F(BaseAppRollbackTest, RejectedRemoteHandoffRestoresOnlyConfirmedSourceOwnership) {
+  check_outgoing_handoff(true);
+}
+
+TEST_F(BaseAppRollbackTest, UnknownRemoteHandoffDoesNotGuessAControlOwner) {
+  check_outgoing_handoff(false, true);
+}
+
+TEST_F(BaseAppRollbackTest, UnsupportedClientCannotStartRemoteHandoff) {
+  check_outgoing_handoff(false, false, true);
+}
+
+TEST_F(BaseAppRollbackTest, RemoteSessionRevocationRoundTripGatesNewLoginCheckout) {
+  check_remote_revocation_roundtrip();
+}
+
+TEST_F(BaseAppRollbackTest, SessionRevocationRejectsUnregisteredAndReplacedRequester) {
+  InterfaceTable table;
+  auto peer = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 25002));
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(database.get());
+  register_base_peer(Address("127.0.0.1", 25001), 111);
+  baseapp::RevokeAccountSession request{
+      (uint64_t{1} << 40) + 1, 222, 42, 7, 9, {Address("127.0.0.1", 25001), 100, 111}};
+  revoke_session(*peer, request);
+  register_base_peer(peer->RemoteAddress(), 333);
+  revoke_session(*peer, request);
+  EXPECT_EQ(database->send_count(), 0u);
+  auto replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 2u);
+  for (const auto& reply : replies) EXPECT_EQ(reply.status, ErrorCode::kPermissionDenied);
+  EXPECT_EQ(revocation_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, SessionRevocationChecksVersionAndWaitsForDatabaseCommit) {
+  InterfaceTable table;
+  auto peer = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 25002));
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(database.get());
+  register_base_peer(peer->RemoteAddress(), 222);
+  register_base_peer(Address("127.0.0.1", 25001), 111);
+  baseapp::RevokeAccountSession request{
+      (uint64_t{1} << 40) + 1, 222, 42, 7, 9, {Address("127.0.0.1", 25001), 100, 111}};
+  AccountSession record;
+  record.version = 10;
+  record.phase = AccountSessionPhase::kActive;
+  record.owner = request.owner;
+  revoke_session(*peer, request);
+  EXPECT_EQ(peer->send_count(), 0u);
+  answer_session(*database, record);
+  auto replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kPermissionDenied);
+  request.request_id++;
+  request.version = record.version;
+  revoke_session(*peer, request);
+  answer_session(*database, record);
+  EXPECT_EQ(DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer).size(), 1u);
+  auto writes = DecodeSentMessages<dbapp::AccountSessionRequest>(*database);
+  ASSERT_TRUE(writes.back().operation.has_value());
+  EXPECT_EQ(writes.back().operation->expected_version, 10u);
+  EXPECT_EQ(writes.back().operation->action, AccountSessionAction::kRelease);
+  answer_session(*database, {}, ErrorCode::kCommitUnknown);
+  replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 2u);
+  EXPECT_EQ(replies.back().status, ErrorCode::kCommitUnknown);
+  EXPECT_EQ(replies.back().version, 10u);
+  EXPECT_EQ(revocation_count(), 0u);
+  request.request_id++;
+  revoke_session(*peer, request);
+  AccountSession offline;
+  offline.version = 11;
+  answer_session(*database, offline);
+  replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 3u);
+  EXPECT_EQ(replies.back().status, ErrorCode::kNone);
+}
+
+TEST_F(BaseAppRollbackTest, SessionRevocationFreezesAndReleasesTheBoundOwner) {
+  InterfaceTable table;
+  auto peer = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 25002));
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  register_base_peer(peer->RemoteAddress(), 222);
+  register_base_peer(Address("127.0.0.1", 25001), 111);
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {});
+  const auto grant = active_session(*proxy);
+  answer_session(*database, grant);
+  ASSERT_TRUE(proxy->HasClient());
+  baseapp::RevokeAccountSession request{(uint64_t{1} << 40) + 1, 222,        42, 7,
+                                        grant.version,           grant.owner};
+  revoke_session(*peer, request);
+  answer_session(*database, grant);
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  EXPECT_TRUE(proxy->HasClient());
+  answer_session(*database, grant);
+  EXPECT_EQ(peer->send_count(), 0u);
+  AccountSession offline;
+  offline.version = 2;
+  answer_session(*database, offline);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_TRUE(proxy->GetSessionKey().IsZero());
+  auto replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kNone);
+  EXPECT_EQ(revocation_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, SessionRevocationRejectsOverloadWithoutDatabaseWork) {
+  InterfaceTable table;
+  auto peer = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 25002));
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(database.get());
+  register_base_peer(peer->RemoteAddress(), 222);
+  register_base_peer(Address("127.0.0.1", 25001), 111);
+  baseapp::RevokeAccountSession request{7, 222, 42, 7, 9, {Address("127.0.0.1", 25001), 100, 111}};
+  set_revocations_full(true);
+  revoke_session(*peer, request);
+  set_revocations_full(false);
+  EXPECT_EQ(database->send_count(), 0u);
+  auto replies = DecodeSentMessages<baseapp::RevokeAccountSessionReply>(*peer);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kRateLimited);
+}
+
+TEST_F(BaseAppRollbackTest, LoginWaitsForSessionCheckBeforeCheckout) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto login = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 28001));
+  set_legacy_dbapp_channel(database.get());
+  prepare_login(*login);
+  EXPECT_EQ(login_session_check_count(), 1u);
+  EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+  answer_session(*database, {});
+  EXPECT_EQ(login_session_check_count(), 0u);
+  EXPECT_EQ(DecodeSentMessages<dbapp::CheckoutEntity>(*database).size(), 1u);
+}
+
+TEST_F(BaseAppRollbackTest, LoginCancellationChecksItsSourceAndRemovesSessionWait) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto login = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 28001));
+  auto wrong = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 28002));
+  set_legacy_dbapp_channel(database.get());
+  prepare_login(*login);
+  cancel_login(*wrong);
+  EXPECT_EQ(login_session_check_count(), 1u);
+  cancel_login(*login);
+  EXPECT_EQ(login_session_check_count(), 0u);
+  EXPECT_EQ(session_pending_count(), 0u);
+  answer_session(*database, {});
+  EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+}
+
+TEST_F(BaseAppRollbackTest, LoginDoesNotGuessThatAnUnavailableOwnerIsOffline) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto login = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 28001));
+  set_legacy_dbapp_channel(database.get());
+  prepare_login(*login);
+  AccountSession record;
+  record.version = 9;
+  record.phase = AccountSessionPhase::kActive;
+  record.owner = {Address("127.0.0.1", 25002), 100, 222};
+  answer_session(*database, record);
+  EXPECT_EQ(login_session_check_count(), 0u);
+  EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, AuthenticationWaitsForConfirmedSessionGrant) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_EQ(client->send_count(), 0u);
+  answer_session(*database, AccountSession{});
+  auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*database);
+  ASSERT_EQ(requests.size(), 2u);
+  ASSERT_TRUE(requests.back().operation.has_value());
+  EXPECT_EQ(requests.back().operation->action, AccountSessionAction::kClaim);
+  EXPECT_EQ(requests.back().operation->claim_checkout, proxy->CheckoutOwner());
+  EXPECT_FALSE(proxy->HasClient());
+  const auto grant = active_session(*proxy);
+  answer_session(*database, grant);
+  EXPECT_TRUE(proxy->HasClient());
+  EXPECT_FALSE(session_frozen(proxy->EntityId()));
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_TRUE(replies[0].success);
+}
+
+TEST_F(BaseAppRollbackTest, AuthenticationCommitUnknownReusesTheOriginalOperation) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, AccountSession{});
+  auto issued = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(issued.operation.has_value());
+  answer_session(*database, AccountSession{}, ErrorCode::kCommitUnknown);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  authenticate(*client, proxy->GetSessionKey());
+  const auto repeated = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(repeated.operation.has_value());
+  EXPECT_EQ(repeated.operation->id, issued.operation->id);
+  EXPECT_NE(repeated.request_id, issued.request_id);
+  answer_session(*database, active_session(*proxy));
+  EXPECT_TRUE(proxy->HasClient());
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, HandoffRollbackCannotReactivateADestroyingSource) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {});
+  const auto active = active_session(*proxy);
+  answer_session(*database, active);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  recover_remote_session(proxy->EntityId(), result);
+  proxy->MarkForDestroy();
+  answer_session(*database, active);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE((*result)->HasValue());
+  EXPECT_EQ((*result)->Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, OverloadedReplayDoesNotForgetAnUnconfirmedOperation) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {});
+  const auto original = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(original.operation.has_value());
+  answer_session(*database, {}, ErrorCode::kCommitUnknown);
+  for (const auto status : {ErrorCode::kRateLimited, ErrorCode::kWouldBlock}) {
+    authenticate(*client, proxy->GetSessionKey());
+    auto retry = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+    ASSERT_TRUE(retry.operation.has_value());
+    EXPECT_EQ(retry.operation->id, original.operation->id);
+    answer_session(*database, {}, status);
+    EXPECT_FALSE(proxy->HasClient());
+    EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  }
+  authenticate(*client, proxy->GetSessionKey());
+  const auto retry = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(retry.operation.has_value());
+  EXPECT_EQ(retry.operation->id, original.operation->id);
+  answer_session(*database, active_session(*proxy));
+  EXPECT_TRUE(proxy->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, SupersededReplayRequiresAMonotonicDatabaseConfirmation) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {});
+  const auto original = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  answer_session(*database, {}, ErrorCode::kCommitUnknown);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {}, ErrorCode::kPermissionDenied);
+  EXPECT_FALSE(DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back().operation);
+  answer_session(*database, {});
+  authenticate(*client, proxy->GetSessionKey());
+  const auto retry = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(retry.operation.has_value());
+  ASSERT_TRUE(original.operation.has_value());
+  EXPECT_EQ(retry.operation->id, original.operation->id);
+  answer_session(*database, {}, ErrorCode::kPermissionDenied);
+  AccountSession advanced;
+  advanced.version = 2;
+  answer_session(*database, advanced);
+  EXPECT_FALSE(proxy->HasClient());
+  authenticate(*client, proxy->GetSessionKey());
+  EXPECT_FALSE(DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back().operation);
+  answer_session(*database, advanced);
+  const auto fresh = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(fresh.operation.has_value());
+  EXPECT_NE(fresh.operation->id, original.operation->id);
+  EXPECT_EQ(fresh.operation->expected_version, 2u);
+  answer_session(*database, active_session(*proxy, 3));
+  EXPECT_TRUE(proxy->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, OverloadedRevocationCannotDropAnUnconfirmedClaim) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, {});
+  answer_session(*database, {}, ErrorCode::kCommitUnknown);
+  auto released = std::make_shared<std::optional<Result<void>>>();
+  release_session(proxy->EntityId(), released);
+  answer_session(*database, {}, ErrorCode::kRateLimited);
+  ASSERT_TRUE(released->has_value());
+  ASSERT_FALSE((*released)->HasValue());
+  EXPECT_EQ((*released)->Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_FALSE(proxy->GetSessionKey().IsZero());
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  released->reset();
+  release_session(proxy->EntityId(), released);
+  const auto active = active_session(*proxy);
+  answer_session(*database, active);
+  answer_session(*database, active);
+  const auto offline = apply_latest(*database, active);
+  answer_session(*database, offline);
+  ASSERT_TRUE(released->has_value());
+  EXPECT_TRUE((*released)->HasValue());
+  EXPECT_TRUE(proxy->GetSessionKey().IsZero());
+}
+
+TEST_F(BaseAppRollbackTest, AuthenticationRejectsForeignOwnershipAndUnpreparedKeys) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  auto foreign = active_session(*proxy);
+  foreign.owner.process_instance = 222;
+  answer_session(*database, foreign);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_EQ(DecodeSentMessages<dbapp::AccountSessionRequest>(*database).size(), 1u);
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_FALSE(replies[0].success);
+  auto* unprepared = new_proxy();
+  ASSERT_NE(unprepared, nullptr);
+  auto key = SessionKey::Generate();
+  ASSERT_TRUE(key.HasValue());
+  ASSERT_TRUE(app_.GetEntityManager().AssignSessionKey(unprepared->EntityId(), *key));
+  authenticate(*client, *key);
+  EXPECT_FALSE(unprepared->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, CancelAuthenticationResolvesGrantBeforeReleasingCheckout) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey());
+  answer_session(*database, AccountSession{});
+  auto issued = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(rollback_auth_proxy(*proxy));
+  EXPECT_FALSE(proxy->IsPendingDestroy());
+  EXPECT_TRUE(DecodeSentMessages<dbapp::CheckinEntity>(*database).empty());
+  const auto repeated = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(repeated.operation.has_value());
+  EXPECT_EQ(repeated.operation->id, issued.operation->id);
+  auto grant = active_session(*proxy);
+  answer_session(*database, grant);
+  answer_session(*database, grant);
+  auto releasing = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(releasing.operation.has_value());
+  EXPECT_EQ(releasing.operation->action, AccountSessionAction::kRelease);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_FALSE(proxy->IsPendingDestroy());
+  AccountSession offline;
+  offline.version = 2;
+  answer_session(*database, offline);
+  EXPECT_TRUE(proxy->IsPendingDestroy());
+  EXPECT_FALSE(DecodeSentMessages<dbapp::CheckinEntity>(*database).empty());
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, LocalClientMoveWaitsForCommitAndReservesItsTarget) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  retain_client_channel(client->RemoteAddress());
+  auto* source = prepare_auth_proxy();
+  auto* target = new_proxy();
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  authenticate(*client, source->GetSessionKey());
+  answer_session(*database, AccountSession{});
+  auto grant = active_session(*source);
+  answer_session(*database, grant);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), result);
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+  EXPECT_FALSE(result->has_value());
+  EXPECT_TRUE(session_frozen(source->EntityId()));
+  auto again = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), again);
+  ASSERT_TRUE(again->has_value());
+  EXPECT_FALSE(again->value().HasValue());
+  const auto issued = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(issued.operation.has_value());
+  EXPECT_EQ(issued.operation->action, AccountSessionAction::kMoveLocal);
+  grant.version = 2;
+  grant.owner.entity_id = target->EntityId();
+  answer_session(*database, grant);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_TRUE(result->value().HasValue());
+  EXPECT_FALSE(source->HasClient());
+  EXPECT_TRUE(target->HasClient());
+  EXPECT_FALSE(session_frozen(target->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, LocalClientMoveCommitUnknownRetainsTheSourceBinding) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* source = prepare_auth_proxy();
+  auto* target = new_proxy();
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  authenticate(*client, source->GetSessionKey());
+  answer_session(*database, AccountSession{});
+  auto grant = active_session(*source);
+  answer_session(*database, grant);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), result);
+  auto issued = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  answer_session(*database, {}, ErrorCode::kCommitUnknown);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+  EXPECT_TRUE(session_frozen(source->EntityId()));
+  auto released = std::make_shared<std::optional<Result<void>>>();
+  release_session(source->EntityId(), released);
+  const auto repeated = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(repeated.operation.has_value());
+  EXPECT_EQ(repeated.operation->id, issued.operation->id);
+  grant.version = 2;
+  grant.owner.entity_id = target->EntityId();
+  answer_session(*database, grant);
+  answer_session(*database, grant);
+  auto releasing = DecodeSentMessages<dbapp::AccountSessionRequest>(*database).back();
+  ASSERT_TRUE(releasing.operation.has_value());
+  EXPECT_EQ(releasing.operation->actor.entity_id, target->EntityId());
+  AccountSession offline;
+  offline.version = 3;
+  answer_session(*database, offline);
+  ASSERT_TRUE(released->has_value());
+  EXPECT_TRUE(released->value().HasValue());
+  EXPECT_FALSE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, FailedClientMoveUnfreezesOnlyAfterConfirmingOriginalOwnership) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* source = prepare_auth_proxy();
+  auto* target = new_proxy();
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  authenticate(*client, source->GetSessionKey());
+  answer_session(*database, {});
+  const auto grant = active_session(*source);
+  answer_session(*database, grant);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), result);
+  answer_session(*database, {}, ErrorCode::kPermissionDenied);
+  EXPECT_TRUE(session_frozen(source->EntityId()));
+  EXPECT_FALSE(result->has_value());
+  answer_session(*database, grant);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_FALSE(result->value().HasValue());
+  EXPECT_FALSE(session_frozen(source->EntityId()));
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, PendingClientMovePreventsDestinationTeardown) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* source = prepare_auth_proxy();
+  auto* target = new_proxy();
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  authenticate(*client, source->GetSessionKey());
+  answer_session(*database, {});
+  auto grant = active_session(*source);
+  answer_session(*database, grant);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), result);
+  EXPECT_TRUE(transfer_target_reserved(target->EntityId()));
+  EXPECT_FALSE(finalize_proxy(target->EntityId()));
+  EXPECT_FALSE(target->IsPendingDestroy());
+  target->MarkForDestroy();
+  grant.version = 2;
+  grant.owner.entity_id = target->EntityId();
+  answer_session(*database, grant);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_TRUE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+  EXPECT_TRUE(session_frozen(source->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, MissingClientChannelAfterMoveCannotReportSuccess) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* source = prepare_auth_proxy();
+  auto* target = new_proxy();
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  authenticate(*client, source->GetSessionKey());
+  answer_session(*database, {});
+  auto grant = active_session(*source);
+  answer_session(*database, grant);
+  auto result = std::make_shared<std::optional<Result<void>>>();
+  move_session(source->EntityId(), target->EntityId(), result);
+  grant.version = 2;
+  grant.owner.entity_id = target->EntityId();
+  answer_session(*database, grant);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_FALSE(source->HasClient());
+  EXPECT_FALSE(target->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, AccountSessionQueryMatchesChannelProcessAndRequest) {
+  InterfaceTable table;
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto wrong = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24003));
+  set_legacy_dbapp_channel(channel.get());
+  auto result = std::make_shared<std::optional<Result<AccountSession>>>();
+  query_session(result);
+  const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*channel);
+  ASSERT_EQ(requests.size(), 1u);
+  EXPECT_EQ(requests[0].account_dbid, 42);
+  EXPECT_EQ(requests[0].process_instance, 111u);
+  EXPECT_FALSE(result->has_value());
+  dbapp::AccountSessionReply reply;
+  reply.request_id = requests[0].request_id;
+  reply.requester_instance = 222;
+  reply.account_dbid = 42;
+  reply.account_type_id = 7;
+  session_reply(channel.get(), reply);
+  reply.requester_instance = 111;
+  session_reply(wrong.get(), reply);
+  session_reply(nullptr, reply);
+  EXPECT_FALSE(result->has_value());
+  EXPECT_EQ(session_pending_count(), 1u);
+  reply.session.version = 7;
+  session_reply(channel.get(), reply);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_TRUE(result->value().HasValue());
+  EXPECT_EQ(result->value()->version, 7u);
+  EXPECT_EQ(session_pending_count(), 0u);
+
+  auto next = std::make_shared<std::optional<Result<AccountSession>>>();
+  query_session(next);
+  session_reply(channel.get(), reply);
+  EXPECT_FALSE(next->has_value());
+  const auto updated = DecodeSentMessages<dbapp::AccountSessionRequest>(*channel);
+  ASSERT_EQ(updated.size(), 2u);
+  EXPECT_NE(updated[1].request_id, reply.request_id);
+  reply.request_id = updated[1].request_id;
+  reply.status = ErrorCode::kIoError;
+  reply.error = "injected read failure";
+  session_reply(channel.get(), reply);
+  ASSERT_TRUE(next->has_value());
+  ASSERT_FALSE(next->value().HasValue());
+  EXPECT_EQ(next->value().Error().Code(), ErrorCode::kIoError);
+}
+
+TEST_F(BaseAppRollbackTest, AccountSessionMutationCancellationCannotClaimRollback) {
+  InterfaceTable table;
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(channel.get());
+  AccountSessionOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.account_dbid = 42;
+  operation.account_type_id = 7;
+  operation.action = AccountSessionAction::kRelease;
+  operation.actor = {Address("127.0.0.1", 25001), 9, 111};
+  auto result = std::make_shared<std::optional<Result<AccountSession>>>();
+  CancellationSource cancel;
+  query_session(result, operation, cancel.Token());
+  EXPECT_EQ(session_pending_count(), 1u);
+  cancel.RequestCancellation();
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, AccountSessionRejectsMismatchedReplyMetadata) {
+  InterfaceTable table;
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(channel.get());
+  auto result = std::make_shared<std::optional<Result<AccountSession>>>();
+  query_session(result);
+  const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*channel);
+  ASSERT_EQ(requests.size(), 1u);
+  dbapp::AccountSessionReply reply;
+  reply.request_id = requests[0].request_id;
+  reply.requester_instance = 111;
+  reply.account_dbid = 43;
+  reply.account_type_id = 7;
+  session_reply(channel.get(), reply);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kInvalidArgument);
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, AccountSessionDisconnectDoesNotLeaveAWaitOrInventAnOfflineSession) {
+  InterfaceTable table;
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(channel.get());
+  auto result = std::make_shared<std::optional<Result<AccountSession>>>();
+  query_session(result);
+  EXPECT_EQ(session_pending_count(), 1u);
+  disconnect_session_channel(channel.get());
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kReceiverGone);
+  EXPECT_EQ(session_pending_count(), 0u);
+  auto request = DecodeSentMessages<dbapp::AccountSessionRequest>(*channel).front();
+  dbapp::AccountSessionReply late;
+  late.request_id = request.request_id;
+  late.requester_instance = request.process_instance;
+  late.account_dbid = request.account_dbid;
+  late.account_type_id = request.account_type_id;
+  session_reply(channel.get(), late);
+  EXPECT_FALSE(result->value().HasValue());
+}
+
+TEST_F(BaseAppRollbackTest, AccountSessionMissingRouteAndPreCancelledCallsDoNotSend) {
+  auto result = std::make_shared<std::optional<Result<AccountSession>>>();
+  query_session(result);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kReceiverGone);
+  InterfaceTable table;
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(channel.get());
+  CancellationSource cancel;
+  cancel.RequestCancellation();
+  result->reset();
+  query_session(result, {}, cancel.Token());
+  ASSERT_TRUE(result->has_value());
+  ASSERT_FALSE(result->value().HasValue());
+  EXPECT_EQ(result->value().Error().Code(), ErrorCode::kCancelled);
+  EXPECT_EQ(channel->send_count(), 0u);
+  EXPECT_EQ(session_pending_count(), 0u);
+}
 
 TEST_F(BaseAppRollbackTest, PreparedLoginTimeoutRollsBackPreparedState) {
   register_watchers();
@@ -1373,6 +3093,22 @@ class FakeDatabase final : public IDatabase {
   Result<void> Startup(const DatabaseConfig&, const EntityDefRegistry&) override { return {}; }
   void Shutdown() override {}
 
+  void ReadAccountSession(DatabaseID, uint16_t,
+                          std::function<void(Result<AccountSession>)> callback) override {
+    ++session_reads;
+    session_callback = std::move(callback);
+  }
+  void UpdateAccountSession(const AccountSessionOperation& operation,
+                            std::function<void(Result<AccountSession>)> callback) override {
+    ++session_updates;
+    session_operation = operation;
+    session_callback = std::move(callback);
+  }
+  int session_reads{0};
+  int session_updates{0};
+  AccountSessionOperation session_operation;
+  std::function<void(Result<AccountSession>)> session_callback;
+
   void PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags, std::span<const std::byte>,
                  const std::string& identifier, std::function<void(PutResult)> callback) override {
     ++put_entity_calls;
@@ -1616,6 +3352,18 @@ class DBAppRollbackTest : public ::testing::Test {
 
   auto db() -> FakeDatabase& { return *static_cast<FakeDatabase*>(app_.database_.get()); }
 
+  void trust_session_peer(const Address& address, uint64_t instance) {
+    app_.baseapp_instances_[address] = instance;
+    app_.account_type_id_ = 7;
+  }
+  void account_session(Channel& channel, const dbapp::AccountSessionRequest& request) {
+    app_.OnAccountSession(channel.RemoteAddress(), &channel, request);
+  }
+  void set_session_queue_full(bool full) {
+    app_.account_session_requests_ = full ? app_.kMaxAccountSessionRequests : 0;
+  }
+  auto session_queue_size() const -> std::size_t { return app_.account_session_requests_; }
+
   void register_watchers() { app_.RegisterWatchers(); }
   void checkout_from(const Address& src, Channel* channel, const dbapp::CheckoutEntity& request) {
     app_.OnCheckoutEntity(src, channel, request);
@@ -1758,6 +3506,173 @@ class DBAppRollbackTest : public ::testing::Test {
   NetworkInterface network_;
   DBApp app_;
 };
+
+TEST_F(DBAppRollbackTest, AccountSessionRejectsUnregisteredAndReplacedProcess) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  dbapp::AccountSessionRequest request;
+  request.request_id = (uint64_t{1} << 40) + 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  account_session(*channel, request);
+  trust_session_peer(source, 222);
+  account_session(*channel, request);
+
+  EXPECT_EQ(db().session_reads, 0);
+  const auto replies = DecodeSentMessages<dbapp::AccountSessionReply>(*channel);
+  ASSERT_EQ(replies.size(), 2u);
+  EXPECT_EQ(replies[0].request_id, request.request_id);
+  EXPECT_EQ(replies[0].requester_instance, request.process_instance);
+  for (const auto& reply : replies) EXPECT_EQ(reply.status, ErrorCode::kPermissionDenied);
+}
+
+TEST_F(DBAppRollbackTest, AccountSessionRepliesOnlyAfterBackendCompletion) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  trust_session_peer(source, 111);
+  dbapp::AccountSessionRequest request;
+  request.request_id = (uint64_t{1} << 40) + 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  account_session(*channel, request);
+  EXPECT_EQ(db().session_reads, 1);
+  EXPECT_EQ(channel->send_count(), 0u);
+  EXPECT_EQ(session_queue_size(), 1u);
+  ASSERT_TRUE(db().session_callback);
+  auto complete = std::move(db().session_callback);
+  complete(Error{ErrorCode::kCommitUnknown, "injected commit uncertainty"});
+
+  EXPECT_EQ(session_queue_size(), 0u);
+  const auto replies = DecodeSentMessages<dbapp::AccountSessionReply>(*channel);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kCommitUnknown);
+  EXPECT_EQ(replies[0].request_id, request.request_id);
+}
+
+TEST_F(DBAppRollbackTest, AccountSessionRejectsWrongAccountTypeAndShard) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  trust_session_peer(source, 111);
+  dbapp::AccountSessionRequest request;
+  request.request_id = 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 8;
+  account_session(*channel, request);
+  request.account_type_id = 7;
+  dbappmgr::RegisterDbAppAck ack;
+  ack.success = true;
+  ack.dbapp_id = 7;
+  ack.shard_table_version = 3;
+  ack.entries.push_back({1, 100, 8, Address("127.0.0.1", 24002), false});
+  handle_register_dbapp_ack(ack);
+  request.shard_table_version = 2;
+  account_session(*channel, request);
+  request.shard_table_version = 3;
+  account_session(*channel, request);
+
+  EXPECT_EQ(db().session_reads, 0);
+  EXPECT_EQ(session_queue_size(), 0u);
+  const auto replies = DecodeSentMessages<dbapp::AccountSessionReply>(*channel);
+  ASSERT_EQ(replies.size(), 3u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kInvalidArgument);
+  EXPECT_EQ(replies[1].error, dbapp::kInvalidShardTableError);
+  EXPECT_EQ(replies[2].status, ErrorCode::kPermissionDenied);
+}
+
+TEST_F(DBAppRollbackTest, AccountSessionDisconnectWhileWaitingReleasesPendingSlot) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  trust_session_peer(source, 111);
+  dbapp::AccountSessionRequest request;
+  request.request_id = 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  account_session(*channel, request);
+  ASSERT_EQ(session_queue_size(), 1u);
+  ASSERT_TRUE(db().session_callback);
+  channel->Condemn();
+  auto complete = std::move(db().session_callback);
+  complete(AccountSession{});
+  EXPECT_EQ(session_queue_size(), 0u);
+  EXPECT_EQ(channel->send_count(), 0u);
+}
+
+TEST_F(DBAppRollbackTest, AccountSessionRejectsActorMismatchAndOverload) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  trust_session_peer(source, 111);
+  dbapp::AccountSessionRequest request;
+  request.request_id = 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  AccountSessionOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.account_dbid = 42;
+  operation.account_type_id = 7;
+  operation.action = AccountSessionAction::kRelease;
+  operation.expected_version = 3;
+  operation.actor = {Address("127.0.0.1", 30002), 9, 111};
+  request.operation = operation;
+  account_session(*channel, request);
+  request.operation->actor.base_addr = source;
+  request.operation->actor.process_instance = 222;
+  account_session(*channel, request);
+  request.operation->actor.process_instance = 111;
+  set_session_queue_full(true);
+  account_session(*channel, request);
+  set_session_queue_full(false);
+
+  EXPECT_EQ(db().session_updates, 0);
+  const auto replies = DecodeSentMessages<dbapp::AccountSessionReply>(*channel);
+  ASSERT_EQ(replies.size(), 3u);
+  EXPECT_EQ(replies[0].status, ErrorCode::kPermissionDenied);
+  EXPECT_EQ(replies[1].status, ErrorCode::kPermissionDenied);
+  EXPECT_EQ(replies[2].status, ErrorCode::kRateLimited);
+}
+
+TEST_F(DBAppRollbackTest, AccountSessionNormalizesActorAndChecksTargetInstance) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 30001);
+  const Address target("127.0.0.1", 30002);
+  auto channel = make_intrusive<CapturingChannel>(dispatcher_, table, source);
+  trust_session_peer(source, 111);
+  dbapp::AccountSessionRequest request;
+  request.request_id = 1;
+  request.process_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  AccountSessionOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.account_dbid = 42;
+  operation.account_type_id = 7;
+  operation.action = AccountSessionAction::kPrepare;
+  operation.expected_version = 3;
+  operation.actor = {Address(0, source.Port()), 9, 111};
+  operation.target = {target, 10, 222};
+  operation.handoff_id = operation.id;
+  operation.credential_hash[0] = std::byte{1};
+  request.operation = operation;
+  account_session(*channel, request);
+  EXPECT_EQ(db().session_updates, 0);
+  trust_session_peer(target, 222);
+  account_session(*channel, request);
+  EXPECT_EQ(db().session_updates, 1);
+  EXPECT_EQ(db().session_operation.actor.base_addr, source);
+  ASSERT_TRUE(db().session_callback);
+  auto complete = std::move(db().session_callback);
+  complete(Error{ErrorCode::kIoError, "injected database failure"});
+  EXPECT_EQ(session_queue_size(), 0u);
+}
 
 TEST_F(DBAppRollbackTest, SharedWriteRejectsOwnerFromDifferentChannel) {
   db().shared = true;

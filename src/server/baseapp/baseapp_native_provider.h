@@ -74,7 +74,11 @@ class BaseAppNativeProvider : public BaseNativeProvider {
 
   void WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len) override;
 
-  void GiveClientTo(uint32_t src_entity_id, uint32_t dest_entity_id) override;
+  auto TransferClient(uint32_t src_entity_id, uint32_t dest_entity_id, uint32_t base_ip,
+                      uint16_t base_port, uint64_t base_instance, uint64_t request_id)
+      -> RpcSendResult override;
+  auto GetClientHandoffTarget(uint32_t entity_id, uint32_t& base_ip, uint16_t& base_port,
+                              uint64_t& base_instance) -> bool override;
 
   void SetSpaceMasterType(uint32_t space_id, const char* name, int32_t len) override;
 

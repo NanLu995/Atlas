@@ -253,7 +253,13 @@ before any cluster process starts. The `atlas_rpc_fixture_base_dll_deploy` and
 `atlas_rpc_fixture_client_dll_deploy` CMake targets build test-only generated RPC peers.
 `--cell-assembly <script.dll>` adds one CellAppMgr and one CellApp; the matching
 `atlas_rpc_fixture_cell_dll_deploy` target builds the Cell peer. Missing assemblies fail
-before process startup. Run manifests record whether the topology includes a CellApp.
+before process startup. `--baseapps 2` starts a second BaseApp for handoff verification;
+run manifests and READY output record the actual BaseApp count and endpoints.
+The test launcher's stdin accepts `kill-baseapp <internal-port>` for crash injection and confirms
+termination with `KILLED`. It only terminates its own live BaseApp children.
+`restart-baseapp <internal-port>` restarts a stopped owned BaseApp with its original arguments,
+confirms `RESTARTED`, and retains earlier logs under the run directory. Confirmation means
+process creation; tests separately wait for registration and check that old sessions cannot bind.
 
 For the standalone generated-mailbox test, set `ATLAS_BIN_DIR` to the absolute isolated
 binary directory and use an empty test database through `ATLAS_DB_MYSQL_*`. The existing
@@ -382,6 +388,36 @@ only after persistence succeeds. Invalid creators and exhausted lease versions f
 without creating an entity. Plugins without a durable operation implementation return
 `write_operation_not_supported` or `checkout_operation_not_supported`; unsupported checkout
 resolution returns `checkout_resolution_not_supported`.
+MySQL and SQLite also persist account session ownership independently of entity checkout.
+Versioned session operations and their receipts commit together; changed operation payloads,
+retired processes and superseded ownership cannot reuse a previous grant. A lost commit reply
+returns `CommitUnknown`; corrupt records fail instead of becoming offline sessions. An account
+with an active or pending session cannot be deleted. Released session versions survive entity
+deletion. DBApp validates the registered BaseApp instance, configured account type and shard,
+and limits outstanding session database requests to 1024. The database API supports local moves
+and prepare/accept/client-confirmation transitions. Login confirms a session grant before binding;
+relogin and logoff confirm its release before reusing or destroying its entity. Cross-BaseApp
+handoff changes client control ownership while retaining the account entity's storage and checkout.
+The internal handoff receiver validates registered source/target instances, entity definitions,
+and the database preparation record before accepting an unbound proxy. A hashed credential
+only binds the client after the database confirms the target as active owner. Incoming handoffs
+are limited to 1024; after 20 seconds without completion the receiver confirms abort or release
+before freeing its reservation. Database failures retain the reservation and retry cleanup at
+20-second intervals. Rejected replays of an unconfirmed operation retain its stable operation ID;
+an ownership conflict needs a newer database version before that operation can be discarded.
+Before preparing login, BaseApp reads the account session and asks its recorded owner to revoke
+it when active. Revocation checks the registered requester and owner process instances, account
+and ownership version; success is returned after database confirmation. An unavailable owner,
+changed version or uncertain commit rejects this login instead of assuming the session is offline.
+Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
+login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
+Database plugins must export `AtlasCreateDatabaseV2`; rebuild both plugins and the server.
+The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
+Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
+tracks peer process instances even for death-only subscriptions: a new instance at the same
+address gets a fresh internal RUDP channel, and late deaths of the old instance are ignored.
+BaseApp session queries match the DBApp channel, requesting process, account and operation. Cancelling
+an already issued mutation stops waiting and reports `CommitUnknown`; it does not undo a grant.
 Account auto-creation uses the unique entity type and account name as its identity.
 An identifier conflict or uncertain commit triggers a fresh credential lookup, without
 another create attempt. Only a confirmed account with matching nonempty credentials can
@@ -551,7 +587,7 @@ public partial class Avatar : ClientEntity
 Containers (`list[T]`, `dict[K,V]`, `list[list[int32]]`, …) and user `<struct>` types replicate field- or op-level deltas through the same setter path; see `entity_defs/StressAvatar.def` and `samples/stress/` for the full coverage matrix.
 
 Entity RPC request and reply headers use 64-bit request IDs. Generated IDs are not reused
-within the managed runtime; exhaustion rejects new calls. Native ABI version 7 requires
+within the server process; exhaustion rejects new calls. Native ABI version 10 requires
 rebuilding the runtime, server and generated callers together; old RPC headers are unsupported.
 Pending RPC registrations reject duplicate keys without replacing the original waiter.
 Replies must arrive on the registered channel; duplicate, late and wrong-channel replies
@@ -602,6 +638,85 @@ in addition to an explicit cancellation token. Entity destruction and script rel
 those waits even when the caller omits `ct`; cleanup detaches both token registrations.
 Reply-style dispatch reports synchronous script exceptions and asynchronous reply
 serialization failures as `RemoteException`, consuming the native reply handle.
+
+## Entity migration boundaries
+
+Await `GiveClientToAsync(destinationId)` for local client handoff. It confirms the database
+ownership change before moving the binding and returns `RpcReply<bool>`. An uncertain commit
+returns `OutcomeUnknown`; the source retains its binding with input frozen until revocation
+confirms the recorded operation's result. Cancelling the script wait does not undo the transfer.
+Local client handoff rejects a destroying entity, an occupied destination, or a destination
+with a prepared session. Rejection preserves both bindings. Clearing a session also revokes
+its retired keys; destroying entities cannot authenticate. `CurrentCell` only changes routing
+and drains queued calls for a registered source channel and a non-stale, consistent epoch.
+Space-host replies must match the teleport's entity, destination space and captured entity epoch.
+An entity can have only one pending teleport lookup; exhausted migration epochs or lookup IDs
+reject new requests. Lookup IDs are not reused within a process.
+
+Cell migration acknowledgements include the attempted epoch and must match the destination
+channel. Timeout or channel loss leaves the source as a passive Ghost with its rollback
+snapshot; only a matching explicit rejection restores the source Real. A late matching success
+can still finish the transfer. There is no automatic takeover when the result is unknown.
+Ghost deletion, position, delta, snapshot and next-Real hints require the current Real address
+and bound channel; messages from a previous owner or replaced channel are ignored.
+Ghost deletion, position, delta and snapshot messages also match the current entity epoch,
+so returning to the same host does not make an earlier migration's data valid again.
+Ghost creation carries the entity migration epoch. Ownership notifications carry the previous
+host and a newer epoch, and must arrive on the new host's registered channel. They can precede
+the old host's next-Real hint; late hints and repeated ownership notifications cannot rewind it.
+Each Ghost buffers up to 16 future ownership transitions and drains them when the preceding
+owner arrives, preserving the per-entity ownership chain across channels. Overflow is logged
+and refused; missing predecessors never authorize a guessed owner. Promotion clears this queue,
+and queued transitions from condemned channels cannot take ownership.
+Explicit migration rejection republishes the retained source ownership epoch to its ghosts.
+These Ghost and space-bootstrap wire layouts require rebuilding all servers together.
+BaseApp space bootstrap explicitly reuses an existing primary Cell or waits for concurrent
+creation of the same space. A conflicting space-master type is rejected; ordinary create
+requests still reject duplicates. Creation callbacks match the Manager channel and space,
+complete once, and fail on send errors, disconnect, or a five-second timeout. Both ends bound
+pending space creation at 1,024 requests; unavailable or exhausted request IDs fail explicitly.
+Invalid controller state rejects arrival; failed rollback restoration retains the Ghost and
+snapshot instead of activating a partially restored Real.
+An unconfirmed Offload send also leaves a passive source Ghost and snapshot; a local send
+error does not prove that no fragments reached the destination. Same-process teleports retain
+the source until target restoration succeeds. Rejection restores the source in its original
+space and pose; failed rollback retains its Ghost and snapshot, and never counts as success.
+The receiving process keeps the latest result per entity, including after destruction, so a
+duplicate cannot recreate a destroyed entity. These in-memory receipts are bounded at 65,536
+distinct entity IDs per process; reaching the bound rejects new IDs with `overloaded`, while
+existing IDs can continue migrating. Receipts are not durable restart recovery. Rebuild all
+CellApps together for the new acknowledgement layout; old layouts are unsupported.
+
+For a remote proxy, await `GiveClientToAsync(new ClientHandoffTarget(entityId, baseIp,
+internalPort, processInstance))`. Supply the registered BaseApp's internal IPv4 value
+(`Address::Ip()`), port and current process identity; no global entity directory is provided.
+`TryGetClientHandoffTarget(out target)` describes a live local proxy using its registered
+BaseApp instance; it returns false before registration or while the entity is being destroyed.
+The Godot `AtlasClientRoundTrip` verification scene also supports a handoff mode: start the
+fixture cluster with `--baseapps 2` and set `ATLAS_GODOT_TEST_HANDOFF=1` for the Godot process.
+Set `ATLAS_RPC_FIXTURE_DIR` to the same empty, isolated local directory for the fixture cluster
+and Godot. Each fixture BaseApp publishes a Probe endpoint there; the test selects the other
+process explicitly, independently of login allocation. Fixture Cell notification records verify
+that a revoked client cannot change state. These files contain no credentials and are test-only.
+Both fixture BaseApps create their Probes in the same space, exercising concurrent bootstrap.
+It checks target identity rejection, switching, target RPC and revocation after relogin.
+The source freezes input, prepares the database session, waits for target acceptance, then
+redirects the client to the target's registered external endpoint. Only target authentication
+confirmation releases the source binding. Rejection restores input only after a confirmed
+database abort; an unknown outcome keeps the source frozen. The account entity and its checkout
+stay at the source, and neither source nor target entities are implicitly destroyed.
+
+The native SDK (`atlas_net_client`, C ABI `0x03000000`) supports this switch for Godot and other
+DLL hosts. It clears old entities, space data and RPC waits, rejects sends during `Handoff`,
+verifies the target channel, entity and process identity, and delivers `EntityTransferred`
+before `CellReady`. A failed or
+timed-out authentication disconnects the client; reconnect through login rather than assuming
+the old connection is still authoritative. Initial authentication advertises handoff support;
+the standalone `atlas_client` CLI does not support remote switching and is rejected before
+preparation. Rebuild all SDKs and servers together for the authentication layout and native API.
+Remote script waits allow 40 seconds; cancelling that wait does not undo remote execution.
+RUDP interfaces do not share bound endpoints; binding an endpoint already owned by another
+RUDP interface fails with `AddressInUse`, including explicit client source-port bindings.
 
 ## Profiling and Stress
 

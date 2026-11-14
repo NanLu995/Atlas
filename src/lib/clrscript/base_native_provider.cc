@@ -108,8 +108,17 @@ void BaseNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* /*entity
   ATLAS_LOG_ERROR("write_to_db() not supported on this process type (entity_id={})", entity_id);
 }
 
-void BaseNativeProvider::GiveClientTo(uint32_t src_entity_id, uint32_t /*dest_entity_id*/) {
-  ATLAS_LOG_ERROR("give_client_to() not supported on this process type (src={})", src_entity_id);
+auto BaseNativeProvider::TransferClient(uint32_t, uint32_t, uint32_t, uint16_t, uint64_t, uint64_t)
+    -> RpcSendResult {
+  return RpcSendResult::kInvalidTarget;
+}
+
+auto BaseNativeProvider::GetClientHandoffTarget(uint32_t, uint32_t& base_ip, uint16_t& base_port,
+                                                uint64_t& base_instance) -> bool {
+  base_ip = 0;
+  base_port = 0;
+  base_instance = 0;
+  return false;
 }
 
 void BaseNativeProvider::SetSpaceMasterType(uint32_t /*space_id*/, const char* /*name*/,

@@ -482,14 +482,27 @@ TEST_F(NetworkInterfaceTest, CondemnedTcpChannelReclaimsExpandedRecvBufferImmedi
   EXPECT_EQ(channel->WriteBufferSize(), 0u);
 }
 
-// ============================================================================
-// RUDP tests
-// ============================================================================
-
 TEST_F(NetworkInterfaceTest, StartRudpServer) {
   auto result = ni_.StartRudpServer(Address("127.0.0.1", 0));
   ASSERT_TRUE(result.HasValue()) << result.Error().Message();
   EXPECT_NE(ni_.RudpAddress().Port(), 0);
+}
+
+TEST_F(NetworkInterfaceTest, RudpServerRejectsAnAlreadyBoundEndpoint) {
+  ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)));
+  NetworkInterface other(dispatcher_);
+  const auto duplicate = other.StartRudpServer(ni_.RudpAddress());
+  ASSERT_FALSE(duplicate.HasValue());
+  EXPECT_EQ(duplicate.Error().Code(), ErrorCode::kAddressInUse);
+}
+
+TEST_F(NetworkInterfaceTest, RudpClientCannotShareAnotherServersEndpoint) {
+  ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)));
+  NetworkInterface other(dispatcher_);
+  other.SetRudpClientBindAddress(ni_.RudpAddress());
+  const auto duplicate = other.ConnectRudp(Address("127.0.0.1", 31001));
+  ASSERT_FALSE(duplicate.HasValue());
+  EXPECT_EQ(duplicate.Error().Code(), ErrorCode::kAddressInUse);
 }
 
 TEST_F(NetworkInterfaceTest, ConnectRudpCreatesChannel) {

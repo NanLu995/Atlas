@@ -84,6 +84,57 @@ struct CheckoutInfo {
   [[nodiscard]] auto operator==(const CheckoutInfo&) const -> bool = default;
 };
 
+struct AccountSessionOwner {
+  Address base_addr;
+  EntityID entity_id{kInvalidEntityID};
+  uint64_t process_instance{0};
+
+  [[nodiscard]] auto operator==(const AccountSessionOwner&) const -> bool = default;
+};
+
+enum class AccountSessionPhase : uint8_t {
+  kOffline = 0,
+  kActive,
+  kPreparing,
+  kAccepted,
+  kAwaitingClient,
+};
+
+struct AccountSession {
+  uint64_t version{0};
+  AccountSessionPhase phase{AccountSessionPhase::kOffline};
+  AccountSessionOwner owner;
+  AccountSessionOwner target;
+  std::array<std::byte, 16> handoff_id{};
+  std::array<std::byte, 32> credential_hash{};
+
+  [[nodiscard]] auto operator==(const AccountSession&) const -> bool = default;
+};
+
+enum class AccountSessionAction : uint8_t {
+  kClaim = 0,
+  kPrepare,
+  kAccept,
+  kAwaitClient,
+  kComplete,
+  kAbort,
+  kRelease,
+  kMoveLocal,
+};
+
+struct AccountSessionOperation {
+  std::array<std::byte, 16> id{};
+  DatabaseID account_dbid{kInvalidDBID};
+  uint16_t account_type_id{0};
+  uint64_t expected_version{0};
+  AccountSessionAction action{AccountSessionAction::kClaim};
+  AccountSessionOwner actor;
+  AccountSessionOwner target;
+  std::array<std::byte, 16> handoff_id{};
+  std::array<std::byte, 32> credential_hash{};
+  std::optional<CheckoutInfo> claim_checkout;
+};
+
 struct DatabaseWriteOperation {
   std::array<std::byte, 16> id{};
   DatabaseID requested_dbid{kInvalidDBID};
@@ -138,6 +189,7 @@ struct GetResult {
 struct DelResult {
   bool success{false};
   std::string error;
+  DatabaseErrorKind error_kind{DatabaseErrorKind::kNone};
 };
 
 struct LookupResult {
@@ -254,6 +306,16 @@ class IDatabase {
   virtual void SetDeferredMode(bool /*enabled*/) {}
 
   virtual void ProcessResults() = 0;
+
+  virtual void ReadAccountSession(DatabaseID /*dbid*/, uint16_t /*type_id*/,
+                                  std::function<void(Result<AccountSession>)> callback) {
+    callback(Error{ErrorCode::kNotSupported, "account sessions are not supported"});
+  }
+
+  virtual void UpdateAccountSession(const AccountSessionOperation& /*operation*/,
+                                    std::function<void(Result<AccountSession>)> callback) {
+    callback(Error{ErrorCode::kNotSupported, "account sessions are not supported"});
+  }
 
   virtual void BeginBatch() {}
 

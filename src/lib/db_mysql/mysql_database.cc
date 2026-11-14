@@ -208,6 +208,13 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
                           ") ENGINE=InnoDB DEFAULT CHARSET=binary");
   if (!receipts) return receipts.Error();
 
+  auto sessions = ExecSql(conn,
+                          "CREATE TABLE IF NOT EXISTS atlas_account_sessions ("
+                          "dbid BIGINT UNSIGNED NOT NULL, type_id INT UNSIGNED NOT NULL,"
+                          "version BIGINT UNSIGNED NOT NULL, payload VARBINARY(256) NOT NULL,"
+                          "PRIMARY KEY(dbid, type_id)) ENGINE=InnoDB DEFAULT CHARSET=binary");
+  if (!sessions) return sessions.Error();
+
   auto begin = BeginTxn(conn);
   if (!begin) return begin.Error();
   // Serialize seeding before the meta read and counter insert acquire opposite locks.
@@ -436,13 +443,15 @@ void MysqlDatabase::Rollback(st_mysql* conn) {
 
 auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                           std::span<const std::byte> blob, const std::string& identifier,
-                          bool write_password, const std::string& password_hash) -> PutResult {
+                          bool write_password, const std::string& password_hash,
+                          bool transaction_open) -> PutResult {
   PutResult result;
   if (HasFlag(flags, WriteFlags::kDelete)) {
-    auto del = DoDel(conn, dbid, type_id);
+    auto del = DoDel(conn, dbid, type_id, transaction_open);
     result.success = del.success;
     result.dbid = dbid;
     result.error = std::move(del.error);
+    result.error_kind = del.error_kind;
     return result;
   }
 
@@ -765,7 +774,7 @@ auto MysqlDatabase::DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperat
         }
       }
     }
-    outcome = DoPut(conn, dbid, type_id, flags, blob, identifier, false, {});
+    outcome = DoPut(conn, dbid, type_id, flags, blob, identifier, false, {}, true);
     if (!outcome.success) return outcome;
     if (operation.create_owner) {
       auto version =
@@ -824,20 +833,36 @@ auto MysqlDatabase::DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> 
   return result;
 }
 
-auto MysqlDatabase::DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> DelResult {
-  DelResult result;
-  auto exec = ExecSql(conn, std::format("DELETE FROM entities WHERE dbid = {} AND type_id = {}",
-                                        static_cast<uint64_t>(dbid), type_id));
-  if (!exec) {
-    result.error = std::string(exec.Error().Message());
-    return result;
+auto MysqlDatabase::DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool transaction_open)
+    -> DelResult {
+  if (!transaction_open) {
+    if (auto begun = BeginTxn(conn); !begun)
+      return DelResult{false, std::string(begun.Error().Message())};
   }
-  if (mysql_affected_rows(conn) == 0) {
-    result.error = std::format("entity ({},{}) not found", type_id, dbid);
-    return result;
+  auto remove = [&]() -> Result<void> {
+    auto row = FetchByDbid(conn, dbid, type_id, true);
+    if (!row) return row.Error();
+    if (!row->found) return Error{ErrorCode::kNotFound, "delete entity not found"};
+    auto session = DoReadAccountSession(conn, dbid, type_id, true);
+    if (!session) return session.Error();
+    if (session->phase != AccountSessionPhase::kOffline)
+      return Error{ErrorCode::kPermissionDenied,
+                   "account session must be released before deletion"};
+    return ExecSql(conn, std::format("DELETE FROM entities WHERE dbid = {} AND type_id = {}",
+                                     static_cast<uint64_t>(dbid), type_id));
+  };
+  auto result = remove();
+  if (!transaction_open) {
+    if (result) result = Commit(conn);
+    if (!result) Rollback(conn);
   }
-  result.success = true;
-  return result;
+  if (result) return DelResult{true, {}};
+  const auto code = result.Error().Code();
+  const auto kind = code == ErrorCode::kPermissionDenied ? DatabaseErrorKind::kOwnershipConflict
+                    : code == ErrorCode::kCommitUnknown  ? DatabaseErrorKind::kCommitUnknown
+                    : code == ErrorCode::kNotFound       ? DatabaseErrorKind::kNotFound
+                                                         : DatabaseErrorKind::kNone;
+  return DelResult{false, std::string(result.Error().Message()), kind};
 }
 
 auto MysqlDatabase::DoLookup(st_mysql* conn, uint16_t type_id, const std::string& identifier)

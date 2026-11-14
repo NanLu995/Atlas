@@ -60,6 +60,11 @@ namespace atlas {
 
 namespace {
 
+auto IsCurrentGhostSource(const CellEntity& entity, const Address& src, Channel* channel) -> bool {
+  return entity.IsGhost() && channel != nullptr && entity.GetRealAddr() == src &&
+         entity.GetRealChannel() == channel;
+}
+
 auto RejectReasonName(cellapp::OffloadRejectReason reason) -> const char* {
   switch (reason) {
     case cellapp::OffloadRejectReason::kNone:
@@ -72,16 +77,21 @@ auto RejectReasonName(cellapp::OffloadRejectReason reason) -> const char* {
       return "target_missing";
     case cellapp::OffloadRejectReason::kRestoreFailed:
       return "restore_failed";
+    case cellapp::OffloadRejectReason::kOutcomeUnknown:
+      return "outcome_unknown";
+    case cellapp::OffloadRejectReason::kOverloaded:
+      return "overloaded";
   }
   return "unknown";
 }
 
-void SendOffloadReject(Channel* ch, const Address& dst, EntityID entity_id,
+void SendOffloadResult(Channel* ch, const Address& dst, EntityID entity_id, uint32_t cell_epoch,
                        cellapp::OffloadRejectReason reason) {
   if (ch == nullptr) return;
   cellapp::OffloadEntityAck ack;
   ack.entity_id = entity_id;
-  ack.success = false;
+  ack.cell_epoch = cell_epoch;
+  ack.success = reason == cellapp::OffloadRejectReason::kNone;
   ack.reject_reason = reason;
   if (auto r = ch->SendMessage(ack); !r) {
     ATLAS_LOG_ERROR("CellApp: failed to send OffloadEntityAck(reason={}) entity_id={} to {}: {}",
@@ -1063,6 +1073,7 @@ void CellApp::RemoveEntityFromSpace(CellEntity* entity) {
   if (auto* rd = entity->GetRealData()) {
     cellapp::DeleteGhost del;
     del.entity_id = cell_id;
+    del.cell_epoch = entity->CellEpoch();
     for (const auto& h : rd->Haunts()) {
       if (h.channel) (void)h.channel->SendMessage(del);
     }
@@ -1712,7 +1723,16 @@ void CellApp::HandlePeerLost(const Address& peer_addr, bool normal) {
   uint32_t haunts_cleared = 0;
   for (auto& [id, entity] : entity_population_) {
     if (entity->IsGhost()) {
-      if (entity->GetRealAddr() == peer_addr) orphan_ghosts.push_back(id);
+      if (entity->GetRealAddr() == peer_addr) {
+        if (auto pending = pending_offloads_.find(id);
+            pending != pending_offloads_.end() && pending->second.target_addr == peer_addr) {
+          pending->second.outcome_unknown = true;
+          entity->RebindRealChannel(nullptr, peer_addr);
+          ATLAS_LOG_ERROR("CellApp: Offload entity_id={} target lost; outcome unknown", id);
+        } else {
+          orphan_ghosts.push_back(id);
+        }
+      }
     } else if (entity->IsReal()) {
       if (auto* rd = entity->GetRealData()) {
         if (rd->RemoveHauntByAddr(peer_addr)) ++haunts_cleared;
@@ -2057,6 +2077,7 @@ void CellApp::OnCreateGhost(const Address& src, Channel* ch, const cellapp::Crea
       msg.real_cellapp_addr));
   entity_ptr_raw->SetOnGround(msg.on_ground);
   entity_ptr_raw->SetBaseAddr(msg.base_addr);
+  entity_ptr_raw->SetCellEpoch(msg.cell_epoch);
   entity_ptr_raw->SetGhostPersistentBlob(std::span<const std::byte>(msg.persistent_blob));
   // Seed snapshot baseline so subsequent GhostDelta frames have
   // something to append to.
@@ -2083,8 +2104,7 @@ void CellApp::OnCreateGhost(const Address& src, Channel* ch, const cellapp::Crea
   }
 }
 
-void CellApp::OnDeleteGhost(const Address& src, Channel* /*ch*/,
-                            const cellapp::DeleteGhost& msg) {
+void CellApp::OnDeleteGhost(const Address& src, Channel* ch, const cellapp::DeleteGhost& msg) {
   if (RejectUntrustedCellAppPeer(src, "DeleteGhost")) return;
 
   auto it = entity_population_.find(msg.entity_id);
@@ -2093,10 +2113,8 @@ void CellApp::OnDeleteGhost(const Address& src, Channel* /*ch*/,
     return;
   }
   auto* entity = it->second;
-  if (!entity->IsGhost()) {
-    ATLAS_LOG_WARNING("CellApp: DeleteGhost for non-Ghost entity_id={} - rejected", msg.entity_id);
-    return;
-  }
+  if (!IsCurrentGhostSource(*entity, src, ch)) return;
+  if (msg.cell_epoch != entity->CellEpoch()) return;
   if (native_provider_ && native_provider_->destroy_ghost_fn() != nullptr) {
     native_provider_->destroy_ghost_fn()(msg.entity_id);
   }
@@ -2105,12 +2123,14 @@ void CellApp::OnDeleteGhost(const Address& src, Channel* /*ch*/,
   entity->GetSpace().RemoveEntity(entity->Id());
 }
 
-void CellApp::OnGhostPositionUpdate(const Address& src, Channel* /*ch*/,
+void CellApp::OnGhostPositionUpdate(const Address& src, Channel* ch,
                                     const cellapp::GhostPositionUpdate& msg) {
   if (RejectUntrustedCellAppPeer(src, "GhostPositionUpdate")) return;
 
   auto it = entity_population_.find(msg.entity_id);
   if (it == entity_population_.end()) return;  // Ghost not here; drop.
+  if (!IsCurrentGhostSource(*it->second, src, ch)) return;
+  if (msg.cell_epoch != it->second->CellEpoch()) return;
   if (!std::isfinite(msg.position.x) || !std::isfinite(msg.position.y) ||
       !std::isfinite(msg.position.z) || !std::isfinite(msg.direction.x) ||
       !std::isfinite(msg.direction.y) || !std::isfinite(msg.direction.z)) {
@@ -2121,21 +2141,24 @@ void CellApp::OnGhostPositionUpdate(const Address& src, Channel* /*ch*/,
   it->second->GhostUpdatePosition(msg.position, msg.direction, msg.on_ground, msg.volatile_seq);
 }
 
-void CellApp::OnGhostDelta(const Address& src, Channel* /*ch*/,
-                           const cellapp::GhostDelta& msg) {
+void CellApp::OnGhostDelta(const Address& src, Channel* ch, const cellapp::GhostDelta& msg) {
   if (RejectUntrustedCellAppPeer(src, "GhostDelta")) return;
 
   auto it = entity_population_.find(msg.entity_id);
   if (it == entity_population_.end()) return;
+  if (!IsCurrentGhostSource(*it->second, src, ch)) return;
+  if (msg.cell_epoch != it->second->CellEpoch()) return;
   it->second->GhostApplyDelta(msg.event_seq, std::span<const std::byte>(msg.other_delta));
 }
 
-void CellApp::OnGhostSnapshotRefresh(const Address& src, Channel* /*ch*/,
+void CellApp::OnGhostSnapshotRefresh(const Address& src, Channel* ch,
                                      const cellapp::GhostSnapshotRefresh& msg) {
   if (RejectUntrustedCellAppPeer(src, "GhostSnapshotRefresh")) return;
 
   auto it = entity_population_.find(msg.entity_id);
   if (it == entity_population_.end()) return;
+  if (!IsCurrentGhostSource(*it->second, src, ch)) return;
+  if (msg.cell_epoch != it->second->CellEpoch()) return;
   if (!msg.other_snapshot.empty() || msg.event_seq > 0) {
     it->second->GhostApplySnapshot(msg.event_seq, std::span<const std::byte>(msg.other_snapshot));
   }
@@ -2144,40 +2167,66 @@ void CellApp::OnGhostSnapshotRefresh(const Address& src, Channel* /*ch*/,
   }
 }
 
-void CellApp::OnGhostSetReal(const Address& src, Channel* /*ch*/,
-                             const cellapp::GhostSetReal& msg) {
+void CellApp::OnGhostSetReal(const Address& src, Channel* ch, const cellapp::GhostSetReal& msg) {
   if (RejectUntrustedCellAppPeer(src, "GhostSetReal")) return;
 
-  // Rebind the Ghost's back-channel so future forwarded traffic
-  // (e.g. reply RPCs) targets the new Real's CellApp.
   auto it = entity_population_.find(msg.entity_id);
   if (it == entity_population_.end()) return;
   auto* entity = it->second;
   if (!entity->IsGhost()) return;
-  auto* new_ch = FindPeerChannel(msg.new_real_addr);
-  if (new_ch == nullptr) {
-    ATLAS_LOG_WARNING("CellApp: GhostSetReal for new_real_addr={}:{} - no peer channel",
-                      msg.new_real_addr.Ip(), msg.new_real_addr.Port());
+  if (ch == nullptr || FindPeerChannel(src) != ch || src != msg.new_real_addr ||
+      msg.cell_epoch <= entity->CellEpoch())
     return;
-  }
-  entity->RebindRealChannel(new_ch, msg.new_real_addr);
+  entity->UpdateGhostOwner(ch, msg.previous_real_addr, msg.new_real_addr, msg.cell_epoch);
 }
 
-void CellApp::OnGhostSetNextReal(const Address& src, Channel* /*ch*/,
+void CellApp::OnGhostSetNextReal(const Address& src, Channel* ch,
                                  const cellapp::GhostSetNextReal& msg) {
   if (RejectUntrustedCellAppPeer(src, "GhostSetNextReal")) return;
 
   auto it = entity_population_.find(msg.entity_id);
   if (it == entity_population_.end()) return;
+  if (!IsCurrentGhostSource(*it->second, src, ch)) return;
+  if (msg.cell_epoch <= it->second->CellEpoch()) return;
   it->second->SetNextRealAddr(msg.next_real_addr);
 }
 
 void CellApp::OnOffloadEntity(const Address& src, Channel* ch, const cellapp::OffloadEntity& msg) {
   if (RejectUntrustedCellAppPeer(src, "OffloadEntity")) return;
+  if (ch == nullptr || FindPeerChannel(src) != ch) return;
   ReceiveOffload(src, ch, msg);
 }
 
 void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::OffloadEntity& msg) {
+  const auto previous = offload_receipts_.find(msg.entity_id);
+  if (previous != offload_receipts_.end() && msg.cell_epoch <= previous->second.cell_epoch) {
+    const auto result =
+        msg.cell_epoch == previous->second.cell_epoch && src == previous->second.source
+            ? previous->second.result
+            : cellapp::OffloadRejectReason::kOutcomeUnknown;
+    SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch, result);
+    return;
+  }
+  if (msg.cell_epoch == std::numeric_limits<uint32_t>::max()) {
+    SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch,
+                      cellapp::OffloadRejectReason::kRejected);
+    return;
+  }
+  if (previous == offload_receipts_.end() && offload_receipts_.size() >= kMaxOffloadReceipts) {
+    SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch,
+                      cellapp::OffloadRejectReason::kOverloaded);
+    return;
+  }
+  auto& receipt =
+      offload_receipts_
+          .insert_or_assign(
+              msg.entity_id,
+              OffloadReceipt{msg.cell_epoch, src, cellapp::OffloadRejectReason::kOutcomeUnknown})
+          .first->second;
+  auto reject = [&](cellapp::OffloadRejectReason reason) {
+    receipt.result = reason;
+    SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch, reason);
+  };
   auto* space = FindSpace(msg.space_id);
   if (msg.is_teleport) {
     // Teleport requires a fully-hosted destination; never auto-create a
@@ -2185,7 +2234,7 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
     if (space == nullptr || space->LocalCells().empty()) {
       ATLAS_LOG_WARNING("CellApp: teleport Offload entity_id={} rejected - space {} not hosted",
                         msg.entity_id, msg.space_id);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kTargetMissing);
+      reject(cellapp::OffloadRejectReason::kTargetMissing);
       return;
     }
   } else if (!space) {
@@ -2193,7 +2242,7 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
       ATLAS_LOG_WARNING(
           "CellApp: OffloadEntity target missing space={} entity_id={} geometry_version={}",
           msg.space_id, msg.entity_id, msg.geometry_version);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kTargetMissing);
+      reject(cellapp::OffloadRejectReason::kTargetMissing);
       return;
     }
     auto inserted = spaces_.emplace(msg.space_id, MakeSpace(msg.space_id));
@@ -2206,14 +2255,14 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
       ATLAS_LOG_WARNING(
           "CellApp: OffloadEntity stale geometry entity_id={} space={} msg={} local={}",
           msg.entity_id, msg.space_id, msg.geometry_version, space->GeometryVersion());
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kStaleGeometry);
+      reject(cellapp::OffloadRejectReason::kStaleGeometry);
       return;
     }
     target_cell = space->FindLocalCell(msg.target_cell_id);
     if (target_cell == nullptr) {
       ATLAS_LOG_WARNING("CellApp: OffloadEntity target cell missing entity_id={} space={} cell={}",
                         msg.entity_id, msg.space_id, msg.target_cell_id);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kTargetMissing);
+      reject(cellapp::OffloadRejectReason::kTargetMissing);
       return;
     }
     if (auto* tree = space->GetBspTree(); tree != nullptr) {
@@ -2222,7 +2271,7 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
         ATLAS_LOG_WARNING(
             "CellApp: OffloadEntity target mismatch entity_id={} target={} geometry_version={}",
             msg.entity_id, msg.target_cell_id, msg.geometry_version);
-        SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kStaleGeometry);
+        reject(cellapp::OffloadRejectReason::kStaleGeometry);
         return;
       }
     }
@@ -2237,7 +2286,7 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
       ATLAS_LOG_WARNING(
           "CellApp: teleport entity_id={} pos not in a local cell of space {} - rejecting",
           msg.entity_id, msg.space_id);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kStaleGeometry);
+      reject(cellapp::OffloadRejectReason::kStaleGeometry);
       return;
     }
   }
@@ -2248,11 +2297,12 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
     // Promote a pre-existing Ghost. ConvertGhostToReal preserves
     // replication_state_; the offload owner_snapshot layers on top.
     entity = it->second;
-    if (!entity->IsGhost()) {
-      ATLAS_LOG_ERROR(
-          "CellApp: OffloadEntity for existing non-Ghost entity_id={} - aborting offload",
-          msg.entity_id);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kRejected);
+    if (msg.cell_epoch < entity->CellEpoch() || !entity->IsGhost()) {
+      reject(cellapp::OffloadRejectReason::kOutcomeUnknown);
+      return;
+    }
+    if (entity->TypeId() != msg.type_id || entity->GetSpace().Id() != msg.space_id) {
+      reject(cellapp::OffloadRejectReason::kRejected);
       return;
     }
     // Drop the C# Ghost mirror so restore_entity_fn below creates a fresh
@@ -2298,7 +2348,7 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
       ATLAS_LOG_ERROR("CellApp: Offload RestoreEntity failed cell_id={} type={}: {}", entity->Id(),
                       msg.type_id, *error);
       RemoveEntityFromSpace(entity);
-      SendOffloadReject(ch, src, msg.entity_id, cellapp::OffloadRejectReason::kRestoreFailed);
+      reject(cellapp::OffloadRejectReason::kRestoreFailed);
       return;
     }
     entity->ClearGhostPersistentBlob();
@@ -2349,10 +2399,10 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
     const bool ok = DeserializeControllersForMigration(
         *entity, r, [this](uint32_t peer_id) -> CellEntity* { return FindEntity(peer_id); });
     if (!ok) {
-      ATLAS_LOG_ERROR(
-          "CellApp: Offload controller restore failed for entity_id={} - arriving "
-          "controllers partially / empty",
-          msg.entity_id);
+      ATLAS_LOG_ERROR("CellApp: Offload controller restore failed for entity_id={}", msg.entity_id);
+      RemoveEntityFromSpace(entity);
+      reject(cellapp::OffloadRejectReason::kRestoreFailed);
+      return;
     }
   }
 
@@ -2384,6 +2434,8 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
   cellapp::GhostSetReal ghost_set_real;
   ghost_set_real.entity_id = msg.entity_id;
   ghost_set_real.new_real_addr = ResolveSelfAddr();
+  ghost_set_real.previous_real_addr = src;
+  ghost_set_real.cell_epoch = new_epoch;
   for (const auto& haunt_addr : msg.existing_haunts) {
     if (haunt_addr == ResolveSelfAddr()) continue;
     if (haunt_addr == src) continue;
@@ -2399,23 +2451,12 @@ void CellApp::ReceiveOffload(const Address& src, Channel* ch, const cellapp::Off
     }
   }
 
-  cellapp::OffloadEntityAck ack;
-  ack.entity_id = msg.entity_id;
-  ack.success = true;
-  ack.reject_reason = cellapp::OffloadRejectReason::kNone;
-  if (ch != nullptr) {
-    if (auto r = ch->SendMessage(ack); !r) {
-      // Sender will time out and revert Ghost->Real.
-      // This side is already Real, so two Reals exist until recovery.
-      ATLAS_LOG_ERROR(
-          "CellApp: failed to send OffloadEntityAck(success=true) entity_id={} to {}: {} "
-          "- two-Reals split-brain until sender's revert timeout fires",
-          msg.entity_id, src.ToString(), r.Error().Message());
-    }
-  }
+  receipt.result = cellapp::OffloadRejectReason::kNone;
+  pending_offloads_.erase(msg.entity_id);
+  SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch, receipt.result);
 }
 
-void CellApp::OnOffloadEntityAck(const Address& src, Channel* /*ch*/,
+void CellApp::OnOffloadEntityAck(const Address& src, Channel* ch,
                                  const cellapp::OffloadEntityAck& msg) {
   if (RejectUntrustedCellAppPeer(src, "OffloadEntityAck")) return;
 
@@ -2428,6 +2469,15 @@ void CellApp::OnOffloadEntityAck(const Address& src, Channel* /*ch*/,
     return;
   }
   const Address target = pending_it->second.target_addr;
+  if (src != target || ch == nullptr || FindPeerChannel(src) != ch ||
+      msg.cell_epoch != pending_it->second.cell_epoch) {
+    return;
+  }
+  if (!msg.success && msg.reject_reason == cellapp::OffloadRejectReason::kOutcomeUnknown) {
+    pending_it->second.outcome_unknown = true;
+    ATLAS_LOG_ERROR("CellApp: Offload entity_id={} peer reports outcome unknown", msg.entity_id);
+    return;
+  }
   const auto age = Clock::now() - pending_it->second.sent_at;
   const bool was_teleport = pending_it->second.is_teleport;
 
@@ -2461,18 +2511,15 @@ void CellApp::TickOffloadAckTimeouts() {
   if (pending_offloads_.empty()) return;
   ATLAS_PROFILE_ZONE_N("CellApp::TickOffloadAckTimeouts");
   const auto now = Clock::now();
-  // Collect first so the revert below can mutate the map.
-  std::vector<std::pair<EntityID, bool>> timed_out;
-  for (const auto& [eid, po] : pending_offloads_) {
-    if (now - po.sent_at >= kOffloadAckTimeout) timed_out.emplace_back(eid, po.is_teleport);
+  std::vector<EntityID> timed_out;
+  for (auto& [eid, po] : pending_offloads_) {
+    if (!po.outcome_unknown && now - po.sent_at >= kOffloadAckTimeout) {
+      po.outcome_unknown = true;
+      if (po.is_teleport) timed_out.push_back(eid);
+      ATLAS_LOG_ERROR("CellApp: Offload entity_id={} timed out; retaining Ghost and snapshot", eid);
+    }
   }
-  for (auto [eid, is_teleport] : timed_out) {
-    ATLAS_LOG_ERROR(
-        "CellApp: Offload of entity_id={} TIMED OUT after {} ms - reverting Ghost to Real locally",
-        eid, std::chrono::duration_cast<std::chrono::milliseconds>(kOffloadAckTimeout).count());
-    RevertPendingOffload(eid, "ack timeout");
-    if (is_teleport) NotifyTeleportFailed(eid, TeleportFailReason::kOffloadTimeout);
-  }
+  for (auto eid : timed_out) NotifyTeleportFailed(eid, TeleportFailReason::kOffloadTimeout);
 }
 
 void CellApp::RevertPendingOffload(EntityID entity_id, const char* reason) {
@@ -2495,6 +2542,21 @@ void CellApp::RevertPendingOffload(EntityID entity_id, const char* reason) {
         entity_id, reason);
     return;
   }
+
+  auto retain_failed_restore = [&] {
+    if (native_provider_ && native_provider_->entity_migrating_out_fn() != nullptr) {
+      native_provider_->entity_migrating_out_fn()(entity_id);
+    }
+    entity->ConvertRealToGhost(nullptr, po.target_addr);
+    entity->SetGhostPersistentBlob(po.persistent_blob);
+    for (auto& [_, cell] : entity->GetSpace().LocalCells()) cell->RemoveRealEntity(entity);
+    movement_system_.EraseEntity(entity_id);
+    entity_load_counters_.erase(entity_id);
+    po.outcome_unknown = true;
+    pending_offloads_.emplace(entity_id, std::move(po));
+    ATLAS_LOG_ERROR("CellApp: Offload rollback failed entity_id={}; retained Ghost and snapshot",
+                    entity_id);
+  };
 
   // Drop the C# Ghost mirror that ProcessOffload created post-ConvertRealToGhost;
   // restore_entity_fn below re-creates the Real C# instance from persistent_blob.
@@ -2534,6 +2596,8 @@ void CellApp::RevertPendingOffload(EntityID entity_id, const char* reason) {
     if (auto err = ConsumeNativeApiError()) {
       ATLAS_LOG_ERROR("CellApp: Offload revert RestoreEntity failed for entity_id={}: {}",
                       entity_id, *err);
+      retain_failed_restore();
+      return;
     }
   }
 
@@ -2542,9 +2606,8 @@ void CellApp::RevertPendingOffload(EntityID entity_id, const char* reason) {
     const bool ok = DeserializeControllersForMigration(
         *entity, r, [this](uint32_t peer_id) -> CellEntity* { return FindEntity(peer_id); });
     if (!ok) {
-      ATLAS_LOG_ERROR(
-          "CellApp: Offload revert controller restore failed for entity_id={} - controllers lost",
-          entity_id);
+      retain_failed_restore();
+      return;
     }
   }
   if (po.has_movement_state) RestoreMovementState(entity_id, po.movement_state);
@@ -2556,6 +2619,14 @@ void CellApp::RevertPendingOffload(EntityID entity_id, const char* reason) {
   // Real, so revert goes through the same AttachWitness helper.
   if (po.had_witness) {
     AttachWitness(*entity, po.aoi_radius, po.aoi_hysteresis);
+  }
+  cellapp::GhostSetReal restored;
+  restored.entity_id = entity_id;
+  restored.new_real_addr = ResolveSelfAddr();
+  restored.previous_real_addr = restored.new_real_addr;
+  restored.cell_epoch = entity->CellEpoch();
+  for (const auto& address : po.haunt_addrs) {
+    if (auto* channel = FindPeerChannel(address)) (void)channel->SendMessage(restored);
   }
 
   ATLAS_LOG_INFO(
@@ -2994,10 +3065,11 @@ void CellApp::TickGhostPump() {
       msg.position = op.entity->Position();
       msg.direction = op.entity->Direction();
       msg.on_ground = op.entity->OnGround();
-      msg.real_cellapp_addr = Network().RudpAddress();
+      msg.real_cellapp_addr = ResolveSelfAddr();
       msg.base_addr = op.entity->BaseAddr();
       msg.entity_id = op.entity->Id();
       msg.persistent_blob = CapturePersistentBlob(*op.entity, "create ghost");
+      msg.cell_epoch = op.entity->CellEpoch();
       if (const auto* state = op.entity->GetReplicationState()) {
         msg.event_seq = state->latest_event_seq;
         msg.volatile_seq = state->latest_volatile_seq;
@@ -3010,6 +3082,7 @@ void CellApp::TickGhostPump() {
       if (op.peer_channel == nullptr) continue;
       cellapp::DeleteGhost msg;
       msg.entity_id = op.entity->Id();
+      msg.cell_epoch = op.entity->CellEpoch();
       (void)op.peer_channel->SendMessage(msg);
       if (auto* rd = op.entity->GetRealData()) rd->RemoveHaunt(op.peer_channel);
     }
@@ -3070,6 +3143,7 @@ void CellApp::TickGhostPump() {
       if (refresh_persistent && !sent_snapshot_refresh) {
         cellapp::GhostSnapshotRefresh msg;
         msg.entity_id = entity.Id();
+        msg.cell_epoch = entity.CellEpoch();
         if (state != nullptr) {
           msg.event_seq = state->latest_event_seq;
           msg.other_snapshot = state->other_snapshot;
@@ -3106,6 +3180,10 @@ void CellApp::TickOffloadChecker() {
         continue;
       }
 
+      if (op.entity->CellEpoch() == std::numeric_limits<uint32_t>::max()) {
+        ATLAS_LOG_ERROR("CellApp: Offload entity_id={} migration epoch exhausted", op.entity->Id());
+        continue;
+      }
       // Cancel in-flight C# RPCs before BuildOffloadMessage captures the blob,
       // then ship the entity to its load-balance target.
       if (auto cancel_fn =
@@ -3121,27 +3199,41 @@ void CellApp::TickOffloadChecker() {
 
 void CellApp::ProcessOffload(CellEntity& entity, Channel* peer, const Address& target_addr,
                              cellapp::OffloadEntity&& msg) {
+  if (entity.CellEpoch() == std::numeric_limits<uint32_t>::max() ||
+      pending_offloads_.contains(entity.Id())) {
+    ATLAS_LOG_ERROR("CellApp: Offload entity_id={} epoch exhausted or already pending",
+                    entity.Id());
+    return;
+  }
+  entity.SetCellEpoch(msg.cell_epoch + 1);
   // Warn existing haunts before shipping the bytes so the GhostSetNextReal
   // subsequence boundary precedes the new Real's GhostSetReal.
   if (auto* rd = entity.GetRealData()) {
     cellapp::GhostSetNextReal notify;
     notify.entity_id = entity.Id();
     notify.next_real_addr = target_addr;
+    notify.cell_epoch = msg.cell_epoch + 1;
     for (const auto& h : rd->Haunts()) {
       if (h.channel) (void)h.channel->SendMessage(notify);
     }
   }
 
-  if (!peer->SendMessage(msg)) {
-    ATLAS_LOG_ERROR("CellApp: OffloadEntity send failed for entity_id={}", entity.Id());
-    return;
+  const bool sent = peer->SendMessage(msg).HasValue();
+  PreserveOffloadSource(entity, peer, target_addr, msg);
+  if (!sent) {
+    pending_offloads_.at(entity.Id()).outcome_unknown = true;
+    ATLAS_LOG_ERROR("CellApp: OffloadEntity send unconfirmed for entity_id={}", entity.Id());
   }
+}
 
-  // Capture the revert snapshot before ConvertRealToGhost; a rejected or
-  // timed-out Offload restores a live Real from this.
+void CellApp::PreserveOffloadSource(CellEntity& entity, Channel* peer, const Address& target_addr,
+                                    const cellapp::OffloadEntity& msg) {
+  entity.SetCellEpoch(msg.cell_epoch + 1);
+  // Keep the source snapshot until the destination outcome is confirmed.
   PendingOffload po;
   po.target_addr = target_addr;
   po.sent_at = Clock::now();
+  po.cell_epoch = msg.cell_epoch;
   po.space_id = entity.GetSpace().Id();
   for (const auto& [cid, cell] : entity.GetSpace().LocalCells()) {
     if (cell->HasRealEntity(&entity)) {
@@ -3168,14 +3260,23 @@ void CellApp::ProcessOffload(CellEntity& entity, Channel* peer, const Address& t
     po.aoi_radius = witness->AoIRadius();
     po.aoi_hysteresis = witness->Hysteresis();
   }
-  po.has_movement_state = msg.has_movement_state;
-  po.movement_state = msg.movement_state;
-  po.movement_position_history = msg.movement_position_history;
-  po.has_movement_command = msg.has_movement_command;
-  po.movement_command = msg.movement_command;
+  movement_system_.CaptureOffloadState(entity.Id(), po.has_movement_state, po.movement_state,
+                                       po.movement_position_history, po.has_movement_command,
+                                       po.movement_command);
   po.persistent_blob = msg.persistent_blob;
   po.type_id = entity.TypeId();
   po.is_teleport = msg.is_teleport;
+  if (msg.is_teleport) {
+    if (auto* rd = entity.GetRealData()) {
+      cellapp::DeleteGhost remove;
+      remove.entity_id = entity.Id();
+      remove.cell_epoch = msg.cell_epoch;
+      for (const auto& haunt : rd->Haunts()) {
+        if (haunt.channel) (void)haunt.channel->SendMessage(remove);
+      }
+    }
+    po.haunt_addrs.clear();
+  }
   pending_offloads_[entity.Id()] = std::move(po);
 
   // Silent C# teardown for migration: OnDestroy stays reserved for real
@@ -3201,7 +3302,7 @@ void CellApp::ProcessOffload(CellEntity& entity, Channel* peer, const Address& t
 
   // Re-create C# as Ghost; state populated outside OnInit / OnGhostInit is
   // dropped across the boundary, matching the BigWorld ghost contract.
-  if (native_provider_ && native_provider_->restore_ghost_fn() != nullptr) {
+  if (peer != nullptr && native_provider_ && native_provider_->restore_ghost_fn() != nullptr) {
     const auto* data = msg.other_snapshot.empty()
                            ? nullptr
                            : reinterpret_cast<const uint8_t*>(msg.other_snapshot.data());
@@ -3228,6 +3329,13 @@ auto CellApp::RequestTeleport(EntityID entity_id, SpaceID target_space_id, math:
                       entity_id, kMaxPendingTeleports);
     return false;
   }
+  if (entity->CellEpoch() == std::numeric_limits<uint32_t>::max() ||
+      pending_offloads_.contains(entity_id) || next_teleport_request_id_ == 0 ||
+      std::ranges::any_of(pending_teleports_, [entity_id](const auto& entry) {
+        return entry.second.entity_id == entity_id;
+      })) {
+    return false;
+  }
   const uint32_t request_id = next_teleport_request_id_++;
   cellappmgr::ResolveSpaceHostRequest req;
   req.space_id = target_space_id;
@@ -3240,7 +3348,7 @@ auto CellApp::RequestTeleport(EntityID entity_id, SpaceID target_space_id, math:
     return false;
   }
   pending_teleports_[request_id] =
-      PendingTeleport{entity_id, target_space_id, pos, dir, Clock::now()};
+      PendingTeleport{entity_id, target_space_id, pos, dir, Clock::now(), entity->CellEpoch()};
   ++teleport_requested_total_;
   return true;
 }
@@ -3255,6 +3363,7 @@ void CellApp::OnResolveSpaceHostReply(const Address& /*src*/, Channel* ch,
     return;
   }
   const PendingTeleport pending = it->second;
+  if (msg.entity_id != pending.entity_id || msg.space_id != pending.target_space_id) return;
   pending_teleports_.erase(it);
 
   if (!msg.found) {
@@ -3264,7 +3373,8 @@ void CellApp::OnResolveSpaceHostReply(const Address& /*src*/, Channel* ch,
     return;
   }
   auto* entity = FindEntity(msg.entity_id);
-  if (entity == nullptr || !entity->IsReal()) {
+  if (entity == nullptr || !entity->IsReal() || entity->CellEpoch() != pending.cell_epoch ||
+      pending_offloads_.contains(msg.entity_id)) {
     ATLAS_LOG_WARNING("CellApp: teleport entity_id={} aborted - no longer a local Real",
                       msg.entity_id);
     return;
@@ -3274,6 +3384,11 @@ void CellApp::OnResolveSpaceHostReply(const Address& /*src*/, Channel* ch,
 
 void CellApp::BeginTeleportOffload(CellEntity& entity, const Address& target_addr,
                                    SpaceID target_space_id, math::Vector3 pos, math::Vector3 dir) {
+  if (!entity.IsReal() || entity.CellEpoch() == std::numeric_limits<uint32_t>::max() ||
+      pending_offloads_.contains(entity.Id())) {
+    NotifyTeleportFailed(entity.Id(), TeleportFailReason::kRejected);
+    return;
+  }
   const bool same_cellapp = target_addr == ResolveSelfAddr();
   Channel* peer = nullptr;
   if (same_cellapp) {
@@ -3302,18 +3417,6 @@ void CellApp::BeginTeleportOffload(CellEntity& entity, const Address& target_add
     }
   }
 
-  // Anchor the pose so the destination re-localizes at the new coordinates.
-  entity.SetPositionAndDirection(pos, dir);
-  // Drop OLD-space ghosts via DeleteGhost (not a cross-space GhostSetReal
-  // redirect); they are meaningless once the Real lives in another space.
-  if (auto* rd = entity.GetRealData()) {
-    cellapp::DeleteGhost del;
-    del.entity_id = entity.Id();
-    for (const auto& h : rd->Haunts()) {
-      if (h.channel) (void)h.channel->SendMessage(del);
-    }
-    rd->Haunts().clear();
-  }
   if (auto cancel_fn =
           native_provider_ ? native_provider_->entity_lifecycle_cancel_fn() : nullptr;
       cancel_fn != nullptr) {
@@ -3341,26 +3444,21 @@ void CellApp::BeginTeleportOffload(CellEntity& entity, const Address& target_add
 
 void CellApp::LocalTeleportRehome(CellEntity& entity, cellapp::OffloadEntity&& msg) {
   const EntityID id = entity.Id();
-  // Tear the source Real down: silent C# teardown (no OnDestroy), drop movement
-  // + cell membership + population, leave the source space (AoI-leave fan-out).
-  if (native_provider_) {
-    if (auto fn = native_provider_->entity_migrating_out_fn()) {
-      fn(id);
-    } else if (auto df = native_provider_->entity_destroyed_fn()) {
-      df(id);
-    }
-  }
-  movement_system_.EraseEntity(id);
-  entity_load_counters_.erase(id);
-  auto& src_space = entity.GetSpace();
-  for (auto& [_, cell] : src_space.LocalCells()) cell->RemoveRealEntity(&entity);
+  auto& source_space = entity.GetSpace();
+  PreserveOffloadSource(entity, nullptr, ResolveSelfAddr(), msg);
+  auto source = source_space.ExtractEntity(id);
   entity_population_.erase(id);
-  src_space.RemoveEntity(id);  // `entity` is dangling after this
-
-  // Rebuild in the target space via the shared receive core. ch=nullptr skips
-  // the ack; existing_haunts is empty so no GhostSetReal fan-out.
-  ReceiveOffload(ResolveSelfAddr(), /*ch=*/nullptr, msg);
-  ++teleport_succeeded_total_;
+  ReceiveOffload(ResolveSelfAddr(), nullptr, msg);
+  auto* arrived = FindEntity(id);
+  if (arrived != nullptr && arrived->IsReal() && arrived->CellEpoch() == msg.cell_epoch + 1 &&
+      arrived->GetSpace().Id() == msg.space_id) {
+    ++teleport_succeeded_total_;
+    return;
+  }
+  source_space.AddEntity(std::move(source));
+  entity_population_[id] = &entity;
+  RevertPendingOffload(id, "local teleport rejected");
+  NotifyTeleportFailed(id, TeleportFailReason::kRejected);
 }
 
 void CellApp::TickTeleportTimeouts() {

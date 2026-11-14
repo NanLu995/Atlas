@@ -45,7 +45,7 @@ TEST(NetClientAbi, VersionMatchesHeaderConstant) {
 }
 
 TEST(NetClientAbi, CreateRejectsMajorMismatch) {
-  constexpr uint32_t kBadMajor = 0x03000000u;
+  constexpr uint32_t kBadMajor = ATLAS_NET_ABI_VERSION ^ 0x01000000u;
   auto* ctx = AtlasNetCreate(kBadMajor);
   EXPECT_EQ(ctx, nullptr);
   EXPECT_NE(AtlasNetGlobalLastError(), nullptr);

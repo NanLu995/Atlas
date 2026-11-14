@@ -88,6 +88,11 @@ class SqliteDatabase : public IDatabase {
 
   void ProcessResults() override;
 
+  void ReadAccountSession(DatabaseID dbid, uint16_t type_id,
+                          std::function<void(Result<AccountSession>)> callback) override;
+  void UpdateAccountSession(const AccountSessionOperation& operation,
+                            std::function<void(Result<AccountSession>)> callback) override;
+
   void BeginBatch() override;
   void EndBatch() override;
 
@@ -128,6 +133,8 @@ class SqliteDatabase : public IDatabase {
   [[nodiscard]] auto Prepare(std::string_view sql) -> Result<Statement>;
   [[nodiscard]] auto UpsertMeta(std::string_view key, std::string_view value) -> Result<void>;
   [[nodiscard]] auto FetchByDbid(DatabaseID dbid, uint16_t type_id) -> Result<EntityRow>;
+  [[nodiscard]] auto ReadAccountSessionImpl(DatabaseID dbid, uint16_t type_id)
+      -> Result<AccountSession>;
   [[nodiscard]] auto FetchByName(uint16_t type_id, std::string_view identifier)
       -> Result<EntityRow>;
   [[nodiscard]] auto ReadRow(sqlite3_stmt* stmt) const -> Result<EntityRow>;

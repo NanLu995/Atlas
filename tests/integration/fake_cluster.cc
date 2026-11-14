@@ -4,36 +4,28 @@
 #include <vector>
 
 #include "baseapp/baseapp_messages.h"
+#include "baseapp/client_handoff_messages.h"
 #include "network/channel.h"
 #include "network/reliable_udp.h"
-#include "network/socket.h"
 #include "protocol/aoi_envelope.h"
 
 namespace atlas::test {
 
-namespace {
-
-auto ReserveUdpPort() -> uint16_t {
-  auto sock = Socket::CreateUdp();
-  if (!sock.HasValue()) return 0;
-  if (!sock->Bind(Address("127.0.0.1", 0)).HasValue()) return 0;
-  auto local = sock->LocalAddress();
-  return local ? local->Port() : uint16_t{0};
+bool FakeCluster::PushClientHandoff(const baseapp::ClientHandoff& request) {
+  return auth_channel_ && auth_channel_->SendMessage(request).HasValue();
 }
 
-}  // namespace
-
 FakeCluster::FakeCluster() {
-  loginapp_port_ = ReserveUdpPort();
-  baseapp_port_ = ReserveUdpPort();
-  loginapp_addr_ = Address("127.0.0.1", loginapp_port_);
-  baseapp_addr_ = Address("127.0.0.1", baseapp_port_);
   for (int i = 0; i < 32; ++i) expected_session_key_.bytes[i] = static_cast<uint8_t>(0xA0 + i);
 }
 
 bool FakeCluster::Start() {
-  if (!net_loginapp_.StartRudpServer(loginapp_addr_)) return false;
-  if (!net_baseapp_.StartRudpServer(baseapp_addr_)) return false;
+  if (!net_loginapp_.StartRudpServer(Address("127.0.0.1", 0))) return false;
+  if (!net_baseapp_.StartRudpServer(Address("127.0.0.1", 0))) return false;
+  loginapp_addr_ = net_loginapp_.RudpAddress();
+  baseapp_addr_ = net_baseapp_.RudpAddress();
+  loginapp_port_ = loginapp_addr_.Port();
+  baseapp_port_ = baseapp_addr_.Port();
 
   auto reg_login = net_loginapp_.InterfaceTable().RegisterTypedHandler<login::LoginRequest>(
       [this](const Address& src, Channel*, const login::LoginRequest&) {

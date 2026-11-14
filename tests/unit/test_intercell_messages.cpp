@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -48,6 +49,7 @@ TEST(IntercellMessages, CreateGhost_RoundTrip) {
   msg.volatile_seq = 200;
   msg.other_snapshot = MakeBlob({0xDE, 0xAD, 0xBE, 0xEF, 0x42});
   msg.persistent_blob = MakeBlob({0x10, 0x20, 0x30});
+  msg.cell_epoch = 23;
 
   auto rt = RoundTrip(msg);
   ASSERT_TRUE(rt.has_value());
@@ -67,6 +69,7 @@ TEST(IntercellMessages, CreateGhost_RoundTrip) {
   EXPECT_EQ(rt->other_snapshot[4], std::byte{0x42});
   ASSERT_EQ(rt->persistent_blob.size(), 3u);
   EXPECT_EQ(rt->persistent_blob[2], std::byte{0x30});
+  EXPECT_EQ(rt->cell_epoch, 23u);
 }
 
 TEST(IntercellMessages, CreateGhost_EmptySnapshot) {
@@ -83,7 +86,7 @@ TEST(IntercellMessages, CreateGhost_EmptySnapshot) {
   EXPECT_TRUE(rt->persistent_blob.empty());
 }
 
-TEST(IntercellMessages, CreateGhost_AcceptsLegacyFrameWithoutPersistentBlob) {
+TEST(IntercellMessages, CreateGhostRejectsOldFrameWithoutMigrationEpoch) {
   CreateGhost msg;
   msg.entity_id = 1;
   msg.type_id = 1;
@@ -113,8 +116,7 @@ TEST(IntercellMessages, CreateGhost_AcceptsLegacyFrameWithoutPersistentBlob) {
   auto buf = w.Detach();
   BinaryReader r(std::span<const std::byte>(buf.data(), buf.size()));
   auto rt = CreateGhost::Deserialize(r);
-  ASSERT_TRUE(rt.HasValue());
-  EXPECT_TRUE(rt->persistent_blob.empty());
+  EXPECT_FALSE(rt.HasValue());
 }
 
 TEST(IntercellMessages, DeleteGhost_RoundTrip) {
@@ -181,7 +183,7 @@ TEST(IntercellMessages, GhostSnapshotRefresh_RoundTrip) {
   EXPECT_EQ(rt->persistent_blob[1], std::byte{0x02});
 }
 
-TEST(IntercellMessages, GhostSnapshotRefresh_AcceptsLegacyFrameWithoutPersistentBlob) {
+TEST(IntercellMessages, GhostSnapshotRefreshRejectsOldFrameWithoutMigrationEpoch) {
   GhostSnapshotRefresh msg;
   msg.entity_id = 55;
   msg.event_seq = 9999;
@@ -196,32 +198,71 @@ TEST(IntercellMessages, GhostSnapshotRefresh_AcceptsLegacyFrameWithoutPersistent
   auto buf = w.Detach();
   BinaryReader r(std::span<const std::byte>(buf.data(), buf.size()));
   auto rt = GhostSnapshotRefresh::Deserialize(r);
-  ASSERT_TRUE(rt.HasValue());
-  EXPECT_EQ(rt->other_snapshot.size(), 2u);
-  EXPECT_TRUE(rt->persistent_blob.empty());
+  EXPECT_FALSE(rt.HasValue());
+}
+
+TEST(IntercellMessages, GhostDataFramesCarryEpochAndRejectTruncation) {
+  auto verify = []<typename Msg>() {
+    Msg message;
+    message.entity_id = 77;
+    message.cell_epoch = 19;
+    auto result = RoundTrip(message);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->entity_id, 77u);
+    EXPECT_EQ(result->cell_epoch, 19u);
+    BinaryWriter writer;
+    message.Serialize(writer);
+    BinaryReader truncated(writer.Data().first(writer.Size() - 1));
+    EXPECT_FALSE(Msg::Deserialize(truncated));
+  };
+  verify.operator()<DeleteGhost>();
+  verify.operator()<GhostPositionUpdate>();
+  verify.operator()<GhostDelta>();
+  verify.operator()<GhostSnapshotRefresh>();
 }
 
 TEST(IntercellMessages, GhostSetReal_RoundTrip) {
   GhostSetReal msg;
   msg.entity_id = 3;
   msg.new_real_addr = Address(0x7F000002u, 31337);
+  msg.previous_real_addr = Address(0x7F000003u, 31338);
+  msg.cell_epoch = 17;
 
   auto rt = RoundTrip(msg);
   ASSERT_TRUE(rt.has_value());
   EXPECT_EQ(rt->entity_id, 3u);
   EXPECT_EQ(rt->new_real_addr.Ip(), 0x7F000002u);
   EXPECT_EQ(rt->new_real_addr.Port(), 31337u);
+  EXPECT_EQ(rt->previous_real_addr, msg.previous_real_addr);
+  EXPECT_EQ(rt->cell_epoch, 17u);
 }
 
 TEST(IntercellMessages, GhostSetNextReal_RoundTrip) {
   GhostSetNextReal msg;
   msg.entity_id = 4;
   msg.next_real_addr = Address(0x0A010101u, 40404);
+  msg.cell_epoch = 18;
 
   auto rt = RoundTrip(msg);
   ASSERT_TRUE(rt.has_value());
   EXPECT_EQ(rt->entity_id, 4u);
   EXPECT_EQ(rt->next_real_addr.Port(), 40404u);
+  EXPECT_EQ(rt->cell_epoch, 18u);
+}
+
+TEST(IntercellMessages, GhostOwnershipFramesRejectTruncatedEpoch) {
+  BinaryWriter real;
+  GhostSetReal{}.Serialize(real);
+  BinaryReader truncated_real(real.Data().first(real.Size() - 1));
+  EXPECT_FALSE(GhostSetReal::Deserialize(truncated_real));
+  BinaryWriter next;
+  GhostSetNextReal{}.Serialize(next);
+  BinaryReader truncated_next(next.Data().first(next.Size() - 1));
+  EXPECT_FALSE(GhostSetNextReal::Deserialize(truncated_next));
+  BinaryWriter create;
+  CreateGhost{}.Serialize(create);
+  BinaryReader truncated_create(create.Data().first(create.Size() - 1));
+  EXPECT_FALSE(CreateGhost::Deserialize(truncated_create));
 }
 
 TEST(IntercellMessages, OffloadEntity_RoundTrip_Full) {
@@ -360,11 +401,13 @@ TEST(IntercellMessages, OffloadEntity_Deserialize_TolerantOfMissingOptionalTail)
 TEST(IntercellMessages, OffloadEntityAck_RoundTripSuccess) {
   OffloadEntityAck msg;
   msg.entity_id = 100;
+  msg.cell_epoch = 17;
   msg.success = true;
   msg.reject_reason = OffloadRejectReason::kRejected;
   auto rt = RoundTrip(msg);
   ASSERT_TRUE(rt.has_value());
   EXPECT_EQ(rt->entity_id, 100u);
+  EXPECT_EQ(rt->cell_epoch, 17u);
   EXPECT_TRUE(rt->success);
   EXPECT_EQ(rt->reject_reason, OffloadRejectReason::kNone);
 }
@@ -379,6 +422,25 @@ TEST(IntercellMessages, OffloadEntityAck_RoundTripFailure) {
   EXPECT_EQ(rt->entity_id, 200u);
   EXPECT_FALSE(rt->success);
   EXPECT_EQ(rt->reject_reason, OffloadRejectReason::kStaleGeometry);
+}
+
+TEST(IntercellMessages, OffloadAckRejectsInvalidStatusAndTruncatedEpoch) {
+  for (const auto [success, reason] :
+       {std::pair{uint8_t{2}, uint8_t{0}}, std::pair{uint8_t{1}, uint8_t{1}},
+        std::pair{uint8_t{0}, uint8_t{0}}, std::pair{uint8_t{0}, uint8_t{7}}}) {
+    BinaryWriter writer;
+    writer.Write(uint32_t{100});
+    writer.Write(uint32_t{17});
+    writer.Write(success);
+    writer.Write(reason);
+    BinaryReader reader(writer.Data());
+    EXPECT_FALSE(OffloadEntityAck::Deserialize(reader).HasValue());
+  }
+  BinaryWriter writer;
+  writer.Write(uint32_t{100});
+  writer.Write(uint16_t{17});
+  BinaryReader reader(writer.Data());
+  EXPECT_FALSE(OffloadEntityAck::Deserialize(reader).HasValue());
 }
 
 TEST(IntercellMessages, SpaceDataUpdateRoundTrip) {
