@@ -16,6 +16,8 @@
 
 namespace atlas::test_fixtures {
 
+inline constexpr std::array<uint8_t, 32> kAccountDefinitionDigest{1};
+
 inline auto MakeAccountTypeBlob() -> std::vector<std::byte> {
   BinaryWriter w;
   w.WriteString("Account");
@@ -55,14 +57,15 @@ inline auto WriteAccountAtdfFile(const std::filesystem::path& path) -> std::file
   w.Write<uint32_t>(EntityDefRegistry::kBinaryFileMagic);
   w.Write<uint16_t>(EntityDefRegistry::kBinaryFileVersion);
   w.Write<uint16_t>(0);  // flags
-  // ATDF v3: 32-byte digest follows flags; tests use a zero digest.
-  std::array<std::byte, EntityDefRegistry::kDigestSize> digest{};
-  w.WriteBytes(std::span<const std::byte>(digest.data(), digest.size()));
+  w.WriteBytes(std::as_bytes(std::span(kAccountDefinitionDigest)));
   w.WritePackedInt(0);   // 0 structs
   w.WritePackedInt(0);   // 0 components
   w.WritePackedInt(1);   // 1 type
   w.WritePackedInt(static_cast<uint32_t>(type_blob.size()));
   w.WriteBytes(std::span<const std::byte>(type_blob.data(), type_blob.size()));
+  auto checksum = Sha256(w.Data());
+  if (!checksum) return {};
+  w.WriteBytes(*checksum);
 
   auto bytes = w.Detach();
   std::ofstream f(path, std::ios::binary | std::ios::trunc);

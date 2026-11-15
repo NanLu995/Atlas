@@ -2,11 +2,14 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <limits>
 #include <string_view>
 
+#include "coro/scope_guard.h"
+#include "db/entity_blob.h"
 #include "foundation/log.h"
 
 namespace {
@@ -17,7 +20,7 @@ auto UnixTimeMs() -> int64_t {
       .count();
 }
 
-constexpr int kSqliteSchemaVersion = 1;
+constexpr int kSqliteSchemaVersion = 2;
 
 auto ConstraintErrorKind(sqlite3* db) -> atlas::DatabaseErrorKind {
   switch (sqlite3_extended_errcode(db)) {
@@ -70,8 +73,11 @@ auto SqliteDatabase::Startup(const DatabaseConfig& config, const EntityDefRegist
     -> Result<void> {
   if (started_ || db_ != nullptr)
     return Error{ErrorCode::kAlreadyExists, "SqliteDatabase is already started"};
+  stopping_ = false;
   entity_defs_ = &entity_defs;
   db_path_ = config.sqlite_path;
+  auto storage_schema = entity_defs.StorageSchemaDigest();
+  if (!storage_schema) return storage_schema.Error();
 
   auto open_result = OpenDatabase(config);
   if (!open_result) {
@@ -79,7 +85,7 @@ auto SqliteDatabase::Startup(const DatabaseConfig& config, const EntityDefRegist
     return open_result.Error();
   }
 
-  auto schema_result = EnsureSchema();
+  auto schema_result = EnsureSchema(*storage_schema);
   if (!schema_result) {
     Shutdown();
     return schema_result.Error();
@@ -90,10 +96,15 @@ auto SqliteDatabase::Startup(const DatabaseConfig& config, const EntityDefRegist
   return {};
 }
 
-void SqliteDatabase::Shutdown() {
-  started_ = false;
+void SqliteDatabase::BeginDrain() {
+  stopping_ = true;
   EndBatch();
+}
+
+void SqliteDatabase::Shutdown() {
+  BeginDrain();
   while (!deferred_.empty()) ProcessResults();
+  started_ = false;
   if (db_ != nullptr) {
     sqlite3_close(db_);
     db_ = nullptr;
@@ -104,6 +115,7 @@ void SqliteDatabase::Shutdown() {
 void SqliteDatabase::PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                                std::span<const std::byte> blob, const std::string& identifier,
                                std::function<void(PutResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   PutEntityImpl(nullptr, dbid, type_id, flags, blob, identifier, std::move(callback));
 }
 
@@ -112,6 +124,7 @@ void SqliteDatabase::PutEntityWithOperation(const DatabaseWriteOperation& operat
                                             std::span<const std::byte> blob,
                                             const std::string& identifier,
                                             std::function<void(PutResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   const bool allocated_create = HasFlag(operation.requested_flags, WriteFlags::kCreateNew) &&
                                 operation.requested_dbid == kInvalidDBID;
   if (!operation.IsValid() || (!allocated_create && dbid != operation.requested_dbid) ||
@@ -417,6 +430,7 @@ void SqliteDatabase::PutEntityWithPassword(DatabaseID dbid, uint16_t type_id, Wr
                                            const std::string& identifier,
                                            const std::string& password_hash,
                                            std::function<void(PutResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   PutResult result;
 
   if (!started_ || db_ == nullptr) {
@@ -598,6 +612,7 @@ void SqliteDatabase::PutEntityWithPassword(DatabaseID dbid, uint16_t type_id, Wr
 
 void SqliteDatabase::GetEntity(DatabaseID dbid, uint16_t type_id,
                                std::function<void(GetResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   GetResult result;
   auto row_result = FetchByDbid(dbid, type_id);
   if (!row_result) {
@@ -622,6 +637,7 @@ void SqliteDatabase::GetEntity(DatabaseID dbid, uint16_t type_id,
 
 void SqliteDatabase::DelEntity(DatabaseID dbid, uint16_t type_id,
                                std::function<void(DelResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   if (!started_ || db_ == nullptr) {
     FireOrDefer(std::move(callback), DelResult{false, "SQLite delete database unavailable"});
     return;
@@ -666,6 +682,7 @@ void SqliteDatabase::DelEntity(DatabaseID dbid, uint16_t type_id,
 
 void SqliteDatabase::LookupByName(uint16_t type_id, const std::string& identifier,
                                   std::function<void(LookupResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   LookupResult result;
   auto row_result = FetchByName(type_id, identifier);
   if (!row_result) {
@@ -686,6 +703,7 @@ void SqliteDatabase::LookupByName(uint16_t type_id, const std::string& identifie
 void SqliteDatabase::CheckoutEntity(DatabaseID dbid, uint16_t type_id,
                                     const CheckoutInfo& new_owner,
                                     std::function<void(GetResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   GetResult result;
   auto scope = BeginWriteScope();
   if (!scope) {
@@ -717,6 +735,7 @@ void SqliteDatabase::CheckoutEntity(DatabaseID dbid, uint16_t type_id,
 void SqliteDatabase::CheckoutEntityByName(uint16_t type_id, const std::string& identifier,
                                           const CheckoutInfo& new_owner,
                                           std::function<void(GetResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   GetResult result;
   auto scope = BeginWriteScope();
   if (!scope) {
@@ -823,6 +842,7 @@ void SqliteDatabase::CheckoutTail(EntityRow row, const CheckoutInfo& owner,
 
 void SqliteDatabase::ReleaseCheckout(DatabaseID dbid, uint16_t type_id, const CheckoutInfo& owner,
                                      std::function<void(Result<void>)> callback) {
+  if (!AdmitCallback(callback)) return;
   if (owner.ownership_version == 0 ||
       owner.ownership_version > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
     FireOrDefer(std::move(callback),
@@ -891,6 +911,7 @@ auto SqliteDatabase::CheckCheckoutProcess(const CheckoutInfo& owner) -> Result<v
 
 void SqliteDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t instance,
                                            std::function<void(Result<int>)> callback) {
+  if (!AdmitCallback(callback)) return;
   if (instance == 0 || instance > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
     FireOrDefer(std::move(callback), Result<int>{Error{ErrorCode::kInvalidArgument,
                                                        "invalid checkout process instance"}});
@@ -926,73 +947,78 @@ void SqliteDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t in
 }
 
 void SqliteDatabase::ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                                   std::function<void(bool)> callback) {
-  bool cleared = false;
-  const auto kNowMs = UnixTimeMs();
-  auto stmt_result = Prepare(
-      "UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
-      "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = ? "
-      "WHERE dbid = ? AND type_id = ? AND checked_out = 1");
-  if (stmt_result) {
-    auto stmt = std::move(*stmt_result);
-    auto rc = sqlite3_bind_int64(stmt.Get(), 1, kNowMs);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt.Get(), 2, dbid);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt.Get(), 3, static_cast<int>(type_id));
-    if (rc == SQLITE_OK && sqlite3_step(stmt.Get()) == SQLITE_DONE) {
-      cleared = sqlite3_changes(db_) > 0;
-    }
-  }
-
-  FireOrDefer(std::move(callback), std::move(cleared));
+                                   std::function<void(Result<bool>)> callback) {
+  if (!AdmitCallback(callback)) return;
+  auto clear = [&]() -> Result<bool> {
+    auto prepared = Prepare(
+        "UPDATE entities SET checked_out = 0, checkout_ip = 0, "
+        "checkout_port = 0, checkout_app_id = 0, checkout_eid = 0, "
+        "updated_at_ms = ? WHERE dbid = ? AND type_id = ? AND checked_out = 1");
+    if (!prepared) return prepared.Error();
+    auto statement = std::move(*prepared);
+    auto rc = sqlite3_bind_int64(statement.Get(), 1, UnixTimeMs());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement.Get(), 2, dbid);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement.Get(), 3, type_id);
+    if (rc != SQLITE_OK) return SqliteError("checkout clear bind failed", rc);
+    rc = sqlite3_step(statement.Get());
+    if (rc != SQLITE_DONE) return SqliteError("checkout clear failed", rc);
+    return sqlite3_changes(db_) > 0;
+  };
+  FireOrDefer(std::move(callback), clear());
 }
 
 void SqliteDatabase::ClearCheckoutsForAddress(const Address& base_addr,
-                                              std::function<void(int cleared_count)> callback) {
-  int cleared = 0;
-  const auto kNowMs = UnixTimeMs();
-  auto stmt_result = Prepare(
-      "UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
-      "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = ? "
-      "WHERE checked_out = 1 AND checkout_ip = ? AND checkout_port = ?");
-  if (stmt_result) {
-    auto stmt = std::move(*stmt_result);
-    auto rc = sqlite3_bind_int64(stmt.Get(), 1, kNowMs);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt.Get(), 2, base_addr.Ip());
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt.Get(), 3, base_addr.Port());
-    if (rc == SQLITE_OK && sqlite3_step(stmt.Get()) == SQLITE_DONE) {
-      cleared = sqlite3_changes(db_);
-    }
-  }
-
-  FireOrDefer(std::move(callback), std::move(cleared));
+                                              std::function<void(Result<int>)> callback) {
+  if (!AdmitCallback(callback)) return;
+  auto clear = [&]() -> Result<int> {
+    auto prepared = Prepare(
+        "UPDATE entities SET checked_out = 0, checkout_ip = 0, "
+        "checkout_port = 0, checkout_app_id = 0, checkout_eid = 0, "
+        "updated_at_ms = ? WHERE checked_out = 1 AND checkout_ip = ? "
+        "AND checkout_port = ?");
+    if (!prepared) return prepared.Error();
+    auto statement = std::move(*prepared);
+    auto rc = sqlite3_bind_int64(statement.Get(), 1, UnixTimeMs());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement.Get(), 2, base_addr.Ip());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement.Get(), 3, base_addr.Port());
+    if (rc != SQLITE_OK) return SqliteError("checkout address clear bind failed", rc);
+    rc = sqlite3_step(statement.Get());
+    if (rc != SQLITE_DONE) return SqliteError("checkout address clear failed", rc);
+    return sqlite3_changes(db_);
+  };
+  FireOrDefer(std::move(callback), clear());
 }
 
-void SqliteDatabase::MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id) {
-  const auto kNowMs = UnixTimeMs();
-  auto stmt_result = Prepare(
-      "UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
-      "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = ? "
-      "WHERE dbid = ? AND type_id = ? AND checked_out = 1");
-  if (!stmt_result) {
-    return;
-  }
-
-  auto stmt = std::move(*stmt_result);
-  auto rc = sqlite3_bind_int64(stmt.Get(), 1, kNowMs);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt.Get(), 2, dbid);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt.Get(), 3, static_cast<int>(type_id));
-  if (rc == SQLITE_OK) {
-    (void)sqlite3_step(stmt.Get());
-  }
+void SqliteDatabase::MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id,
+                                         std::function<void(Result<void>)> callback) {
+  if (!AdmitCallback(callback)) return;
+  auto mark = [&]() -> Result<void> {
+    auto prepared = Prepare(
+        "UPDATE entities SET checked_out = 0, checkout_ip = 0, "
+        "checkout_port = 0, checkout_app_id = 0, checkout_eid = 0, "
+        "updated_at_ms = ? WHERE dbid = ? AND type_id = ?");
+    if (!prepared) return prepared.Error();
+    auto statement = std::move(*prepared);
+    auto rc = sqlite3_bind_int64(statement.Get(), 1, UnixTimeMs());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement.Get(), 2, dbid);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement.Get(), 3, type_id);
+    if (rc != SQLITE_OK) return SqliteError("checkout mark bind failed", rc);
+    rc = sqlite3_step(statement.Get());
+    if (rc != SQLITE_DONE) return SqliteError("checkout mark failed", rc);
+    return {};
+  };
+  FireOrDefer(std::move(callback), mark());
 }
 
-void SqliteDatabase::GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) {
+void SqliteDatabase::GetAutoLoadEntities(
+    std::function<void(Result<std::vector<EntityData>>)> callback) {
+  if (!AdmitCallback(callback)) return;
   std::vector<EntityData> result;
   auto stmt_result = Prepare(
       "SELECT dbid, type_id, blob, identifier FROM entities WHERE auto_load = 1 "
       "ORDER BY type_id, dbid");
   if (!stmt_result) {
-    FireOrDefer(std::move(callback), std::move(result));
+    FireOrDefer(std::move(callback), Result<std::vector<EntityData>>{stmt_result.Error()});
     return;
   }
 
@@ -1003,7 +1029,9 @@ void SqliteDatabase::GetAutoLoadEntities(std::function<void(std::vector<EntityDa
       break;
     }
     if (rc != SQLITE_ROW) {
-      break;
+      FireOrDefer(std::move(callback),
+                  Result<std::vector<EntityData>>{SqliteError("auto-load query failed", rc)});
+      return;
     }
 
     EntityData data;
@@ -1021,29 +1049,33 @@ void SqliteDatabase::GetAutoLoadEntities(std::function<void(std::vector<EntityDa
     result.push_back(std::move(data));
   }
 
-  FireOrDefer(std::move(callback), std::move(result));
+  FireOrDefer(std::move(callback), Result<std::vector<EntityData>>{std::move(result)});
 }
 
-void SqliteDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load) {
-  const auto kNowMs = UnixTimeMs();
-  auto stmt_result = Prepare(
-      "UPDATE entities SET auto_load = ?, updated_at_ms = ? WHERE dbid = ? AND type_id = ?");
-  if (!stmt_result) {
-    return;
-  }
-
-  auto stmt = std::move(*stmt_result);
-  auto rc = sqlite3_bind_int(stmt.Get(), 1, auto_load ? 1 : 0);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt.Get(), 2, kNowMs);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt.Get(), 3, dbid);
-  if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt.Get(), 4, static_cast<int>(type_id));
-  if (rc == SQLITE_OK) {
-    (void)sqlite3_step(stmt.Get());
-  }
+void SqliteDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
+                                 std::function<void(Result<void>)> callback) {
+  if (!AdmitCallback(callback)) return;
+  auto update = [&]() -> Result<void> {
+    auto prepared = Prepare(
+        "UPDATE entities SET auto_load = ?, updated_at_ms = ? "
+        "WHERE dbid = ? AND type_id = ?");
+    if (!prepared) return prepared.Error();
+    auto statement = std::move(*prepared);
+    auto rc = sqlite3_bind_int(statement.Get(), 1, auto_load ? 1 : 0);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement.Get(), 2, UnixTimeMs());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement.Get(), 3, dbid);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement.Get(), 4, type_id);
+    if (rc != SQLITE_OK) return SqliteError("auto-load update bind failed", rc);
+    rc = sqlite3_step(statement.Get());
+    if (rc != SQLITE_DONE) return SqliteError("auto-load update failed", rc);
+    return {};
+  };
+  FireOrDefer(std::move(callback), update());
 }
 
 void SqliteDatabase::GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                                        std::function<void(DbidRangeResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   DbidRangeResult result;
 
   if (!started_ || db_ == nullptr) {
@@ -1094,6 +1126,7 @@ void SqliteDatabase::GetMaxDbidInRange(DatabaseID low, DatabaseID high,
 
 void SqliteDatabase::ReserveEntityIds(uint32_t count,
                                       std::function<void(Result<EntityIdRange>)> callback) {
+  if (!AdmitCallback(callback)) return;
   if (batch_txn_open_) {
     deferred_.push_back([this, count, cb = std::move(callback)]() mutable {
       ReserveEntityIds(count, std::move(cb));
@@ -1283,7 +1316,60 @@ auto SqliteDatabase::OpenDatabase(const DatabaseConfig& config) -> Result<void> 
   return {};
 }
 
-auto SqliteDatabase::EnsureSchema() -> Result<void> {
+auto SqliteDatabase::EnsureSchema(const Sha256Digest& storage_schema) -> Result<void> {
+  auto tables = Prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' "
+      "AND name NOT LIKE 'sqlite_%' LIMIT 1");
+  if (!tables) return tables.Error();
+  const auto step = sqlite3_step(tables->Get());
+  if (step != SQLITE_ROW && step != SQLITE_DONE)
+    return SqliteError("SqliteDatabase: cannot inspect existing schema", step);
+  tables->Reset();
+  if (step == SQLITE_ROW) {
+    auto version = Prepare("SELECT value FROM meta WHERE key = 'schema_version'");
+    if (!version)
+      return Error{
+          version.Error().Code(),
+          std::format("SqliteDatabase: cannot read schema_version: {}", version.Error().Message())};
+    const auto result = sqlite3_step(version->Get());
+    if (result != SQLITE_ROW && result != SQLITE_DONE)
+      return SqliteError("SqliteDatabase: cannot read schema_version", result);
+    if (result != SQLITE_ROW || sqlite3_column_type(version->Get(), 0) != SQLITE_TEXT ||
+        std::string_view(reinterpret_cast<const char*>(sqlite3_column_text(version->Get(), 0)),
+                         static_cast<std::size_t>(sqlite3_column_bytes(version->Get(), 0))) !=
+            std::to_string(kSqliteSchemaVersion))
+      return Error{ErrorCode::kInvalidArgument,
+                   "SqliteDatabase: missing or incompatible schema_version; use a new empty "
+                   "database with matching server binaries; automatic upgrade is disabled"};
+    auto format = Prepare("SELECT value FROM meta WHERE key = 'blob_format_version'");
+    if (!format) return format.Error();
+    const auto format_result = sqlite3_step(format->Get());
+    if (format_result != SQLITE_ROW && format_result != SQLITE_DONE)
+      return SqliteError("SqliteDatabase: cannot read blob_format_version", format_result);
+    if (format_result != SQLITE_ROW || sqlite3_column_type(format->Get(), 0) != SQLITE_TEXT ||
+        std::string_view(reinterpret_cast<const char*>(sqlite3_column_text(format->Get(), 0)),
+                         static_cast<std::size_t>(sqlite3_column_bytes(format->Get(), 0))) !=
+            std::to_string(kDbBlobVersion))
+      return Error{ErrorCode::kInvalidArgument,
+                   "SqliteDatabase: missing or incompatible blob_format_version"};
+    auto digest = Prepare("SELECT value FROM meta WHERE key = 'storage_schema_digest'");
+    if (!digest) return digest.Error();
+    const auto digest_result = sqlite3_step(digest->Get());
+    if (digest_result != SQLITE_ROW && digest_result != SQLITE_DONE)
+      return SqliteError("SqliteDatabase: cannot read storage_schema_digest", digest_result);
+    if (digest_result != SQLITE_ROW || sqlite3_column_type(digest->Get(), 0) != SQLITE_BLOB ||
+        sqlite3_column_bytes(digest->Get(), 0) != static_cast<int>(storage_schema.size()) ||
+        std::memcmp(sqlite3_column_blob(digest->Get(), 0), storage_schema.data(),
+                    storage_schema.size()) != 0)
+      return Error{ErrorCode::kInvalidArgument,
+                   "SqliteDatabase: missing or incompatible storage_schema_digest; "
+                   "database and entity definitions must have the same snapshot schema"};
+    return ExecSql("SELECT checkout_instance FROM entities LIMIT 0");
+  }
+
+  auto begin = ExecSql("BEGIN IMMEDIATE");
+  if (!begin) return begin.Error();
+  ScopeGuard rollback([this] { (void)ExecSql("ROLLBACK"); });
   auto schema_result = ExecSql(
       "CREATE TABLE IF NOT EXISTS entities ("
       "dbid INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -1308,27 +1394,10 @@ auto SqliteDatabase::EnsureSchema() -> Result<void> {
   auto columns = ExecSql("SELECT checkout_instance FROM entities LIMIT 0");
   if (!columns) return columns.Error();
 
-  auto created_at_result = ExecSqlIgnoringDuplicateColumn(
-      "ALTER TABLE entities ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0");
-  if (!created_at_result) {
-    return created_at_result.Error();
-  }
-
-  auto updated_at_result = ExecSqlIgnoringDuplicateColumn(
-      "ALTER TABLE entities ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0");
-  if (!updated_at_result) {
-    return updated_at_result.Error();
-  }
-
   auto meta_table_result =
       ExecSql("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   if (!meta_table_result) {
     return meta_table_result.Error();
-  }
-
-  auto schema_version_result = UpsertMeta("schema_version", std::to_string(kSqliteSchemaVersion));
-  if (!schema_version_result) {
-    return schema_version_result.Error();
   }
 
   auto index1 =
@@ -1403,23 +1472,33 @@ auto SqliteDatabase::EnsureSchema() -> Result<void> {
     return eid_table_result.Error();
   }
 
-  auto begin = ExecSql("BEGIN IMMEDIATE");
-  if (!begin) return begin.Error();
   auto seed = ExecSql(
       "INSERT OR IGNORE INTO atlas_entity_id_counter(id, next_id) "
       "SELECT 1, 1 WHERE NOT EXISTS "
       "(SELECT 1 FROM meta WHERE key = 'entity_id_counter_initialized'); "
       "INSERT OR IGNORE INTO meta(key, value) "
       "VALUES('entity_id_counter_initialized', '1')");
-  if (!seed) {
-    (void)ExecSql("ROLLBACK");
-    return seed.Error();
-  }
+  if (!seed) return seed.Error();
+  auto digest = Prepare("INSERT INTO meta(key, value) VALUES('storage_schema_digest', ?)");
+  if (!digest) return digest.Error();
+  auto bound = sqlite3_bind_blob(digest->Get(), 1, storage_schema.data(),
+                                 static_cast<int>(storage_schema.size()), SQLITE_TRANSIENT);
+  if (bound != SQLITE_OK) return SqliteError("SqliteDatabase: bind storage schema failed", bound);
+  auto stored = sqlite3_step(digest->Get());
+  if (stored != SQLITE_DONE)
+    return SqliteError("SqliteDatabase: store storage schema failed", stored);
+  digest->Reset();
+  auto format = ExecSql(std::format(
+      "INSERT INTO meta(key, value) VALUES('blob_format_version', '{}')", kDbBlobVersion));
+  if (!format) return format.Error();
+  auto version = ExecSql(std::format("INSERT INTO meta(key, value) VALUES('schema_version', '{}')",
+                                     kSqliteSchemaVersion));
+  if (!version) return version.Error();
   auto committed = ExecSql("COMMIT");
   if (!committed) {
-    (void)ExecSql("ROLLBACK");
     return Error{ErrorCode::kCommitUnknown, std::string(committed.Error().Message())};
   }
+  rollback.Dismiss();
   return {};
 }
 
@@ -1443,20 +1522,6 @@ auto SqliteDatabase::ExecSql(std::string_view sql) -> Result<void> {
   return Error{ErrorCode::kInternalError, std::move(message)};
 }
 
-auto SqliteDatabase::ExecSqlIgnoringDuplicateColumn(std::string_view sql) -> Result<void> {
-  auto result = ExecSql(sql);
-  if (result) {
-    return result;
-  }
-
-  if (std::string_view(result.Error().Message()).find("duplicate column name") !=
-      std::string_view::npos) {
-    return {};
-  }
-
-  return result.Error();
-}
-
 auto SqliteDatabase::Prepare(std::string_view sql) -> Result<Statement> {
   sqlite3_stmt* stmt = nullptr;
   auto rc = sqlite3_prepare_v2(db_, std::string(sql).c_str(), -1, &stmt, nullptr);
@@ -1464,28 +1529,6 @@ auto SqliteDatabase::Prepare(std::string_view sql) -> Result<Statement> {
     return SqliteError(std::format("SqliteDatabase: prepare failed '{}'", sql), rc);
   }
   return Statement{stmt};
-}
-
-auto SqliteDatabase::UpsertMeta(std::string_view key, std::string_view value) -> Result<void> {
-  auto stmt_result = Prepare("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)");
-  if (!stmt_result) {
-    return stmt_result.Error();
-  }
-
-  auto stmt = std::move(*stmt_result);
-  auto rc = sqlite3_bind_text(stmt.Get(), 1, std::string(key).c_str(), -1, SQLITE_TRANSIENT);
-  if (rc == SQLITE_OK)
-    rc = sqlite3_bind_text(stmt.Get(), 2, std::string(value).c_str(), -1, SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) {
-    return SqliteError("SqliteDatabase: meta bind failed", rc);
-  }
-
-  rc = sqlite3_step(stmt.Get());
-  if (rc != SQLITE_DONE) {
-    return SqliteError("SqliteDatabase: meta upsert failed", rc);
-  }
-
-  return {};
 }
 
 auto SqliteDatabase::FetchByDbid(DatabaseID dbid, uint16_t type_id) -> Result<EntityRow> {

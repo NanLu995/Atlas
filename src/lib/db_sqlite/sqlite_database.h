@@ -12,7 +12,9 @@
 
 #include <sqlite3.h>
 
+#include "db/database_failure.h"
 #include "db/write_operation.h"
+#include "foundation/callback_utils.h"
 #include "platform/filesystem.h"
 
 namespace atlas {
@@ -27,6 +29,10 @@ class SqliteDatabase : public IDatabase {
   [[nodiscard]] auto Startup(const DatabaseConfig& config, const EntityDefRegistry& entity_defs)
       -> Result<void> override;
   void Shutdown() override;
+  void BeginDrain() override;
+  [[nodiscard]] auto PendingOperations() const -> std::size_t override {
+    return pending_operations_;
+  }
 
   void PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                  std::span<const std::byte> blob, const std::string& identifier,
@@ -66,19 +72,21 @@ class SqliteDatabase : public IDatabase {
                        std::function<void(Result<void>)> callback) override;
 
   void ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                     std::function<void(bool)> callback) override;
+                     std::function<void(Result<bool>)> callback) override;
 
   void ClearCheckoutsForAddress(const Address& base_addr,
-                                std::function<void(int cleared_count)> callback) override;
+                                std::function<void(Result<int>)> callback) override;
 
   void RetireCheckoutProcess(const Address& base_addr, uint64_t instance,
                              std::function<void(Result<int>)> callback) override;
 
-  void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id) override;
+  void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id,
+                           std::function<void(Result<void>)> callback) override;
 
-  void GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) override;
+  void GetAutoLoadEntities(std::function<void(Result<std::vector<EntityData>>)> callback) override;
 
-  void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load) override;
+  void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
+                   std::function<void(Result<void>)> callback) override;
 
   void GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                          std::function<void(DbidRangeResult)> callback) override;
@@ -127,11 +135,9 @@ class SqliteDatabase : public IDatabase {
   };
 
   [[nodiscard]] auto OpenDatabase(const DatabaseConfig& config) -> Result<void>;
-  [[nodiscard]] auto EnsureSchema() -> Result<void>;
+  [[nodiscard]] auto EnsureSchema(const Sha256Digest& storage_schema) -> Result<void>;
   [[nodiscard]] auto ExecSql(std::string_view sql) -> Result<void>;
-  [[nodiscard]] auto ExecSqlIgnoringDuplicateColumn(std::string_view sql) -> Result<void>;
   [[nodiscard]] auto Prepare(std::string_view sql) -> Result<Statement>;
-  [[nodiscard]] auto UpsertMeta(std::string_view key, std::string_view value) -> Result<void>;
   [[nodiscard]] auto FetchByDbid(DatabaseID dbid, uint16_t type_id) -> Result<EntityRow>;
   [[nodiscard]] auto ReadAccountSessionImpl(DatabaseID dbid, uint16_t type_id)
       -> Result<AccountSession>;
@@ -150,6 +156,27 @@ class SqliteDatabase : public IDatabase {
       -> Result<void>;
   [[nodiscard]] auto SqliteError(std::string_view prefix) const -> Error;
   [[nodiscard]] auto SqliteError(std::string_view prefix, int code) const -> Error;
+  template <typename T>
+  [[nodiscard]] auto AdmitCallback(std::function<void(T)>& callback) -> bool {
+    Error error;
+    if (stopping_)
+      error = Error{ErrorCode::kReceiverGone, "database is stopping"};
+    else if (!started_)
+      error = Error{ErrorCode::kIoError, "database is not started"};
+    else if (pending_operations_ >= kMaxPendingOperations)
+      error = Error{ErrorCode::kRateLimited, "database operation capacity reached"};
+    if (error) {
+      callback(DatabaseFailure<T>(error));
+      return false;
+    }
+    ++pending_operations_;
+    callback = [this, cb = std::move(callback)](T result) mutable {
+      SafeInvoke("Database callback", [&] { cb(std::move(result)); });
+      --pending_operations_;
+    };
+    return true;
+  }
+
   template <typename T>
   void FireOrDefer(std::function<void(T)> callback, T result) {
     auto status = batch_txn_open_ ? batch_status_ : nullptr;
@@ -198,6 +225,8 @@ class SqliteDatabase : public IDatabase {
   const EntityDefRegistry* entity_defs_{nullptr};
   std::filesystem::path db_path_;
   bool started_{false};
+  bool stopping_{false};
+  std::size_t pending_operations_{0};
   bool deferred_mode_{false};
   std::deque<std::function<void()>> deferred_;
 

@@ -174,6 +174,30 @@ TEST_F(PendingRpcRegistryTest, DestroyingSuspendedCallerRemovesPendingWaiter) {
   EXPECT_FALSE(registry.TryDispatch(42, make_payload(100), &channel));
 }
 
+TEST_F(PendingRpcRegistryTest, RpcCallReportsOverloadAndStoppingWithoutSending) {
+  PendingRpcRegistry registry(dispatcher_);
+  InterfaceTable table;
+  RpcTestChannel channel(dispatcher_, table);
+  for (uint64_t id = 1000; id < 1000 + PendingRpcRegistry::kMaxPendingRpcs; ++id) {
+    ASSERT_TRUE(registry
+                    .RegisterPending(
+                        42, id, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero())
+                    .IsValid());
+  }
+  Result<TestRpcMessage> result{Error{ErrorCode::kInternalError}};
+  auto overloaded = AwaitTestRpc(registry, channel, result);
+  overloaded.operator co_await().await_suspend(std::noop_coroutine()).resume();
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kRateLimited);
+  EXPECT_EQ(channel.sends, 0);
+  registry.Shutdown();
+  auto stopped = AwaitTestRpc(registry, channel, result);
+  stopped.operator co_await().await_suspend(std::noop_coroutine()).resume();
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kReceiverGone);
+  EXPECT_EQ(channel.sends, 0);
+}
+
 TEST_F(PendingRpcRegistryTest, LocalReplyHandleCompletesOnceAndChecksRequestId) {
   PendingRpcRegistry registry(dispatcher_);
   const auto reply_id = msg_id::Id(msg_id::Common::kEntityRpcReply);

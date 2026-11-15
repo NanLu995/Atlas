@@ -85,6 +85,35 @@ ServerApp
 
 `ServerApp` 提供配置、machined 注册、watcher 指标、tick 回调与信号分发。`BaseApp` 和 `CellApp` 通过 `EntityApp` 扩展它，使 C# 玩法运行在 C++ 服务器核心之上。
 
+`BgTaskManager` 最多接纳 4,096 项任务，包含排队、执行中及等待主线程回调的结果。
+`AddTask` 在满载时返回 `RateLimited`，`StopAccepting` 后返回 `ReceiverGone`；
+被拒绝的提交不触发完成回调。工作返回 `Result<void>`，每个已接纳任务在调度线程回报结果。
+`CancelPending` 停止接单，并为尚未开始的工作回报 `Cancelled`，不打断已执行的工作。
+既有回调异常边界捕获的异常回报 `InternalError`。
+
+停服停止接单及正常模拟 tick，事件循环继续处理已接纳工作和回复；
+`ScriptEngine::Drain` / `Lifecycle.OnDrain` 继续推进托管续延，
+不执行实体 tick 和属性同步。停服后拒绝脚本新建实体、创建空间及传送请求；已有 Real 的
+重复创建请求保留已确认的回复。BaseApp 确认会话释放及持久化登出保存后才销毁实体；
+DBApp 排空已接纳操作和回调。默认截止时间为 30 秒。
+已知保存失败以失败状态退出；到期记录未确认工作并失败退出，不在 worker 析构处无限等待。
+强制退出仅保证已提交数据。按 LoginApp、BaseApp、CellApp/Manager、DBApp、machined 顺序
+关闭，依赖方排空期间保留存储及控制服务。集群工具每组等待 35 秒，非零退出或强杀均报失败。
+
+数据库接纳上限为 4,096 项，包含等待消费的回调。满载在执行前拒绝，返回 `RateLimited` /
+`kOverloaded`；排空时新工作返回 `ReceiverGone` / `kStopping`。`BeginDrain` 和
+`PendingOperations` 提供生命周期接口。checkout 清理及自动加载读写接口均通过 `Result`
+回调传递错误，不能把失败解释为空的成功结果。数据库插件须导出 `AtlasCreateDatabaseV3`。
+即时可靠 UDP 发送同样遵守发送窗口。每通道、每可靠性类别的延迟 Bundle 上限为
+256 KiB，满载时返回 `WouldBlock` 且不追加。RPC 调用区分满载 `RateLimited`、重复请求
+`AlreadyExists` 和停服 `ReceiverGone`，被拒绝的请求不发送。
+原生登录和认证在发送被拒绝时立即返回忙或传输错误，清理未启动的尝试，允许重新登录，
+不等待超时再报错。
+`atlas_tool watch` 返回成功前刷新输出；标准输出写入失败时以非零状态退出并向标准错误
+报告原因，不把未输出结果误报为成功。
+LoginApp 在已接纳登录处理期间暂停客户端的 3 秒空闲计时，结束后恢复；断线仍取消登录，
+既有 RPC 和客户端超时保持有效，不新增服务端整体登录截止时间。
+
 ## 环境要求
 
 Windows：
@@ -232,9 +261,9 @@ tools/bin/run_cluster.sh
 脚本化集群验证：
 
 ```bash
-tools/bin/test_cluster.sh
+tools/bin/test_cluster.sh --base-assembly <你的Base实体程序集>
 # Windows
-tools\bin\test_cluster.bat
+tools\bin\test_cluster.bat --base-assembly <你的Base实体程序集>
 ```
 
 `test_cluster` 支持 `--base-assembly <脚本.dll>`，用于为 BaseApp 加载测试脚本。
@@ -244,8 +273,12 @@ CMake 的 `atlas_rpc_fixture_base_dll_deploy`、`atlas_rpc_fixture_client_dll_de
 `--cell-assembly <脚本.dll>` 增加一个 CellAppMgr 和一个 CellApp；配套的
 `atlas_rpc_fixture_cell_dll_deploy` 目标构建 Cell 测试端。程序集缺失时在启动进程前报错，
 `--baseapps 2` 为移交验证启动第二个 BaseApp；运行清单及 READY 输出记录实际进程数及端点。
+`--log-level debug` 为本次隔离集群启用既有服务端诊断；C# 夹具可通过
+`ATLAS_TEST_CLUSTER_LOG_LEVEL` 传入相同设置，默认仍为 `info`。
 测试启动器的标准输入接受 `kill-baseapp <内部端口>` 注入崩溃，并以 `KILLED` 确认终止；
 只能终止本次启动器自己的存活 BaseApp 子进程。
+`shutdown-baseapp <内部端口>` 通过 machined 请求正常停服，只有进程零退出才确认
+`SHUTDOWN`；超时或非零退出使测试启动器失败。
 `restart-baseapp <内部端口>` 仅按原参数重启本次启动器已停止的 BaseApp，以 `RESTARTED`
 确认创建进程并保留此前日志；测试须另等注册就绪并检查旧会话不能重新取得控制权。
 
@@ -278,8 +311,24 @@ EntityID 经后端原子预留后才发放。MySQL 锁定计数行并等待提�
 DBApp 分片游标恢复同时查询左闭右开区间内的现存实体、持久操作回执结果及 checkout 版本历史。
 删除实体不删除其保留的回执或租约历史，因此这些已确认身份在重启后仍低于恢复的游标。
 备份必须包含这三类数据；此机制不承诺恢复被任意删除的元数据，也不将后端原始删除视为 ID 回收。
-多个 MySQL DBApp 同时启动时，先锁住已有结构元数据行，再读取初始化标记并建立 EntityID 计数器，
-统一锁顺序以避免初始化死锁。
+多个 MySQL DBApp 同时启动时，使用数据库范围的命名锁串行初始化结构。
+两个后端只初始化空库。已有库必须包含匹配的 `schema_version`（当前为 2）；
+标记缺失或不兼容时拒绝启动，不覆盖版本、不自动升级结构。请重建配套进程并使用新的
+隔离数据库；不提供旧格式迁移。SQLite 在一个事务中初始化结构和元数据。
+MySQL 建表中断可能留下不完整库，应检查处理，框架不会自动修补或写入兼容标记。
+启动还校验 SHA-256 `storage_schema_digest`，覆盖已注册实体字段、组件继承和槽位、
+结构体、嵌套容器及其顺序，不包含 RPC 声明。当前存档保存 Base/Cell 完整快照，
+未标记 `persistent` 的字段也会落盘，因此一并校验。摘要缺失或不匹配时拒绝启动，
+不覆盖已有摘要；修改已注册数据结构后须使用新库。
+`blob_format_version` 也必须匹配（当前为 2）。每份实体快照包含明确版本、Base/Cell 段长
+和 SHA-256 校验和；截断、篡改、尾随及无版本数据均拒绝。新账号使用编码后的空快照，
+显式保存和退出保存采用同一封装，包含最近一次 Cell 备份。此处 SHA-256 用于检测损坏，
+不能替代传输认证。
+ATDF 定义文件使用版本 4，包含整文件 SHA-256 校验和。定义缺失、为空或损坏时，DBApp 在
+打开存储前拒绝启动。登录认证、实体 checkout 和写入携带完整实体定义摘要，DBApp 在访问
+数据库前检查；BaseApp 等待 checkout 期间定义发生变化时，也拒绝完成装载。
+内联同步组件在实体槽位描述中携带类型名和展平字段，无需分配全局组件 ID。
+其字段和嵌套类型参与存档及定义校验；本地组件不进入快照持久化。
 
 事务提交失败返回结果不确定，不视为成功。SQLite 批量回调等待事务结果。
 Checkout 区分实体不存在与数据库错误。注销使用 `kLogOff` 在同次写入中释放 checkout；
@@ -302,8 +351,8 @@ MySQL 将请求 SHA-256 摘要及成功结果写入 `atlas_write_receipts`，与
 一秒；耗尽后记录错误并继续阻塞该数据库身份，晚到且匹配的成功回复仍可完成确认。
 DBApp 在条件释放成功，或数据库读取确认原租约已失效后，才确认成功。读取失败、原租约
 仍有效均不能确认释放；重复或旧 checkin 不会释放新租约。
-`baseapp/pending_checkin_count` 包含停止重试的记录。此确认依赖 BaseApp 事件循环运行，
-停服排空仍属后续工作。
+`baseapp/pending_checkin_count` 包含停止重试的记录。停服期间 BaseApp 保持事件循环运行，
+等待这些确认完成或达到停服截止时间。
 
 共享 MySQL 首次保存将创建实体、获取 checkout 和保存回执放在同一事务中。
 确认回复携带所有权版本；重放返回原 DBID 和版本。请求摘要绑定创建者地址、AppID
@@ -371,7 +420,7 @@ MySQL 和 SQLite 还独立于实体 checkout 保存账号会话所有权。带�
 持有者不可达、版本已改变或提交结果不确定时拒绝本次登录，不推断会话已经离线。
 登录检查及接收的撤销请求分别限制为 1024 项；取消登录检查后不能继续 checkout，
 取消等待不撤销已经完成的会话撤销。
-数据库插件须导出 `AtlasCreateDatabaseV2`，需同时重建两个插件及服务器；
+数据库插件须导出 `AtlasCreateDatabaseV3`，需同时重建两个插件及服务器；
 加载器明确拒绝旧接口，避免调用不兼容的虚函数表。
 出生及死亡通知只接受当前 machined 通道。即使仅订阅死亡回调，`MachinedClient` 仍跟踪进程实例；
 相同地址出现新实例时重建内部 RUDP 通道，旧实例的晚到死亡通知被忽略。
@@ -427,12 +476,13 @@ CLI 读取。缺少库名/用户/密码、参数无效、插件不可用或连�
 
 ```bat
 rem 默认 MySQL；使用现有隔离开发库和本地配置。
-tools\bin\test_cluster.bat --database-config <本地DBApp配置>
+tools\bin\test_cluster.bat --database-config <本地DBApp配置> --base-assembly <你的Base实体程序集>
 tools\bin\run_login_stress.bat --database-config <本地DBApp配置>
 tools\bin\run_world_stress.bat --database-config <本地DBApp配置>
 rem 显式单 DBApp 快速冒烟，不作为 MySQL 验收。
-tools\bin\test_cluster.bat --db-backend sqlite
-bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3
+tools\bin\test_cluster.bat --db-backend sqlite --base-assembly <你的Base实体程序集>
+dotnet build/debug/csharp/Atlas.Tools.DefDump.dll --assembly <你的Base实体程序集> --out .tmp/sqlite-smoke/entity_defs.bin
+bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3 --entitydef-bin-path .tmp/sqlite-smoke/entity_defs.bin
 ```
 
 Linux 使用同名 `tools/bin/*.sh` 包装和 `bin/debug/atlas_dbapp`，参数相同。SQLite 专用构建
@@ -440,6 +490,13 @@ Linux 使用同名 `tools/bin/*.sh` 包装和 `bin/debug/atlas_dbapp`，参数�
 显式设置 `ATLAS_TEST_DB_BACKEND=sqlite` 才选择冒烟范围。工具输出 `database-run.json`，记录
 后端、拓扑和范围，控制台/READY 也标明后端。SQLite 结果标记为 `sqlite_smoke_only`，不能作为
 容量或共享存储验收结论。
+
+DBApp 在打开数据库前必须加载包含实体类型和非零定义摘要的 ATDF 文件。集群工具使用配套
+构建的 DefDump，从选定的 Base 程序集导出到本次运行目录。`test_cluster` 必须传入
+`--base-assembly`；登录及世界压测默认使用压测 Base 程序集，也支持显式覆盖。
+客户端摘要来自该导出，不再读取其他构建 `obj` 中的生成源码。DefDump 在加载程序集前检查
+离线导出契约，仅在导出进程内跳过生成的原生注册。旧生成程序集须重建。
+只导出可信程序集：其他用户编写的模块初始化仍可能执行。
 
 SQLite 在规范化的本地存档路径旁持有操作系统文件锁，覆盖连接整个生命周期。同一存档的
 第二个 Atlas 实例在访问结构和数据前失败；进程退出后锁释放，`.atlas-lock` 文件保留。
@@ -530,7 +587,36 @@ public partial class Avatar : ClientEntity
 容器（`list[T]`、`dict[K,V]`、`list[list[int32]]` …）与用户 `<struct>` 类型同样通过 setter 路径以字段级 / op-log 级别 delta 复制；完整覆盖矩阵参见 `entity_defs/StressAvatar.def` 与 `samples/stress/`。
 
 实体 RPC 请求与回复头使用 64 位请求 ID。生成的 ID 在服务器进程内不复用，耗尽时拒绝新调用。
-原生 ABI 版本 10 要求运行时、服务器及生成调用代码一起重建，不支持旧 RPC 消息头。
+原生 ABI 版本 11 要求运行时、服务器及生成调用代码一起重建，不支持旧 RPC 消息头。
+CLR 宿主在绑定回调和生命周期前校验 Bootstrap 及服务端生命周期 ABI。
+托管服务端和桌面端初始化也在注册前校验已加载引擎 DLL 的 ABI；版本入口缺失或不匹配
+时明确报错并停止初始化。
+
+Base 脚本可等待 `PersistToDbAsync(ct)`，返回 `AtlasTask<RpcReply<long>>`，成功值为数据库
+确认后的 DBID。确定的数据库拒绝返回失败；提交未确认或 DBApp 断线返回 `OutcomeUnknown`，
+原生恢复逻辑继续保留并隔离该写入。取消和超时只停止等待，不撤销已经发出的写入。
+`PersistToDb()` 仅发起请求，本地接单失败时抛出异常。
+
+Cell 脚本通过 `AddProximity(range, userArg)` 创建邻近控制器，并重写 `OnProximityEnter` /
+`OnProximityLeave`。事件经现有主线程队列在原生范围更新返回后执行，因此回调可以安全取消
+控制器。执行前复核原实体及其生命周期，销毁、Ghost 或已取消的实体不接收事件。非法或负
+半径返回零，零半径仍受支持；通过 `CancelController(id)` 取消。队列回调异常由现有队列记录。
+
+`StartTimer` 只接受有限的正间隔，拒绝时返回零。定时器通知仍在主线程同步执行；脚本异常
+记录到日志，不遗留原生 CLR 错误。Ghost、已销毁或生命周期已取消的实体不执行定时器回调。
+热重载在卸载前取消旧实例的原生定时器，脚本在 `OnInit(isReload: true)` 中重新创建。
+
+可选 EDR SDK 的 `AtlasEdrEntityComponentAtSlot` 同时支持具名及内联组件；内联组件的
+类型 ID 为零，结构描述属于所在槽位。
+每个 EDR Context 只允许一次加载尝试；失败会清空部分定义，重试须新建 Context。成功后
+定义保持只读，返回的视图有效至 Context 销毁。
+服务端 `NativeApi` 必须在主 tick 线程调用；线程守卫在 Debug 下断言，Release 调用方同样须遵守
+该契约。输入 Span 仅在调用期间借用，异步持久化在返回前复制快照。原生快照消费者在下一次
+序列化回调或运行时重置可能释放固定缓冲区前完成复制。
+`Time.DeltaTime` 读取所属 BaseApp/CellApp 的 `GameClock.FrameDelta` 秒数，包含该时钟的
+时间缩放；首个 tick 前、暂停和时钟重置后为零。`Time.ServerTime` 为起点未指定的单调
+时钟秒数，不是 UTC 时间戳。
+`SpaceMaster.Register` 属于 BaseApp 操作；不支持的 Provider 会明确记录错误。
 等待注册遇到重复键时明确拒绝，不替换原等待者。回复必须来自注册的通道，重复、晚到及
 错误通道的回复不能完成该等待者。取消表示停止等待，并阻止发送前已取消的生成调用；
 不承诺撤销远端已经执行的工作。
@@ -546,7 +632,7 @@ CellApp 将托管 RPC 等待接入原生注册表。Cell 到 Base、Ghost 到 Re
 每个原生注册表最多保留 4096 个发起方等待和 4096 个回复上下文；每个托管注册表最多
 保留 4096 个等待。完成、取消或清理后释放容量，超限注册失败，不替换原等待者。
 BaseApp、CellApp 在结束流程卸载脚本前关闭 RPC 注册表；关闭后拒绝新请求，
-包括清理回调中重入的注册。此行为不代表完整的停服任务排空已经实现。
+包括清理回调中重入的注册。
 生成的单向 Mailbox 和组件发送方法返回 `RpcSendResult`：`Queued`、`InvalidTarget`、
 `Overloaded`、`Stopping`、`SendFailed`、`PartiallyQueued`。已入队只确认本地分发或传输
 接纳，不确认远端已执行。广播汇总所有尝试的 BaseApp 和 Ghost 通道；部分入队表示至少
@@ -628,6 +714,11 @@ Godot 进程设置 `ATLAS_GODOT_TEST_HANDOFF=1`，验证错误目标身份拒绝
 远端切换，在准备前明确拒绝。认证协议和原生 API 已变更，须配套重建全部 SDK 和服务器。
 远端脚本等待上限为 40 秒；取消等待不撤销远端已经执行的工作。
 RUDP 接口不共享已绑定的端点；重复绑定返回 `AddressInUse`，显式指定客户端源端口时也一样。
+TCP 帧和 UDP/RUDP 数据报使用连接协议版本 1，前缀为 `ATLS` 和小端 16 位版本号。
+TCP 随后是 32 位负载长度；UDP/RUDP 保留前缀之后的原有负载和报头。
+TCP 版本不匹配时断开；不匹配或截断的数据报在分配对端通道前丢弃。
+RUDP 的 MTU 与分片计算包含六字节前缀。服务器、SDK 和协议工具须配套重建，
+不保留无版本流量的兼容路径；Mesh gossip 保留独立版本。
 
 ## Profiling 与压测
 

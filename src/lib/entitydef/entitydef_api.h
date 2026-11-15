@@ -35,6 +35,7 @@ ATLAS_EDR_API AtlasEdrContext* AtlasEdrCreate(uint32_t expected_abi);
 
 ATLAS_EDR_API void AtlasEdrDestroy(AtlasEdrContext* ctx);
 
+// One load attempt per ctx; failures clear partial data. Create a new ctx to retry.
 ATLAS_EDR_API int32_t AtlasEdrLoadFromFile(AtlasEdrContext* ctx, const char* path);
 ATLAS_EDR_API int32_t AtlasEdrLoadFromBuffer(AtlasEdrContext* ctx, const uint8_t* data, int32_t len);
 
@@ -112,7 +113,7 @@ ATLAS_EDR_API int32_t AtlasEdrComponentPropertyCount(const AtlasEdrComponent* co
 ATLAS_EDR_API const AtlasEdrProperty* AtlasEdrComponentPropertyAt(const AtlasEdrComponent* comp,
                                                                    int32_t index);
 
-// Null when the slot is unallocated.
+// Inline components have type ID zero; missing slots return null.
 ATLAS_EDR_API const AtlasEdrComponent* AtlasEdrEntityComponentAtSlot(
     AtlasEdrContext* ctx, const AtlasEdrEntity* entity, uint8_t slot_idx);
 

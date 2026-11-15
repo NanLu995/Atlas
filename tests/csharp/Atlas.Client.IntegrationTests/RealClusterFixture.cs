@@ -57,6 +57,11 @@ public sealed class RealClusterFixture : IDisposable
         arguments.Add(baseapps.ToString());
         arguments.Add("--build-dir");
         arguments.Add(Path.GetFileName(Environment.GetEnvironmentVariable("ATLAS_BIN_DIR") ?? "debug"));
+        if (Environment.GetEnvironmentVariable("ATLAS_TEST_CLUSTER_LOG_LEVEL") is { Length: > 0 } level)
+        {
+            arguments.Add("--log-level");
+            arguments.Add(level);
+        }
         if (!string.IsNullOrEmpty(assembly))
         {
             arguments.Add("--base-assembly");
@@ -128,7 +133,8 @@ public sealed class RealClusterFixture : IDisposable
 
     private void TeardownAndThrow(string message)
     {
-        Dispose();
+        try { Dispose(); }
+        catch (Exception error) { throw new InvalidOperationException(message, error); }
         throw new InvalidOperationException(message);
     }
 
@@ -138,13 +144,16 @@ public sealed class RealClusterFixture : IDisposable
     internal void RestartBaseApp(ushort internalPort)
         => ControlBaseApp("restart-baseapp", "RESTARTED", internalPort);
 
+    internal void ShutdownBaseApp(ushort internalPort)
+        => ControlBaseApp("shutdown-baseapp", "SHUTDOWN", internalPort);
+
     private void ControlBaseApp(string command, string status, ushort internalPort)
     {
         if (!_baseInternalPorts.Contains(internalPort) || _launcher is null)
             throw new InvalidOperationException("BaseApp is not in this test topology");
         _launcher.StandardInput.WriteLine($"{command} {internalPort}");
         _launcher.StandardInput.Flush();
-        var deadline = DateTime.UtcNow.AddSeconds(10);
+        var deadline = DateTime.UtcNow.AddSeconds(command == "shutdown-baseapp" ? 45 : 10);
         while (DateTime.UtcNow < deadline)
         {
             var reply = _launcher.StandardOutput.ReadLineAsync()
@@ -165,6 +174,10 @@ public sealed class RealClusterFixture : IDisposable
     }
 
     internal int BaseAppCount() => WatcherCount("baseappmgr:baseappmgr", "baseappmgr/baseapp_count");
+    internal int AvailableBaseAppCount()
+        => WatcherCount("baseappmgr:baseappmgr", "baseappmgr/available_baseapp_count");
+    internal int RpcReplyCount()
+        => WatcherCount("baseapp:baseapp", "baseapp/rpc_reply_count");
 
     private int WatcherCount(string target, string path)
     {
@@ -185,7 +198,8 @@ public sealed class RealClusterFixture : IDisposable
         var fields = output.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         if (process.ExitCode != 0 || fields.Length != 2 || !int.TryParse(fields[1], out var count))
             throw new InvalidOperationException(
-                $"Watcher {target} {path} failed (exit={process.ExitCode}): {output} {error}");
+                $"Watcher {target} {path} failed (pid={process.Id}, exit={process.ExitCode}, " +
+                $"stdout={output.Length}, stderr={error.Length}): {output} {error}");
         return count;
     }
 
@@ -194,18 +208,21 @@ public sealed class RealClusterFixture : IDisposable
         if (_launcher is null) return;
         try
         {
-            // Closing stdin signals test_cluster.py's readline loop to exit;
-            // its finally clause then runs stop_logged_processes.
             _launcher.StandardInput.Close();
-            if (!_launcher.WaitForExit(15_000))
+            if (!_launcher.WaitForExit(210_000))
             {
                 _launcher.Kill(entireProcessTree: true);
                 _launcher.WaitForExit(5_000);
+                throw new TimeoutException("Cluster teardown exceeded its ordered drain budgets");
             }
+            if (_launcher.ExitCode != 0)
+                throw new InvalidOperationException($"Cluster teardown failed: exit={_launcher.ExitCode}");
         }
-        catch { /* teardown is best-effort */ }
-        _launcher.Dispose();
-        _launcher = null;
+        finally
+        {
+            _launcher.Dispose();
+            _launcher = null;
+        }
     }
 
     private static string ResolveRepoRoot()

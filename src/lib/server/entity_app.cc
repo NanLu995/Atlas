@@ -10,6 +10,15 @@ EntityApp::EntityApp(EventDispatcher& dispatcher, NetworkInterface& network)
 
 EntityApp::~EntityApp() = default;
 
+void EntityApp::BeginShutdown() {
+  bg_task_manager_.StopAccepting();
+  ScriptApp::BeginShutdown();
+}
+
+auto EntityApp::PendingShutdownOperations() const -> std::size_t {
+  return ScriptApp::PendingShutdownOperations() + bg_task_manager_.InFlightCount();
+}
+
 auto EntityApp::Init(int argc, char* argv[]) -> bool {
   if (!ScriptApp::Init(argc, argv)) return false;
 

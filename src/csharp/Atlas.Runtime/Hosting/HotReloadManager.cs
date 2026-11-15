@@ -136,7 +136,11 @@ internal static class HotReloadManager
     internal static void CancelLifecyclesAndDrain(IReadOnlyCollection<ServerEntity> entities)
     {
         foreach (var entity in entities)
+        {
             entity.TriggerLifecycleCancellation();
+            entity.CancelTimersForReload();
+        }
+        EngineContext.SyncContext?.ProcessQueue();
         if (AtlasLoop.Current is not ManagedAtlasLoop loop) return;
         for (int i = 0; i < kDrainPasses; i++)
         {

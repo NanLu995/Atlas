@@ -256,6 +256,22 @@ class CellAppHandlersTest : public ::testing::Test {
   }
 };
 
+TEST_F(CellAppHandlersTest, NativeDeltaTimeUsesTheAppGameClock) {
+  native_provider_holder_ = app_.CreateNativeProviderForTest();
+  auto& clock = app_.GetGameClock();
+  EXPECT_FLOAT_EQ(native_provider_holder_->DeltaTime(), 0.f);
+  clock.Tick(std::chrono::milliseconds(25));
+  EXPECT_FLOAT_EQ(native_provider_holder_->DeltaTime(), 0.025f);
+  clock.SetTimeScale(0.5);
+  clock.Tick(std::chrono::milliseconds(40));
+  EXPECT_FLOAT_EQ(native_provider_holder_->DeltaTime(), 0.02f);
+  clock.SetTimeScale(0.0);
+  clock.Tick(std::chrono::milliseconds(40));
+  EXPECT_FLOAT_EQ(native_provider_holder_->DeltaTime(), 0.f);
+  clock.Reset();
+  EXPECT_FLOAT_EQ(native_provider_holder_->DeltaTime(), 0.f);
+}
+
 using test_support::FakeChannel;
 
 TEST_F(CellAppHandlersTest, CreateCellEntityUsesUnifiedEntityId) {
@@ -855,6 +871,30 @@ TEST_F(CellAppHandlersTest, CreateLocalEntityFailsWhenIDClientEmpty) {
   EXPECT_EQ(id, kInvalidEntityID);
 }
 
+TEST_F(CellAppHandlersTest, ShutdownRejectsCreationButKeepsExistingRealAcknowledgement) {
+  auto existing = MakeCreate(100, 1);
+  existing.request_id = 7;
+  app_.OnCreateCellEntity({}, nullptr, existing);
+  ASSERT_NE(app_.FindEntity(100), nullptr);
+  auto& ids = const_cast<IDClient&>(app_.GetIdClientForTest());
+  ids.AddIds(500, 600);
+  const auto available = ids.Available();
+  app_.Shutdown();
+  EXPECT_EQ(app_.CreateLocalEntity(1, 1, {}, {}, false), kInvalidEntityID);
+  EXPECT_EQ(ids.Available(), available);
+  InterfaceTable table;
+  RecordingChannel channel(dispatcher_, table, Address("127.0.0.1", 24002));
+  app_.OnCreateCellEntity({}, &channel, existing);
+  EXPECT_TRUE(CellEntityCreateFailures(channel).empty());
+  auto created = MakeCreate(200, 1);
+  created.request_id = 8;
+  app_.OnCreateCellEntity({}, &channel, created);
+  EXPECT_EQ(app_.FindEntity(200), nullptr);
+  const auto failures = CellEntityCreateFailures(channel);
+  ASSERT_EQ(failures.size(), 1u);
+  EXPECT_EQ(failures[0].request_id, 8u);
+}
+
 TEST_F(CellAppHandlersTest, NativeProviderSetPositionResolvesLocalEntity) {
   auto& id_client = const_cast<IDClient&>(app_.GetIdClientForTest());
   id_client.AddIds(500, 600);
@@ -1097,8 +1137,7 @@ auto RegisterTypeWithRpc(uint16_t type_id, uint32_t rpc_id, ExposedScope scope) 
   w.WritePackedInt(rpc_id);
   w.WritePackedInt(0);  // 0 params
   w.Write<uint8_t>(static_cast<uint8_t>(scope));
-  w.Write<uint8_t>(0);  // compression
-  w.Write<uint8_t>(0);
+  w.WritePackedInt(0);
   auto buf = w.Detach();
   EntityDefRegistry::Instance().RegisterType(buf.data(), static_cast<int32_t>(buf.size()));
 }

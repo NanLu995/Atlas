@@ -286,7 +286,8 @@ TEST_F(ReliableUdpTest, FragmentTableCappedUnderAttack) {
     buf[off++] = std::byte{0};
     buf[off++] = std::byte{255};
     buf[off++] = std::byte{0xAB};
-    channel_b.OnDatagramReceived(std::span<const std::byte>(buf.data(), off));
+    channel_b.OnDatagramReceived(
+        WithConnectionProtocolHeader(std::span<const std::byte>(buf.data(), off)));
   }
 
   EXPECT_LE(channel_b.PendingFragmentGroupCount(), 16u);
@@ -313,7 +314,7 @@ TEST_F(ReliableUdpTest, AckOnlyDatagramBumpsInactivity) {
   std::memcpy(ack_buf.data() + 1, &ack_num, 4);
   std::memcpy(ack_buf.data() + 5, &ack_bits, 4);
   std::memcpy(ack_buf.data() + 9, &una, 4);
-  channel_a.OnDatagramReceived(std::span<const std::byte>(ack_buf));
+  channel_a.OnDatagramReceived(WithConnectionProtocolHeader(ack_buf));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   dispatcher_.ProcessOnce();
@@ -1589,6 +1590,31 @@ struct RudpTestMsgBatched {
     return m;
   }
 };
+
+TEST_F(ReliableUdpTest, DeferredWindowBackpressureIsQueuedUntilByteCapacityRejects) {
+  auto socket = Socket::CreateUdp();
+  ASSERT_TRUE(socket);
+  ASSERT_TRUE(socket->Bind(Address("127.0.0.1", 0)));
+  ReliableUdpChannel channel(dispatcher_, table_, *socket, Address("127.0.0.1", 1));
+  channel.Activate();
+  channel.SetSendWindow(1);
+  channel.SetDeferredFlushThreshold(350);
+  channel.Bundle().AddMessage(RudpTestMsg{1});
+  ASSERT_TRUE(channel.SendReliable());
+  int accepted = 0;
+  for (int i = 0; i < 2000; ++i) {
+    auto result = channel.SendMessage(RudpTestMsgBatched{});
+    if (!result) {
+      EXPECT_EQ(result.Error().Code(), ErrorCode::kWouldBlock);
+      break;
+    }
+    ++accepted;
+  }
+  EXPECT_GT(accepted, 1);
+  EXPECT_LT(accepted, 2000);
+  for (int i = 0; i < 100; ++i) EXPECT_FALSE(channel.SendMessage(RudpTestMsgBatched{}));
+  EXPECT_EQ(channel.UnackedCount(), 1u);
+}
 
 TEST_F(ReliableUdpTest, SendMessageBatchedNotifiesDirtyAndAutoFlushes) {
   // SendMessage with a kBatched descriptor must:

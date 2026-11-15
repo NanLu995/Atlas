@@ -103,23 +103,7 @@ internal static class TypeRegistryEmitter
         sb.AppendLine($"            writer.WritePackedUInt32({(uint)effectiveProps.Count});");
         for (int i = 0; i < effectiveProps.Count; i++)
         {
-            var prop = effectiveProps[i];
-            var topKind = ResolveTopLevelKind(prop);
-            sb.AppendLine($"            writer.WriteString(\"{prop.Name}\");");
-            sb.AppendLine($"            writer.WriteByte({(byte)topKind});");
-            sb.AppendLine($"            writer.WriteByte({(byte)prop.Scope});");
-            sb.AppendLine($"            writer.WriteBool({(prop.Persistent ? "true" : "false")});");
-            sb.AppendLine($"            writer.WriteByte(5);");  // detail_level default
-            sb.AppendLine($"            writer.WriteUInt16({(ushort)i});");
-            sb.AppendLine($"            writer.WriteBool(false);");  // identifier (not parsed from .def yet)
-            sb.AppendLine($"            writer.WriteBool({(prop.Reliable ? "true" : "false")});");
-
-            // Wire format consumed by RegisterType in entity_def_registry.cc.
-            if (prop.TypeRef is not null && IsContainer(topKind))
-            {
-                EmitDataTypeRefBody(sb, prop.TypeRef);
-                sb.AppendLine($"            writer.WritePackedUInt32({prop.MaxSize});");
-            }
+            EmitProperty(sb, effectiveProps[i], i);
         }
 
         // Slot encoded into rpc_id so C++ registry treats body + components alike.
@@ -167,20 +151,47 @@ internal static class TypeRegistryEmitter
         // Slot table tail — lets ATDF readers map slot_idx → component_type_id
         // without the C# runtime. Local components (SlotIdx == -1) are skipped.
         var syncedSlots = def.Components
-            .Where(c => c.Locality == ComponentLocality.Synced && c.SlotIdx >= 0
-                        && c.ComponentTypeId > 0)
+            .Where(c => c.Locality == ComponentLocality.Synced && c.SlotIdx > 0)
             .ToList();
         sb.AppendLine($"            writer.WritePackedUInt32({(uint)syncedSlots.Count});");
         foreach (var c in syncedSlots)
         {
             sb.AppendLine($"            writer.WriteUInt16({(ushort)c.SlotIdx});");
             sb.AppendLine($"            writer.WriteString(\"{c.SlotName}\");");
-            sb.AppendLine($"            writer.WriteUInt16({(ushort)c.ComponentTypeId});");
+            sb.AppendLine($"            writer.WriteUInt16({(ushort)System.Math.Max(0, c.ComponentTypeId)});");
             sb.AppendLine($"            writer.WriteByte({(byte)c.Scope});");
             sb.AppendLine($"            writer.WriteBool({(c.Lazy ? "true" : "false")});");
+            if (c.ComponentTypeId <= 0)
+            {
+                sb.AppendLine($"            writer.WriteString(\"{c.TypeName}\");");
+                var fields = ComponentEmitter.FlattenChain(c);
+                sb.AppendLine($"            writer.WritePackedUInt32({(uint)fields.Count});");
+                foreach (var field in fields)
+                    EmitProperty(sb, field.Prop, field.PropIdx);
+            }
         }
 
         sb.AppendLine("    }");
+    }
+
+    private static void EmitProperty(StringBuilder sb, PropertyDefModel prop, int index)
+    {
+        var topKind = ResolveTopLevelKind(prop);
+        sb.AppendLine($"            writer.WriteString(\"{prop.Name}\");");
+        sb.AppendLine($"            writer.WriteByte({(byte)topKind});");
+        sb.AppendLine($"            writer.WriteByte({(byte)prop.Scope});");
+        sb.AppendLine($"            writer.WriteBool({(prop.Persistent ? "true" : "false")});");
+        sb.AppendLine($"            writer.WriteByte(5);");  // detail_level default
+        sb.AppendLine($"            writer.WriteUInt16({(ushort)index});");
+        sb.AppendLine($"            writer.WriteBool(false);");  // identifier (not parsed from .def yet)
+        sb.AppendLine($"            writer.WriteBool({(prop.Reliable ? "true" : "false")});");
+
+        // Wire format consumed by RegisterType in entity_def_registry.cc.
+        if (prop.TypeRef is not null && IsContainer(topKind))
+        {
+            EmitDataTypeRefBody(sb, prop.TypeRef);
+            sb.AppendLine($"            writer.WritePackedUInt32({prop.MaxSize});");
+        }
     }
 
     internal static PropertyDataKind ResolveTopLevelKind(PropertyDefModel prop)

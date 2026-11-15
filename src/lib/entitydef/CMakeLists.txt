@@ -6,7 +6,7 @@ add_library(atlas_entitydef STATIC
 
 target_include_directories(atlas_entitydef PUBLIC "${CMAKE_SOURCE_DIR}/src/lib")
 target_link_libraries(atlas_entitydef
-  PUBLIC atlas_foundation atlas_serialization atlas_compiler_options
+  PUBLIC atlas_foundation atlas_platform atlas_serialization atlas_compiler_options
 )
 
 # atlas_entitydef_client — C ABI SHARED DLL exposing EntityDefRegistry to

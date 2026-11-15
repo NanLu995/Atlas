@@ -242,3 +242,18 @@ TEST(Bundle, MultipleFinalizeRoundTrips) {
   EXPECT_FALSE(data2.empty());
   EXPECT_TRUE(b.empty());
 }
+
+TEST(BundleAdmission, OverflowPreservesEarlierMessagesAndRejectsRepeatedGrowth) {
+  Bundle bundle;
+  ASSERT_TRUE(bundle.TryAddMessage(BundleTestMsg{1}, 16));
+  const auto size = bundle.TotalSize();
+  for (int i = 0; i < 100; ++i) {
+    auto rejected = bundle.TryAddMessage(BundleTestMsg{2}, size);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.Error().Code(), ErrorCode::kWouldBlock);
+    EXPECT_EQ(bundle.TotalSize(), size);
+    EXPECT_EQ(bundle.MessageCount(), 1u);
+  }
+  EXPECT_FALSE(bundle.Finalize().empty());
+  EXPECT_TRUE(bundle.empty());
+}

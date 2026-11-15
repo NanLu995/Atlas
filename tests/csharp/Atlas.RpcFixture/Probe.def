@@ -1,5 +1,6 @@
 <entity name="Probe">
   <base_methods>
+    <method name="Save" exposed="own_client" reply="int64" />
     <method name="BaseEcho" reply="int32">
       <arg name="value" type="int32" />
     </method>
@@ -11,6 +12,7 @@
     </method>
   </base_methods>
   <cell_methods>
+    <method name="CheckProximityCancellation" exposed="own_client" reply="int32" />
     <method name="Echo" exposed="own_client" reply="int32">
       <arg name="value" type="int32" />
     </method>

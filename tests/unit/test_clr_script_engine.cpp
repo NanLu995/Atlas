@@ -159,7 +159,13 @@ class ClrScriptEngineTest : public ::testing::Test {
     EngineScope& operator=(const EngineScope&) = delete;
   };
 
-  struct TestProvider : BaseNativeProvider {};
+  struct TestProvider : BaseNativeProvider {
+    int cancelled_timers{0};
+    float delta_time{0.f};
+    float DeltaTime() override { return delta_time; }
+    auto AddTimerController(uint32_t, float, bool, int32_t) -> int32_t override { return 1; }
+    void CancelController(uint32_t, int32_t) override { ++cancelled_timers; }
+  };
 
   static ClrHost s_host;
   static std::optional<DynamicLibrary> s_engine_lib;
@@ -172,9 +178,37 @@ std::optional<DynamicLibrary> ClrScriptEngineTest::s_engine_lib{};
 bool ClrScriptEngineTest::s_bootstrapped = false;
 ClrScriptEngineTest::TestProvider ClrScriptEngineTest::s_provider{};
 
-// ============================================================================
-// Test 1: Full lifecycle — EngineInit → OnInit → OnTick → OnShutdown → EngineShutdown
-// ============================================================================
+TEST_F(ClrScriptEngineTest, IncompatibleManagedAbiIsRejectedBeforeLifecycleBinding) {
+  auto verified = VerifyClrAbi(s_host, test_dll(),
+                               "Atlas.RuntimeTest.IncompatibleLifecycle, Atlas.RuntimeTest");
+  ASSERT_FALSE(verified.HasValue());
+  EXPECT_NE(verified.Error().Message().find("ABI mismatch"), std::string_view::npos)
+      << verified.Error().Message();
+}
+
+TEST_F(ClrScriptEngineTest, TimerExceptionsAreLoggedAndCancelledLifecyclesCannotFire) {
+  EngineScope scope(*this);
+  ASSERT_TRUE(scope.ok);
+  ClrStaticMethod<int32_t> check;
+  ASSERT_TRUE(bind(check, "CheckCallbacks",
+                   "Atlas.RuntimeTest.TimerCallbackEntryPoint, Atlas.RuntimeTest"));
+  const int cancelled_before = s_provider.cancelled_timers;
+  auto result = check.Invoke();
+  ASSERT_TRUE(result.HasValue()) << result.Error().Message();
+  EXPECT_EQ(*result, 0);
+  EXPECT_EQ(s_provider.cancelled_timers, cancelled_before + 1);
+}
+
+TEST_F(ClrScriptEngineTest, ManagedBootstrapAbiMatchesTheNativeHost) {
+  auto verified = VerifyClrAbi(s_host, test_dll(), "Atlas.Core.Bootstrap, Atlas.ClrHost");
+  ASSERT_TRUE(verified.HasValue()) << verified.Error().Message();
+}
+
+TEST_F(ClrScriptEngineTest, MissingManagedAbiIsRejected) {
+  auto verified = VerifyClrAbi(s_host, test_dll(), kLifecycleType);
+  ASSERT_FALSE(verified.HasValue());
+  EXPECT_NE(verified.Error().Message().find("ABI version entry missing"), std::string_view::npos);
+}
 
 TEST_F(ClrScriptEngineTest, FullLifecycle) {
   EngineScope scope(*this);
@@ -183,10 +217,12 @@ TEST_F(ClrScriptEngineTest, FullLifecycle) {
   ClrFallibleMethod<uint8_t> on_init;
   ClrFallibleMethod<float> on_tick;
   ClrFallibleMethod<> on_shutdown;
+  ClrFallibleMethod<> on_drain;
 
   ASSERT_TRUE(bind(on_init, "OnInit"));
   ASSERT_TRUE(bind(on_tick, "OnTick"));
   ASSERT_TRUE(bind(on_shutdown, "OnShutdown"));
+  ASSERT_TRUE(bind(on_drain, "OnDrain"));
 
   auto r2 = on_init.Invoke(uint8_t{0});
   ASSERT_TRUE(r2.HasValue()) << r2.Error().Message();
@@ -195,6 +231,9 @@ TEST_F(ClrScriptEngineTest, FullLifecycle) {
     auto r = on_tick.Invoke(0.016f);
     ASSERT_TRUE(r.HasValue()) << "on_tick frame " << i << ": " << r.Error().Message();
   }
+
+  auto drained = on_drain.Invoke();
+  ASSERT_TRUE(drained.HasValue()) << drained.Error().Message();
 
   auto r4 = on_shutdown.Invoke();
   ASSERT_TRUE(r4.HasValue()) << r4.Error().Message();
@@ -215,18 +254,18 @@ TEST_F(ClrScriptEngineTest, LogInfoForwarding) {
   EXPECT_EQ(*r, 0);
 }
 
-// ============================================================================
-// Test 3: Time.DeltaTime through NativeApi
-// ============================================================================
-
 TEST_F(ClrScriptEngineTest, DeltaTimeQuery) {
   ClrStaticMethod<int, float*> get_dt;
   ASSERT_TRUE(bind(get_dt, "GetDeltaTime"));
 
-  float dt = -1.0f;
-  auto r = get_dt.Invoke(&dt);
-  ASSERT_TRUE(r.HasValue()) << r.Error().Message();
-  EXPECT_GE(dt, 0.0f);
+  for (float expected : {0.f, 0.025f, 0.02f, 0.f}) {
+    s_provider.delta_time = expected;
+    float dt = -1.0f;
+    auto result = get_dt.Invoke(&dt);
+    ASSERT_TRUE(result.HasValue()) << result.Error().Message();
+    EXPECT_EQ(*result, 0);
+    EXPECT_FLOAT_EQ(dt, expected);
+  }
 }
 
 // ============================================================================

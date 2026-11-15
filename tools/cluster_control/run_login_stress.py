@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -18,6 +17,7 @@ from common.paths import REPO_ROOT, resolve_repo_root  # noqa: F401
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from common.cluster import (
     LoggedProcess,
+    export_entity_definitions,
     resolve_program,
     start_logged_process,
     stop_logged_processes,
@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bring up a local Atlas cluster and run login_stress.")
     parser.add_argument("--build-dir", default="build/debug")
     parser.add_argument("--config", default="Debug")
+    parser.add_argument("--base-assembly", type=Path,
+                        help="Base entity assembly (default: bin/<build>/Atlas.StressTest.Base.dll).")
     parser.add_argument("--machined-host", default="127.0.0.1")
     parser.add_argument("--machined-port", type=int, default=20018)
     parser.add_argument("--login-port", type=int, default=20013)
@@ -216,24 +218,6 @@ def build_loginapp_args(args: argparse.Namespace, machined_address: str) -> list
     return loginapp_args
 
 
-_DIGEST_FILE = (
-    Path("samples") / "stress" / "Atlas.StressTest.Base" / "obj" / "generated"
-    / "Atlas.Generators.Def" / "Atlas.Generators.Def.DefGenerator"
-    / "EntityDefDigest.g.cs"
-)
-_DIGEST_RE = re.compile(r'Sha256Hex\s*=\s*"([0-9A-Fa-f]{64})"')
-
-
-def load_entity_def_digest(repo_root: Path) -> str:
-    path = repo_root / _DIGEST_FILE
-    if not path.is_file():
-        fail(f"EntityDefDigest.g.cs not found at {path}; build the C# stress projects first.")
-    match = _DIGEST_RE.search(path.read_text(encoding="utf-8"))
-    if not match:
-        fail(f"Could not extract Sha256Hex from {path}.")
-    return match.group(1)
-
-
 def build_stress_args(
     args: argparse.Namespace, worker: dict[str, object], entity_def_digest: str
 ) -> list[str]:
@@ -309,6 +293,7 @@ def main() -> int:
     bin_base = repo_root / "bin" / bin_name
     runtime_config = repo_root / "runtime" / "atlas_server.runtimeconfig.json"
     runtime_assembly = bin_base / "Atlas.Runtime.dll"
+    base_assembly = args.base_assembly or bin_base / "Atlas.StressTest.Base.dll"
 
     search_subdirs = []
     atlas_tool = resolve_program(repo_root, bin_name, search_subdirs, "atlas_tool")
@@ -328,8 +313,7 @@ def main() -> int:
     assert_file_exists(login_stress, login_stress.name)
     assert_file_exists(runtime_config, runtime_config.name)
     assert_file_exists(runtime_assembly, runtime_assembly.name)
-
-    entity_def_digest = load_entity_def_digest(repo_root)
+    assert_file_exists(base_assembly, base_assembly.name)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_root = repo_root / ".tmp" / "login-stress" / timestamp
@@ -339,6 +323,12 @@ def main() -> int:
 
     log_dir.mkdir(parents=True, exist_ok=True)
     db_dir.mkdir(parents=True, exist_ok=True)
+    entitydef_path = run_root / "entity_defs.bin"
+    try:
+        entity_def_digest = export_entity_definitions(
+            repo_root, bin_name, base_assembly, entitydef_path)
+    except RuntimeError as error:
+        fail(str(error))
 
     database = database_config(args, db_dir / 'atlas_login_stress.sqlite3')
     record_database_run(run_root, database, baseapps=args.baseapp_count, cellapps=0)
@@ -412,7 +402,7 @@ def main() -> int:
                         "--external-port",
                         str(baseapp_spec["external_port"]),
                         "--assembly",
-                        str(runtime_assembly),
+                        str(base_assembly),
                         "--runtime-config",
                         str(runtime_config),
                         "--update-hertz",
@@ -442,6 +432,8 @@ def main() -> int:
                     str(args.dbapp_port),
                     "--config",
                     str(db_config_path),
+                    "--entitydef-bin-path",
+                    str(entitydef_path),
                     "--update-hertz",
                     "50",
                     "--log-level",

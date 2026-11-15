@@ -62,6 +62,13 @@ add_test(NAME test_database_tools
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_database_tools.py)
 set_tests_properties(test_database_tools PROPERTIES LABELS "unit")
 add_subdirectory(integration)
+if(TARGET atlas_tool AND TARGET machined AND TARGET atlas_baseappmgr)
+  add_test(NAME test_atlas_tool_output
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/integration/test_atlas_tool_output.py"
+      --bin-dir "$<TARGET_FILE_DIR:atlas_tool>")
+  set_tests_properties(test_atlas_tool_output PROPERTIES LABELS "integration" TIMEOUT 120)
+endif()
 add_subdirectory(parity)
 
 if(ATLAS_BUILD_CSHARP)

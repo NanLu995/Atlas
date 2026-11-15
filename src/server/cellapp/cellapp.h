@@ -305,6 +305,9 @@ class CellApp : public EntityApp, public CellMovementHost {
   }
 
  protected:
+  void BeginShutdown() override;
+  void OnShutdownTick() override;
+  [[nodiscard]] auto PendingShutdownOperations() const -> std::size_t override;
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
 

@@ -203,8 +203,7 @@ void RegisterTypeWithRpc(uint16_t type_id, uint32_t rpc_id, ExposedScope scope) 
   w.WritePackedInt(rpc_id);
   w.WritePackedInt(0);  // 0 params
   w.Write<uint8_t>(static_cast<uint8_t>(scope));
-  w.Write<uint8_t>(0);  // compression
-  w.Write<uint8_t>(0);
+  w.WritePackedInt(0);
   auto buf = w.Detach();
   EntityDefRegistry::Instance().RegisterType(buf.data(), static_cast<int32_t>(buf.size()));
 }

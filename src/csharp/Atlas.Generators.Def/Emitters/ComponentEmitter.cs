@@ -180,7 +180,7 @@ internal static class ComponentEmitter
     // Walks the base chain bottom-up (most-base first), emits each level's
     // properties tagged with their hierarchy-flat propIdx. Order matches
     // the wire layout produced by setters: base props before own props.
-    private static List<(PropertyDefModel Prop, int PropIdx)> FlattenChain(ComponentDefModel c)
+    internal static List<(PropertyDefModel Prop, int PropIdx)> FlattenChain(ComponentDefModel c)
     {
         var chain = new List<ComponentDefModel>();
         for (var cur = c; cur != null; cur = cur.Base) chain.Add(cur);

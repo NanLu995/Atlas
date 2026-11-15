@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
 using Atlas.Serialization;
 
 namespace Atlas.Tools.DefDump;
@@ -10,9 +11,7 @@ namespace Atlas.Tools.DefDump;
 public static class Program
 {
     private const uint FileMagic = 0x46445441u;  // 'A''T''D''F' little-endian
-    // v3 adds the 32-byte SHA-256 digest right after the flags word so UE
-    // / DBApp loaders pick it up without round-tripping through C# bootstrap.
-    private const ushort FileVersion = 3;
+    private const ushort FileVersion = 4;
 
     public static int Main(string[] args)
     {
@@ -34,12 +33,36 @@ public static class Program
                     PrintUsage(); return 0;
             }
         }
-        if (digestOnly is not null) return PrintDigestOnly(digestOnly);
+        if (digestOnly is not null)
+        {
+            try { return PrintDigestOnly(digestOnly); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"DefDump: cannot inspect '{digestOnly}': {ex.Message}");
+                return 2;
+            }
+        }
         if (assemblyPath is null || outPath is null)
         {
             PrintUsage();
             return 1;
         }
+
+        try
+        {
+            if (ReadMetadataConstant(assemblyPath, "Atlas.Def.DefBootstrap", "OfflineExportVersion")
+                is not int exportVersion || exportVersion != 1)
+            {
+                Console.Error.WriteLine($"DefDump: '{assemblyPath}' lacks offline export support; rebuild the entity definitions with the current generator");
+                return 3;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"DefDump: cannot inspect '{assemblyPath}': {ex.Message}");
+            return 2;
+        }
+        AppContext.SetSwitch("Atlas.EntityDef.ExportOnly", true);
 
         // Without this, the first generated-type touch hits AssemblyResolveError.
         var assemblyDir = Path.GetDirectoryName(Path.GetFullPath(assemblyPath));
@@ -68,6 +91,7 @@ public static class Program
         var componentBlobs = TryCollectBlobs(target, "Atlas.Def.DefComponentRegistry");
         var typeBlobs = TryCollectBlobs(target, "Atlas.Def.DefEntityTypeRegistry");
         var digest = TryGetDigest(target);
+        if (digest is null) return 3;
 
         try
         {
@@ -77,7 +101,7 @@ public static class Program
                 w.WriteUInt32(FileMagic);
                 w.WriteUInt16(FileVersion);
                 w.WriteUInt16(0);  // flags
-                w.WriteRawBytes(digest);  // 32-byte SHA-256 (zeros if unavailable)
+                w.WriteRawBytes(digest);
 
                 w.WritePackedUInt32((uint)structBlobs.Count);
                 foreach (var blob in structBlobs)
@@ -99,6 +123,9 @@ public static class Program
                     w.WritePackedUInt32((uint)blob.Length);
                     w.WriteRawBytes(blob);
                 }
+
+                var checksum = SHA256.HashData(w.WrittenSpan);
+                w.WriteRawBytes(checksum);
 
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
                 File.WriteAllBytes(outPath, w.WrittenSpan.ToArray());
@@ -122,14 +149,15 @@ public static class Program
     }
 
     // Bytes is ReadOnlySpan<byte> — can't box across reflection — so reach the
-    // s_bytes backing field DigestEmitter generates. 32 zeros if not present.
-    private static byte[] TryGetDigest(Assembly asm)
+    // s_bytes backing field DigestEmitter generates.
+    private static byte[]? TryGetDigest(Assembly asm)
     {
         var t = asm.GetType("Atlas.Rpc.EntityDefDigest", throwOnError: false);
         var fld = t?.GetField("s_bytes", BindingFlags.NonPublic | BindingFlags.Static);
-        if (fld?.GetValue(null) is byte[] bytes && bytes.Length == 32) return bytes;
-        Console.Error.WriteLine("DefDump: EntityDefDigest.s_bytes unreadable (writing zero digest)");
-        return new byte[32];
+        if (fld?.GetValue(null) is byte[] bytes && bytes.Length == 32 &&
+            Array.Exists(bytes, value => value != 0)) return bytes;
+        Console.Error.WriteLine("DefDump: valid EntityDefDigest.s_bytes missing; rebuild the entity definitions");
+        return null;
     }
 
     private static System.Collections.Generic.List<byte[]> TryCollectBlobs(Assembly asm, string typeName)
@@ -162,16 +190,12 @@ public static class Program
             "Atlas.Tools.DefDump --digest-only <path-to-assembly.dll>");
     }
 
-    // MetadataLoadContext path: reads EntityDefDigest.Sha256Hex without ever
-    // running the assembly's ModuleInitializer, so server-side assemblies that
-    // would otherwise PInvoke into uninitialised native providers stay quiet.
-    private static int PrintDigestOnly(string assemblyPath)
+    private static object? ReadMetadataConstant(string assemblyPath, string typeName, string fieldName)
     {
         var dir = Path.GetDirectoryName(Path.GetFullPath(assemblyPath));
         if (dir is null)
         {
-            Console.Error.WriteLine($"DefDump: cannot resolve directory of {assemblyPath}");
-            return 2;
+            throw new ArgumentException($"Cannot resolve directory of {assemblyPath}");
         }
         var runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location);
         var resolverPaths = new System.Collections.Generic.List<string>();
@@ -181,9 +205,13 @@ public static class Program
         using var mlc = new System.Reflection.MetadataLoadContext(
             new System.Reflection.PathAssemblyResolver(resolverPaths));
         var asm = mlc.LoadFromAssemblyPath(Path.GetFullPath(assemblyPath));
-        var t = asm.GetType("Atlas.Rpc.EntityDefDigest");
-        var fld = t?.GetField("Sha256Hex", BindingFlags.Public | BindingFlags.Static);
-        var hex = fld?.GetRawConstantValue() as string;
+        var t = asm.GetType(typeName);
+        return t?.GetField(fieldName, BindingFlags.Public | BindingFlags.Static)?.GetRawConstantValue();
+    }
+
+    private static int PrintDigestOnly(string assemblyPath)
+    {
+        var hex = ReadMetadataConstant(assemblyPath, "Atlas.Rpc.EntityDefDigest", "Sha256Hex") as string;
         if (string.IsNullOrEmpty(hex))
         {
             Console.Error.WriteLine($"DefDump: EntityDefDigest.Sha256Hex missing in {assemblyPath}");

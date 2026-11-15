@@ -83,7 +83,7 @@ auto BaseApp::OnPrepareClientHandoff(IntrusivePtr<Channel> channel,
     respond(Error{ErrorCode::kPermissionDenied, "unregistered client handoff process"});
     co_return;
   }
-  if (rpc_registry_.IsStopping()) {
+  if (IsShuttingDown() || rpc_registry_.IsStopping()) {
     respond(Error{ErrorCode::kReceiverGone, "BaseApp is stopping"});
     co_return;
   }

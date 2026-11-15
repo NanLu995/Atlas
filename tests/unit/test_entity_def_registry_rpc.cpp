@@ -10,8 +10,6 @@ namespace atlas {
 
 namespace {
 
-// Encodes the minimal TypeRegistryEmitter descriptor shape needed by these
-// tests: {type header, rpc list, compression tail}.
 struct RpcSpec {
   std::string name;
   uint32_t rpc_id;
@@ -35,9 +33,7 @@ auto MakeDescriptor(std::string_view type_name, uint16_t type_id, bool has_cell,
     for (auto pt : r.params) w.Write<uint8_t>(static_cast<uint8_t>(pt));
     w.Write<uint8_t>(static_cast<uint8_t>(r.exposed));
   }
-  // Compression tail (internal/external): none.
-  w.Write<uint8_t>(0);
-  w.Write<uint8_t>(0);
+  w.WritePackedInt(0);
   return w.Detach();
 }
 

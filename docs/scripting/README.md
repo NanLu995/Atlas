@@ -82,12 +82,18 @@ Atlas 服务端的玩法脚本运行在嵌入式 .NET CoreCLR 上;`Atlas.Generat
 | 方向 | C# 入口 | C++ 入口 |
 |---|---|---|
 | 引擎握手 | `Atlas.Core.Bootstrap.Initialize(BootstrapArgs*, ObjectVTableOut*)`(in `Atlas.ClrHost`) | `clr_bootstrap()` → `ClrHost::GetMethodAs<>` |
-| 引擎生命周期 | `Atlas.Core.Lifecycle.{EngineInit, EngineShutdown, OnInit, OnTick, OnShutdown}` | `ClrScriptEngine::{Initialize, OnInit, OnTick, OnShutdown, Finalize}` |
+| 引擎生命周期 | `Atlas.Core.Lifecycle.{EngineInit, EngineShutdown, OnInit, OnTick, OnDrain, OnShutdown}` | `ClrScriptEngine::{Initialize, OnInit, OnTick, Drain, OnShutdown, Finalize}` |
 | C# → C++ | `Atlas.Core.NativeApi` 的 `[LibraryImport]` 方法（EntryPoint=`Atlas*`） | `ATLAS_NATIVE_API_TABLE` X-macro 展开的 `Atlas*` 导出函数 |
 | C++ → C# | C++ 端缓存的 `[UnmanagedCallersOnly]` 函数指针 | `Atlas.Generators.Def` 生成的 RPC dispatcher / EntityFactory |
 | 错误桥 | `Atlas.Core.ErrorBridge.SetError(ex)`(`Atlas.ClrHost`) | `clr_error_set / clear / get_code`(thread-local;DLL 内导出 `AtlasGetClrError*Fn` 提供函数指针) |
 | GCHandle 桥 | `Atlas.Core.GCHandleHelper`(`Atlas.ClrHost`) 提供 7 个 `[UnmanagedCallersOnly]` | `ClrObjectVTable` 一次性注入,所有 `ClrObject` 共享 |
 | 热重载 | `Atlas.Hosting.HotReloadManager.{SerializeAndUnload, LoadAndRestore}` | `ClrHotReload::Reload / ProcessPending` |
+
+Cell 邻近事件使用 `CellServerEntity.AddProximity` 和 `OnProximityEnter` / `OnProximityLeave`，
+经现有主线程队列延迟分发；销毁、迁移取消和热重载后不执行旧实例事件，回调中可取消控制器。
+Base 持久化确认使用 `PersistToDbAsync`，返回 `RpcReply<long>` 中已确认的 DBID；取消等待不
+撤销写入，`OutcomeUnknown` 保留原生待决写入。完整失败边界见根目录中英文 README。
+定时器事件异常记录日志；热重载在卸载前取消旧实例的原生定时器，脚本需重新创建定时器。
 
 ## 5. 测试矩阵速览
 
@@ -128,7 +134,7 @@ Atlas 服务端的玩法脚本运行在嵌入式 .NET CoreCLR 上;`Atlas.Generat
 | 示例脚本 | `samples/base/`(Account / Avatar)、`samples/client/`(StressAvatar + Component) |
 | 热重载基础设施 | `clr_hot_reload.{h,cc}` + `file_watcher.{h,cc}` + `Hosting/{ScriptHost, ScriptLoadContext, HotReloadManager}.cs` |
 | 热重载接入 + 测试 | `ScriptApp::Init` 读 `ServerConfig.enable_hot_reload` 等字段构造 `ClrHotReload`,`OnTickComplete` 驱动 `Poll/ProcessPending`;集成测试 `tests/integration/test_hot_reload.cpp` |
-| C++ 测试 | `tests/unit/test_clr_*` + `test_script_*` + `test_native_api_*` + `test_entity_def_registry_*`；`test_clr_script_engine.cpp` 覆盖 EngineInit → OnInit → OnTick → OnShutdown → EngineShutdown |
+| C++ 测试 | `tests/unit/test_clr_*` + `test_script_*` + `test_native_api_*` + `test_entity_def_registry_*`；`test_clr_script_engine.cpp` 覆盖 EngineInit → OnInit → OnTick → OnDrain → OnShutdown → EngineShutdown |
 | C# 测试 | `Atlas.Runtime.Tests`、`Atlas.Generators.Tests`、`Atlas.Client.Tests` |
 | 集成 forwarder / 冒烟 | `Atlas.RuntimeTest` + `Atlas.SmokeTest` |
 

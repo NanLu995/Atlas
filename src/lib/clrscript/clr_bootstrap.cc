@@ -2,6 +2,7 @@
 
 #include <format>
 
+#include "clrscript/clr_export.h"
 #include "foundation/error.h"
 #include "foundation/log.h"
 
@@ -13,6 +14,8 @@ using BootstrapFn = int (*)(ClrBootstrapArgs*, ClrObjectVTableOut*);
 
 auto ClrBootstrapImpl(ClrHost& host, const std::filesystem::path& runtime_dll,
                       ClrBootstrapArgs args) -> Result<void> {
+  auto abi = VerifyClrAbi(host, runtime_dll, "Atlas.Core.Bootstrap, Atlas.ClrHost");
+  if (!abi) return abi.Error();
   auto method = host.GetMethodAs<BootstrapFn>(runtime_dll, "Atlas.Core.Bootstrap, Atlas.ClrHost",
                                               "Initialize");
   if (!method)
@@ -48,6 +51,21 @@ auto ClrBootstrapImpl(ClrHost& host, const std::filesystem::path& runtime_dll,
 }
 
 }  // namespace
+
+auto VerifyClrAbi(ClrHost& host, const std::filesystem::path& assembly, std::string_view type_name)
+    -> Result<void> {
+  auto version = host.GetMethodAs<uint32_t (*)()>(assembly, type_name, "GetAbiVersion");
+  if (!version)
+    return Error{ErrorCode::kScriptError,
+                 std::format("Managed ABI version entry missing for {}: {}", type_name,
+                             version.Error().Message())};
+  const auto actual = (*version)();
+  if (actual != kAtlasAbiVersion)
+    return Error{ErrorCode::kScriptError,
+                 std::format("Managed ABI mismatch for {}: expected {}, received {}", type_name,
+                             kAtlasAbiVersion, actual)};
+  return {};
+}
 
 auto ClrBootstrap(ClrHost& host, const std::filesystem::path& runtime_dll) -> Result<void> {
   return ClrBootstrapImpl(host, runtime_dll, ClrBootstrapArgs{});

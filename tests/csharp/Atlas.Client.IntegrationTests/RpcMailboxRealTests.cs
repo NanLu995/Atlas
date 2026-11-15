@@ -48,6 +48,11 @@ public sealed class RpcMailboxRealTests
             Assert.Equal(71, (await Await(account.Base.Reject())).Error);
             Assert.Equal(RpcSendResult.Queued, account.Base.Notify(73));
             Assert.Equal(73, (await Await(account.Base.ReadNotification())).Value);
+            var saved = await Await(account.Base.Save(false));
+            Assert.True(saved.IsOk, saved.ErrorMessage);
+            Assert.True(saved.Value > 0);
+            Assert.Equal(saved.Value, (await Await(account.Base.Save(false))).Value);
+            Assert.Equal(RpcErrorCodes.Cancelled, (await Await(account.Base.Save(true))).Error);
             Assert.Equal(RpcErrorCodes.Timeout,
                 (await Await(account.Base.DelayedEcho(33, 300, timeoutMs: 20))).Error);
             using var cancellation = new AtlasCancellationSource();
@@ -68,6 +73,14 @@ public sealed class RpcMailboxRealTests
             Assert.True(attached.IsOk, attached.ErrorMessage);
             Pump(() => ready == attached.Value);
             var probe = Assert.IsType<RpcProbe>(session.EntityManager.Get(attached.Value));
+            var firstSave = await Await(probe.Base.Save());
+            Assert.True(firstSave.IsOk, firstSave.ErrorMessage);
+            Assert.True(firstSave.Value > 0);
+            Assert.NotEqual(saved.Value, firstSave.Value);
+            Assert.Equal(firstSave.Value, (await Await(probe.Base.Save())).Value);
+            var proximity = await Await(probe.Cell.CheckProximityCancellation());
+            Assert.True(proximity.IsOk, proximity.ErrorMessage);
+            Assert.Equal(1, proximity.Value);
             Assert.Equal(101, (await Await(probe.Cell.Echo(101))).Value);
             Assert.Equal(102, (await Await(probe.Base.ViaCell(102))).Value);
             Assert.Equal(103, (await Await(probe.Cell.ViaBase(103))).Value);

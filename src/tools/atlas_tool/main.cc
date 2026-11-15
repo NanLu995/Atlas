@@ -175,7 +175,11 @@ static auto CmdWatch(EventDispatcher& dispatcher, MachinedClient& client, const 
                              watcher_path);
     return 1;
   }
-  std::cout << std::format("{:<24} {}\n", source_name, value);
+  std::cout << std::format("{:<24} {}\n", source_name, value) << std::flush;
+  if (!std::cout) {
+    std::cerr << "watch: stdout write failed\n";
+    return 1;
+  }
   return 0;
 }
 

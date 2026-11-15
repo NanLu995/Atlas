@@ -1,5 +1,6 @@
 #include "network/tcp_channel.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 
@@ -97,13 +98,24 @@ auto TcpChannel::PeekFrameLength() const -> std::optional<uint32_t> {
   }
 
   uint32_t frame_length = 0;
-  std::memcpy(&frame_length, header.data(), sizeof(frame_length));
+  std::memcpy(&frame_length, header.data() + kConnectionProtocolHeader.size(),
+              sizeof(frame_length));
   return endian::FromLittle(frame_length);
 }
 
 void TcpChannel::ProcessRecvBuffer() {
   while (true) {
     auto available = recv_buffer_.ReadableSize();
+
+    if (available >= kConnectionProtocolHeader.size()) {
+      std::array<std::byte, kConnectionProtocolHeader.size()> protocol{};
+      if (!recv_buffer_.PeekFront(protocol) || !HasConnectionProtocolHeader(protocol)) {
+        ATLAS_LOG_WARNING("TcpChannel incompatible connection protocol from {}; expected {}",
+                          remote_.ToString(), kConnectionProtocolVersion);
+        OnDisconnect();
+        return;
+      }
+    }
 
     if (available < kFrameHeaderSize) {
       break;
@@ -170,8 +182,10 @@ void TcpChannel::OnWritable() {
 
 auto TcpChannel::DoSend(std::span<const std::byte> data) -> Result<size_t> {
   uint32_t frame_length = endian::ToLittle(static_cast<uint32_t>(data.size()));
-  auto header = std::span<const std::byte>(reinterpret_cast<const std::byte*>(&frame_length),
-                                           sizeof(uint32_t));
+  std::array<std::byte, kFrameHeaderSize> header{};
+  std::copy(kConnectionProtocolHeader.begin(), kConnectionProtocolHeader.end(), header.begin());
+  std::memcpy(header.data() + kConnectionProtocolHeader.size(), &frame_length,
+              sizeof(frame_length));
 
   if (!write_buffer_.EnsureWritable(header.size() + data.size())) {
     return Error(ErrorCode::kWouldBlock, "Write buffer full");

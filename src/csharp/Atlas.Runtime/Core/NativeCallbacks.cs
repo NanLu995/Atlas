@@ -509,21 +509,22 @@ internal static unsafe class NativeCallbacks
                 return;
             }
 
-            // Log at Debug until OnProximityEnter/Leave is generator-emitted.
-            if (isEnter != 0)
+            if (isEnter > 1) throw new ArgumentOutOfRangeException(nameof(isEnter));
+            if (entity is CellServerEntity cell && !cell.IsGhost && !cell.IsDestroyed &&
+                !cell.LifecycleCancellation.IsCancellationRequested)
             {
-                Log.Debug(
-                    $"ProximityEvent: entity={entityId} userArg={userArg} peer={peerEntityId} ENTER");
-            }
-            else
-            {
-                Log.Debug(
-                    $"ProximityEvent: entity={entityId} userArg={userArg} peer={peerEntityId} LEAVE");
+                var context = EngineContext.SyncContext
+                    ?? throw new InvalidOperationException("Engine synchronization context is missing");
+                context.Post(_ =>
+                {
+                    if (ReferenceEquals(EntityManager.Instance.Get(entityId), cell))
+                        cell.DispatchProximity(userArg, peerEntityId, isEnter != 0);
+                }, null);
             }
         }
         catch (Exception ex)
         {
-            ErrorBridge.SetError(ex);
+            Log.Error($"ProximityEvent failed for entity {entityId}: {ex}");
         }
     }
 
@@ -551,7 +552,7 @@ internal static unsafe class NativeCallbacks
         }
         catch (Exception ex)
         {
-            ErrorBridge.SetError(ex);
+            Log.Error($"Timer callback failed for entity {entityId}: {ex}");
         }
     }
 

@@ -13,6 +13,7 @@
 #include "entitydef/entity_type_descriptor.h"
 #include "entitydef/struct_descriptor.h"
 #include "foundation/error.h"
+#include "platform/sha256.h"
 
 namespace atlas {
 
@@ -36,8 +37,8 @@ class EntityDefRegistry {
   // component_type_id, and component / entity properties may reference
   // struct_id; both must already be registered before the referrer is parsed.
   static constexpr uint32_t kBinaryFileMagic = 0x46445441u;  // 'A''T''D''F'
-  // v3 adds 32-byte SHA-256 digest immediately after the flags word.
-  static constexpr uint16_t kBinaryFileVersion = 3;
+  // The definition digest follows flags; v4 appends a SHA-256 file checksum.
+  static constexpr uint16_t kBinaryFileVersion = 4;
 
   struct LoadedCounts {
     size_t structs{0};
@@ -92,7 +93,7 @@ class EntityDefRegistry {
 
   [[nodiscard]] auto AllTypes() const -> const std::vector<EntityTypeDescriptor>& { return types; }
 
-  [[nodiscard]] auto PersistentPropertiesDigest() const -> std::array<uint8_t, 16>;
+  [[nodiscard]] auto StorageSchemaDigest() const -> Result<Sha256Digest>;
 
   // 32-byte SHA-256 of the entity-def surface, pushed in by C# at bootstrap.
   // All-zero until C# DefBootstrap calls SetDigest; BaseApp uses this to

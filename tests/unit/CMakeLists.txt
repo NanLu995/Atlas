@@ -331,9 +331,13 @@ atlas_add_test(NAME test_entity_def_registry_component
 )
 
 atlas_add_test(NAME test_entity_def_registry_binary_file
-  SOURCES test_entity_def_registry_binary_file.cpp
+  SOURCES test_entity_def_registry_binary_file.cpp test_entity_def_registry_persistence.cpp
+          test_entity_blob.cpp
   DEPS atlas_entitydef atlas_serialization
 )
+if(TARGET atlas_entitydef_client)
+  target_link_libraries(test_entity_def_registry_binary_file PRIVATE atlas_entitydef_client)
+endif()
 
 atlas_add_test(NAME test_range_list
   SOURCES test_range_list.cpp
@@ -501,15 +505,15 @@ atlas_add_test(NAME test_sqlite_database
   SOURCES test_sqlite_database.cpp
   DEPS atlas_db_sqlite atlas_entitydef atlas_platform
 )
+target_include_directories(test_sqlite_database PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../integration")
 
-# Runs only when the MySQL backend is built; skips itself unless a server is
-# reachable (ATLAS_TEST_MYSQL + connection), so it is inert without one.
 if(ATLAS_DB_MYSQL)
   atlas_add_test(NAME test_mysql_database
     SOURCES test_mysql_database.cpp
     DEPS atlas_db_mysql atlas_entitydef atlas_platform
   )
-  target_include_directories(test_mysql_database PRIVATE "${ATLAS_MARIADB_INCLUDE_DIR}")
+  target_include_directories(test_mysql_database PRIVATE
+    "${ATLAS_MARIADB_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../integration")
 endif()
 
 atlas_add_test(NAME test_coro_task

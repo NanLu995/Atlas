@@ -2,7 +2,10 @@
 #define ATLAS_SERVER_DBAPP_DBAPP_MESSAGES_H_
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +32,7 @@ enum class CheckoutStatus : uint8_t {
 };
 
 struct WriteEntity {
+  std::array<uint8_t, 32> entity_def_digest{};
   std::array<std::byte, 16> operation_id{};
   WriteFlags flags{WriteFlags::kNone};
   uint16_t type_id{0};
@@ -65,6 +69,7 @@ struct WriteEntity {
     w.WriteString(identifier);
     w.Write(static_cast<uint32_t>(blob.size()));
     w.WriteBytes(blob);
+    w.WriteBytes(std::as_bytes(std::span(entity_def_digest)));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<WriteEntity> {
@@ -99,6 +104,9 @@ struct WriteEntity {
     msg.shard_table_version = *version;
     msg.identifier = std::move(*id_str);
     msg.blob.assign(blob_span->begin(), blob_span->end());
+    auto digest = r.ReadBytes(msg.entity_def_digest.size());
+    if (!digest) return digest.Error();
+    std::memcpy(msg.entity_def_digest.data(), digest->data(), msg.entity_def_digest.size());
     return msg;
   }
 };
@@ -157,7 +165,7 @@ struct WriteEntityAck {
     if (!ip || !port || !app || !entity || !lease || !instance || !operation || !rid || !ok ||
         !kind || !db || !version || !err)
       return Error{ErrorCode::kInvalidArgument, "WriteEntityAck: truncated"};
-    if (*ok > 1 || *kind > static_cast<uint8_t>(DatabaseErrorKind::kOwnershipConflict) ||
+    if (*ok > 1 || *kind > static_cast<uint8_t>(DatabaseErrorKind::kStopping) ||
         (*ok != 0 && *kind != 0)) {
       return Error{ErrorCode::kInvalidArgument, "WriteEntityAck: invalid result"};
     }
@@ -176,6 +184,7 @@ struct WriteEntityAck {
 static_assert(NetworkMessage<WriteEntityAck>);
 
 struct CheckoutEntity {
+  std::array<uint8_t, 32> entity_def_digest{};
   std::array<std::byte, 16> operation_id{};
   LoadMode mode{LoadMode::kByDbid};
   uint16_t type_id{0};
@@ -211,6 +220,7 @@ struct CheckoutEntity {
     w.Write(owner_addr.Port());
     w.Write(owner_app_id);
     w.Write(owner_process_instance);
+    w.WriteBytes(std::as_bytes(std::span(entity_def_digest)));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<CheckoutEntity> {
@@ -242,6 +252,9 @@ struct CheckoutEntity {
     if (!instance) return instance.Error();
     msg.owner_app_id = *app;
     msg.owner_process_instance = *instance;
+    auto digest = r.ReadBytes(msg.entity_def_digest.size());
+    if (!digest) return digest.Error();
+    std::memcpy(msg.entity_def_digest.data(), digest->data(), msg.entity_def_digest.size());
     return msg;
   }
 };
@@ -301,7 +314,7 @@ struct CheckoutEntityAck {
     auto blob_sz = r.Read<uint32_t>();
     if (!operation || !kind || !lease || !instance || !rid || !st || !db || !blob_sz)
       return Error{ErrorCode::kInvalidArgument, "CheckoutEntityAck: truncated"};
-    if (*kind > static_cast<uint8_t>(DatabaseErrorKind::kOwnershipConflict) ||
+    if (*kind > static_cast<uint8_t>(DatabaseErrorKind::kStopping) ||
         *st > static_cast<uint8_t>(CheckoutStatus::kDbError) ||
         (*st == static_cast<uint8_t>(CheckoutStatus::kSuccess) &&
          (*kind != static_cast<uint8_t>(DatabaseErrorKind::kNone) || *lease == 0 || *db <= 0)))

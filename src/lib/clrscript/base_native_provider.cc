@@ -103,9 +103,10 @@ void BaseNativeProvider::SetEntityDefDigest(const std::byte* data, int32_t len) 
   EntityDefRegistry::Instance().SetDigest(data, len);
 }
 
-void BaseNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* /*entity_data*/,
-                                   int32_t /*len*/) {
+auto BaseNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* /*entity_data*/,
+                                   int32_t /*len*/, uint64_t /*request_id*/) -> RpcSendResult {
   ATLAS_LOG_ERROR("write_to_db() not supported on this process type (entity_id={})", entity_id);
+  return RpcSendResult::kInvalidTarget;
 }
 
 auto BaseNativeProvider::TransferClient(uint32_t, uint32_t, uint32_t, uint16_t, uint64_t, uint64_t)
@@ -121,9 +122,9 @@ auto BaseNativeProvider::GetClientHandoffTarget(uint32_t, uint32_t& base_ip, uin
   return false;
 }
 
-void BaseNativeProvider::SetSpaceMasterType(uint32_t /*space_id*/, const char* /*name*/,
+void BaseNativeProvider::SetSpaceMasterType(uint32_t space_id, const char* /*name*/,
                                             int32_t /*len*/) {
-  // Default no-op; only BaseAppNativeProvider routes to BaseApp::SetSpaceMasterType.
+  ATLAS_LOG_ERROR("set_space_master_type() only supported on BaseApp (space_id={})", space_id);
 }
 
 auto BaseNativeProvider::CreateBaseEntity(uint16_t type_id, uint32_t /*space_id*/) -> uint32_t {

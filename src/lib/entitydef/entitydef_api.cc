@@ -27,7 +27,20 @@ struct AtlasEdrContext {
   atlas::EntityDefRegistry registry;
   std::string last_error;
   bool loaded{false};
+  bool load_attempted{false};
 };
+
+namespace {
+auto BeginLoad(AtlasEdrContext* ctx) -> bool {
+  if (!ctx) return false;
+  if (ctx->load_attempted) {
+    ctx->last_error = "EDR context already used; create a new context to load definitions";
+    return false;
+  }
+  ctx->load_attempted = true;
+  return true;
+}
+}  // namespace
 
 extern "C" {
 
@@ -58,10 +71,15 @@ AtlasEdrContext* AtlasEdrCreate(uint32_t expected_abi) {
 void AtlasEdrDestroy(AtlasEdrContext* ctx) { delete ctx; }
 
 int32_t AtlasEdrLoadFromFile(AtlasEdrContext* ctx, const char* path) {
-  if (!ctx || !path) return ATLAS_EDR_ERR_INVAL;
+  if (!BeginLoad(ctx)) return ATLAS_EDR_ERR_INVAL;
+  if (!path) {
+    ctx->last_error = "EDR definition path is null; create a new context to retry";
+    return ATLAS_EDR_ERR_INVAL;
+  }
   auto result = ctx->registry.RegisterFromBinaryFile(std::filesystem::path(path));
   if (!result.HasValue()) {
     ctx->last_error = std::string(result.Error().Message());
+    ctx->registry.clear();
     return ATLAS_EDR_ERR_PARSE;
   }
   ctx->loaded = true;
@@ -69,12 +87,17 @@ int32_t AtlasEdrLoadFromFile(AtlasEdrContext* ctx, const char* path) {
 }
 
 int32_t AtlasEdrLoadFromBuffer(AtlasEdrContext* ctx, const uint8_t* data, int32_t len) {
-  if (!ctx || !data || len <= 0) return ATLAS_EDR_ERR_INVAL;
+  if (!BeginLoad(ctx)) return ATLAS_EDR_ERR_INVAL;
+  if (!data || len <= 0) {
+    ctx->last_error = "EDR definition buffer is empty; create a new context to retry";
+    return ATLAS_EDR_ERR_INVAL;
+  }
   auto buf = std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(data), static_cast<size_t>(len));
   auto result = ctx->registry.RegisterFromBinaryBuffer(buf);
   if (!result.HasValue()) {
     ctx->last_error = std::string(result.Error().Message());
+    ctx->registry.clear();
     return ATLAS_EDR_ERR_PARSE;
   }
   ctx->loaded = true;
@@ -164,6 +187,8 @@ const AtlasEdrComponent* AtlasEdrEntityComponentAtSlot(AtlasEdrContext* ctx,
   const auto* desc = reinterpret_cast<const atlas::EntityTypeDescriptor*>(entity);
   for (const auto& slot : desc->slots) {
     if (slot.slot_idx == slot_idx) {
+      if (slot.component_type_id == 0)
+        return reinterpret_cast<const AtlasEdrComponent*>(&slot.inline_component);
       return reinterpret_cast<const AtlasEdrComponent*>(
           ctx->registry.FindComponentById(slot.component_type_id));
     }

@@ -27,10 +27,13 @@ namespace Atlas.Core;
 /// </remarks>
 internal static class Lifecycle
 {
-    // ---- Non-[UnmanagedCallersOnly] core logic (shared with test forwarders) ----
-
     internal static void DoEngineInit()
     {
+        var nativeAbi = NativeApi.GetAbiVersion();
+        if (nativeAbi != Bootstrap.NativeAbiVersion)
+            throw new InvalidOperationException(
+                $"Native ABI mismatch: expected {Bootstrap.NativeAbiVersion}, received {nativeAbi}");
+
         // Install before any init step touches Log; ResetBackend on shutdown
         // makes this idempotent across hot-reload init cycles.
         Log.SetBackend(new NativeLogBackend());
@@ -108,6 +111,12 @@ internal static class Lifecycle
         PublishReplicationAllWithGCProbe();
     }
 
+    internal static void DoOnDrain()
+    {
+        EngineContext.SyncContext?.ProcessQueue();
+        EngineContext.CoroLoop?.Drain();
+    }
+
     // Wraps PublishReplicationAll with a lightweight GC collection detector.
     // Snapshots GC generation counts before and after the call; logs a warning
     // when a collection occurred, giving correlation data to confirm whether
@@ -142,7 +151,8 @@ internal static class Lifecycle
         EntityManager.Instance.OnShutdownAll();
     }
 
-    // ---- [UnmanagedCallersOnly] entry points (C++ calls these) ----
+    [UnmanagedCallersOnly]
+    public static uint GetAbiVersion() => Bootstrap.NativeAbiVersion;
 
     [UnmanagedCallersOnly]
     public static int EngineInit()
@@ -195,6 +205,21 @@ internal static class Lifecycle
         try
         {
             DoOnTick(deltaTime);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            ErrorBridge.SetError(ex);
+            return -1;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static int OnDrain()
+    {
+        try
+        {
+            DoOnDrain();
             return 0;
         }
         catch (Exception ex)

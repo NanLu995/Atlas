@@ -18,6 +18,7 @@ from typing import Iterable, NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.paths import REPO_ROOT, dotnet_tfm_dir, resolve_repo_root  # noqa: F401
+from common.cluster import export_entity_definitions
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 
 
@@ -1014,59 +1015,6 @@ def build_stress_args(
     return stress_args
 
 
-_DIGEST_FILE = (
-    Path("samples") / "stress" / "Atlas.StressTest.Base" / "obj" / "generated"
-    / "Atlas.Generators.Def" / "Atlas.Generators.Def.DefGenerator"
-    / "EntityDefDigest.g.cs"
-)
-_DIGEST_RE = re.compile(r'Sha256Hex\s*=\s*"([0-9A-Fa-f]{64})"')
-_DEFDUMP_RE = re.compile(r"DefDump:\s+digest=([0-9A-Fa-f]{64})")
-
-
-def find_defdump(repo_root: Path, build_dir: str) -> Path | None:
-    build_path = repo_root / build_dir
-    build_name = Path(build_dir).name
-    candidates = [
-        build_path / "csharp" / "Atlas.Tools.DefDump.dll",
-        repo_root / "build" / build_name / "csharp" / "Atlas.Tools.DefDump.dll",
-        repo_root / "bin" / build_name / "Atlas.Tools.DefDump.dll",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def load_entity_def_digest(repo_root: Path, build_dir: str, assembly_path: Path) -> str:
-    defdump = find_defdump(repo_root, build_dir)
-    if defdump is not None:
-        try:
-            proc = subprocess.run(
-                ["dotnet", str(defdump), "--digest-only", str(assembly_path)],
-                capture_output=True,
-                text=True,
-                cwd=repo_root,
-                timeout=30,
-            )
-        except FileNotFoundError:
-            fail("dotnet not found; install the .NET SDK or run from a developer shell")
-        if proc.returncode != 0:
-            detail = proc.stderr.strip() or proc.stdout.strip()
-            fail(f"DefDump failed for {assembly_path}: {detail}")
-        match = _DEFDUMP_RE.search(proc.stdout)
-        if not match:
-            fail(f"DefDump output did not contain a digest for {assembly_path}")
-        return match.group(1)
-
-    path = repo_root / _DIGEST_FILE
-    if not path.is_file():
-        fail(f"EntityDefDigest.g.cs not found at {path}; build the C# stress projects first.")
-    match = _DIGEST_RE.search(path.read_text(encoding="utf-8"))
-    if not match:
-        fail(f"Could not extract Sha256Hex from {path}.")
-    return match.group(1)
-
-
 def default_client_exe(args: argparse.Namespace) -> Path:
     bin_name = Path(args.build_dir).name
     return resolve_repo_root() / "bin" / bin_name / "atlas_client.exe"
@@ -1249,7 +1197,6 @@ def main() -> int:
             repo_root, bin_name, search_subdirs, "world_stress"
         )
         assert_file_exists(world_stress, world_stress.name)
-        entity_def_digest = load_entity_def_digest(repo_root, args.build_dir, base_assembly)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     git_hash = _git_short(repo_root)
@@ -1273,6 +1220,12 @@ def main() -> int:
 
     log_dir.mkdir(parents=True, exist_ok=True)
     db_dir.mkdir(parents=True, exist_ok=True)
+    entitydef_path = run_root / "entity_defs.bin"
+    try:
+        entity_def_digest = export_entity_definitions(
+            repo_root, bin_name, base_assembly, entitydef_path)
+    except RuntimeError as error:
+        fail(str(error))
 
     database = database_config(args, db_dir / 'atlas_world_stress.sqlite3')
     record_database_run(run_root, database, baseapps=args.baseapp_count, cellapps=args.cellapp_count)
@@ -1344,6 +1297,8 @@ def main() -> int:
                     str(args.dbapp_port),
                     "--config",
                     str(db_config_path),
+                    "--entitydef-bin-path",
+                    str(entitydef_path),
                     "--update-hertz",
                     str(args.dbapp_update_hertz),
                     "--log-level",

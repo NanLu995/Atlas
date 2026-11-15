@@ -16,6 +16,7 @@
 #include <sqlite3.h>
 
 #include "atdf_account_fixture.h"
+#include "db/entity_blob.h"
 #include "dbapp/account_session_messages.h"
 #include "dbapp/dbapp.h"
 #include "dbapp/dbapp_messages.h"
@@ -110,7 +111,10 @@ class TestDBApp final : public DBApp {
 
  protected:
   auto Init(int argc, char* argv[]) -> bool override {
-    if (!DBApp::Init(argc, argv)) return false;
+    if (!DBApp::Init(argc, argv)) {
+      addr_promise_.set_value(Address{});
+      return false;
+    }
 
     Address addr = Network().RudpAddress();
     if (addr.Ip() == 0) addr = Address("127.0.0.1", addr.Port());
@@ -284,6 +288,23 @@ void CheckAccountSessionProtocol(DBAppClient& first, Channel& first_channel, DBA
 
 }  // namespace
 
+TEST(DBAppIntegration, InvalidDefinitionsCompleteTheStartupNotification) {
+  EventDispatcher dispatcher{"invalid_dbapp_definitions"};
+  NetworkInterface network(dispatcher);
+  std::promise<Address> ready;
+  auto address = ready.get_future();
+  std::atomic<bool> stop{false};
+  TestDBApp app(dispatcher, network, ready, stop);
+  const auto stamp = Clock::now().time_since_epoch().count();
+  const auto directory =
+      std::filesystem::temp_directory_path() / std::format("atlas_invalid_dbapp_{}", stamp);
+  DBAppArgv arguments(reserve_udp_port(), directory / "missing.bin", directory / "store.sqlite3");
+  EXPECT_EQ(app.RunApp(arguments.argc(), arguments.argv()), 1);
+  ASSERT_EQ(address.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_EQ(address.get(), Address{});
+  EXPECT_FALSE(std::filesystem::exists(directory / "store.sqlite3"));
+}
+
 TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   const uint16_t port = reserve_udp_port();
   ASSERT_NE(port, 0u);
@@ -336,6 +357,7 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   ASSERT_TRUE(poll_until(machined_client.dispatcher, [&] { return machined_channel != nullptr; }));
 
   WriteEntity write;
+  write.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.flags = WriteFlags::kCreateNew;
@@ -343,7 +365,9 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   write.entity_id = 101;
   write.request_id = 1;
   write.identifier = "cleanup_target";
-  write.blob = make_blob("entity");
+  auto encoded = EncodeDbBlob(make_blob("entity"), {});
+  ASSERT_TRUE(encoded);
+  write.blob = std::move(*encoded);
   ASSERT_TRUE((*ch1)->SendMessage(write).HasValue());
   ASSERT_TRUE(poll_until(baseapp1.dispatcher,
                          [&] { return baseapp1.write_received.load(std::memory_order_acquire); }));
@@ -372,6 +396,7 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   ASSERT_TRUE(baseapp1.write_ack.success) << baseapp1.write_ack.error;
 
   CheckoutEntity co1;
+  co1.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   co1.owner_process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(co1.operation_id));
   co1.mode = LoadMode::kByDbid;
@@ -495,6 +520,7 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   CheckoutEntity co2;
+  co2.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   co2.owner_process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(co2.operation_id));
   co2.mode = LoadMode::kByDbid;
@@ -577,6 +603,7 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   ASSERT_TRUE(first_channel.HasValue());
   ASSERT_TRUE(next_channel.HasValue());
   WriteEntity write;
+  write.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   write.owner.process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(write.operation_id).HasValue());
   write.type_id = 1;
@@ -584,7 +611,9 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   write.entity_id = 1001;
   write.owner.app_id = 7;
   write.request_id = 101;
-  write.blob = make_blob("shared");
+  auto encoded = EncodeDbBlob(make_blob("shared"), {});
+  ASSERT_TRUE(encoded);
+  write.blob = std::move(*encoded);
   ASSERT_TRUE((*first_channel)->SendMessage(write).HasValue());
   ASSERT_TRUE(poll_until(first.dispatcher, [&] { return first.write_received.load(); }));
   ASSERT_TRUE(first.write_ack.success) << first.write_ack.error;
@@ -623,6 +652,7 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   EXPECT_FALSE(first.write_ack.success);
   EXPECT_EQ(first.write_ack.error_kind, DatabaseErrorKind::kOperationConflict);
   CheckoutEntity competing;
+  competing.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   competing.owner_process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(competing.operation_id));
   competing.dbid = dbid;
@@ -646,6 +676,7 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   ASSERT_TRUE(first.write_ack.success) << first.write_ack.error;
 
   CheckoutEntity checkout;
+  checkout.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   checkout.owner_process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(checkout.operation_id));
   checkout.type_id = 1;
@@ -858,6 +889,7 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
   EXPECT_TRUE(reservations[0].second.end < reservations[1].second.start ||
               reservations[1].second.end < reservations[0].second.start);
   WriteEntity write;
+  write.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   write.owner.process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(write.operation_id));
   write.type_id = 1;
@@ -866,7 +898,9 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
   write.owner.app_id = 7;
   write.request_id = 1;
   write.identifier = "cross_dbapp_checkout_retry";
-  write.blob = make_blob("original");
+  auto encoded = EncodeDbBlob(make_blob("original"), {});
+  ASSERT_TRUE(encoded);
+  write.blob = std::move(*encoded);
   ASSERT_TRUE((*first_channel)->SendMessage(write));
   ASSERT_TRUE(poll_until(client.dispatcher, [&] { return client.write_received.load(); }));
   ASSERT_TRUE(client.write_ack.success) << client.write_ack.error;
@@ -881,6 +915,7 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
   ASSERT_TRUE(poll_until(client.dispatcher, [&] { return client.write_received.load(); }));
   ASSERT_TRUE(client.write_ack.success) << client.write_ack.error;
   CheckoutEntity checkout;
+  checkout.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   checkout.owner_process_instance = 111;
   ASSERT_TRUE(FillSecureRandom(checkout.operation_id));
   checkout.dbid = dbid;

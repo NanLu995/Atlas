@@ -5,13 +5,14 @@ using Atlas.Entity;
 
 namespace Atlas.RuntimeTest;
 
-// ============================================================================
-// LifecycleTestEntryPoint — forwarding [UnmanagedCallersOnly] entry points
-// ============================================================================
-//
-// These methods forward to Lifecycle.DoXxx() in Atlas.Runtime.
-// They must live in Atlas.RuntimeTest to avoid the dual-Assembly-instance
-// issue (see docs/scripting/native_api_architecture.md §5).
+public static class IncompatibleLifecycle
+{
+    [UnmanagedCallersOnly]
+    public static uint GetAbiVersion() => uint.MaxValue;
+}
+
+// Keep forwarders in the test assembly so calls share the native bridge
+// registered by the harness.
 
 public static class LifecycleTestEntryPoint
 {
@@ -68,6 +69,21 @@ public static class LifecycleTestEntryPoint
         try
         {
             Lifecycle.DoOnTick(deltaTime);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            ErrorBridge.SetError(ex);
+            return -1;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static int OnDrain()
+    {
+        try
+        {
+            Lifecycle.DoOnDrain();
             return 0;
         }
         catch (Exception ex)

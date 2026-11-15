@@ -115,7 +115,7 @@ struct EntityTypeDescriptor {
 | `bool IsExposed(rpc_id)` / `ExposedScope GetExposedScope(rpc_id)` | 客户端 RPC 合法性 |
 | `std::vector<const PropertyDescriptor*> GetReplicatedProperties(type_id, min_scope)` | 按 `ReplicationScope` 数值做粗粒度 helper 过滤 |
 | `std::vector<const PropertyDescriptor*> GetPersistentProperties(type_id)` | 持久属性列表 |
-| `std::array<uint8_t,16> PersistentPropertiesDigest()` | 本地持久字段摘要 helper；当前未接入 BaseApp ↔ DBApp 握手 |
+| `Result<Sha256Digest> StorageSchemaDigest()` | 实际快照结构的 SHA-256 摘要，覆盖注册字段、组件、结构体和嵌套类型；两个数据库后端启动时核对，不匹配拒绝 |
 | `void clear()` | 热重载前清空 |
 
 > `.def` scope 当前完整写入 8 个 `ReplicationScope` 值。Owner / other-client
@@ -150,7 +150,7 @@ Component / Struct 等扩展元素由 `ComponentEmitter` /
 |---|---|
 | BaseApp | `INativeApiProvider::SendClientRpc / SendCellRpc / SendBaseRpc` 前用 `ValidateRpc` + `IsExposed` 校验;`GetPersistentProperties` 构造持久化快照 |
 | CellApp | 使用 `EntityDefRegistry` 做 RPC / 组件 / 容器描述校验;属性 owner / other 过滤由生成器产物写入 replication frame |
-| DBApp | 启动时通过 `RegisterFromBinaryFile(entity_defs.bin)` 加载离线 ATDF，供数据库后端按持久字段 schema 读写 |
+| DBApp | 启动必须加载 ATDF v4（整文件 SHA-256），核对存储摘要；认证、checkout、写入检查完整定义摘要 |
 | LoginApp | 不直接加载 `EntityDefRegistry`；只把客户端 `entity_def_digest` 透传给 BaseApp 做版本校验 |
 | Reviver | 不读实体类型元数据；只监督 manager 进程 |
 

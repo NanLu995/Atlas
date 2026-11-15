@@ -41,8 +41,8 @@ class PendingRpcRegistry {
 
   // Rejection returns an invalid handle without invoking either callback.
   auto RegisterPending(MessageID reply_id, uint64_t request_id, ReplyCallback on_reply,
-                       ErrorCallback on_error, Duration timeout, Channel* channel = nullptr)
-      -> PendingHandle;
+                       ErrorCallback on_error, Duration timeout, Channel* channel = nullptr,
+                       Error* rejection = nullptr) -> PendingHandle;
 
   // Entity and account-session replies use uint64_t IDs; older control replies use uint32_t.
   auto TryDispatch(MessageID id, std::span<const std::byte> payload, Channel* source = nullptr)

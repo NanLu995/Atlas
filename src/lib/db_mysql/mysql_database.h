@@ -1,6 +1,7 @@
 #ifndef ATLAS_LIB_DB_MYSQL_MYSQL_DATABASE_H_
 #define ATLAS_LIB_DB_MYSQL_MYSQL_DATABASE_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -14,7 +15,9 @@
 #include <thread>
 #include <vector>
 
+#include "db/database_failure.h"
 #include "db/write_operation.h"
+#include "foundation/callback_utils.h"
 
 struct st_mysql;
 
@@ -32,6 +35,10 @@ class MysqlDatabase : public IDatabase {
   [[nodiscard]] auto Startup(const DatabaseConfig& config, const EntityDefRegistry& entity_defs)
       -> Result<void> override;
   void Shutdown() override;
+  void BeginDrain() override;
+  [[nodiscard]] auto PendingOperations() const -> std::size_t override {
+    return pending_operations_.load(std::memory_order_acquire);
+  }
 
   void PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                  std::span<const std::byte> blob, const std::string& identifier,
@@ -71,17 +78,18 @@ class MysqlDatabase : public IDatabase {
                        std::function<void(Result<void>)> callback) override;
 
   void ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                     std::function<void(bool)> callback) override;
+                     std::function<void(Result<bool>)> callback) override;
 
   void ClearCheckoutsForAddress(const Address& base_addr,
-                                std::function<void(int cleared_count)> callback) override;
+                                std::function<void(Result<int>)> callback) override;
 
   void RetireCheckoutProcess(const Address& base_addr, uint64_t instance,
                              std::function<void(Result<int>)> callback) override;
 
-  void GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) override;
+  void GetAutoLoadEntities(std::function<void(Result<std::vector<EntityData>>)> callback) override;
 
-  void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load) override;
+  void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
+                   std::function<void(Result<void>)> callback) override;
 
   void GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                          std::function<void(DbidRangeResult)> callback) override;
@@ -121,35 +129,38 @@ class MysqlDatabase : public IDatabase {
   template <typename R>
   void Dispatch(uint16_t type_id, uint64_t key, std::function<R(st_mysql*)> op,
                 std::function<void(R)> callback) {
-    if (!deferred_mode_) {
-      if (started_ && !stopping_) RefreshConnection(conn_);
-      callback(op(stopping_ ? nullptr : conn_));
+    if (auto admitted = AdmitOperation(); !admitted) {
+      callback(DatabaseFailure<R>(admitted.Error()));
       return;
     }
+    if (!deferred_mode_) {
+      RefreshConnection(conn_);
+      callback(op(conn_));
+      return;
+    }
+    pending_operations_.fetch_add(1, std::memory_order_relaxed);
     EnqueueForEntity(
         type_id, key, [this, op = std::move(op), cb = std::move(callback)](st_mysql* conn) mutable {
           R r = op(conn);
-          PostResult([cb = std::move(cb), r = std::move(r)]() mutable { cb(std::move(r)); });
+          PostResult([this, cb = std::move(cb), r = std::move(r)]() mutable {
+            SafeInvoke("Database callback", [&] { cb(std::move(r)); });
+            pending_operations_.fetch_sub(1, std::memory_order_release);
+          });
         });
   }
 
-  // Result-less variant for fire-and-forget setters (SetAutoLoad).
-  void DispatchVoid(uint16_t type_id, uint64_t key, std::function<void(st_mysql*)> op) {
-    if (!deferred_mode_) {
-      if (started_ && !stopping_) RefreshConnection(conn_);
-      op(stopping_ ? nullptr : conn_);
-      return;
-    }
-    EnqueueForEntity(type_id, key, std::move(op));
-  }
-
+  [[nodiscard]] auto AdmitOperation() const -> Result<void>;
   void EnqueueForEntity(uint16_t type_id, uint64_t key, std::function<void(st_mysql*)> job);
   void PostResult(std::function<void()> result);
   void WorkerLoop(Worker& worker);
   [[nodiscard]] auto OpenConnection() const -> st_mysql*;
   void RefreshConnection(st_mysql*& conn) const;
 
-  static auto EnsureSchema(st_mysql* conn) -> Result<void>;
+  static auto EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) -> Result<void>;
+  static auto EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema)
+      -> Result<void>;
+  static auto QueryScalar(st_mysql* conn, std::string_view sql)
+      -> Result<std::optional<std::string>>;
   static auto ExecSql(st_mysql* conn, std::string_view sql) -> Result<void>;
   static auto QueryRow(st_mysql* conn, std::string_view sql) -> Result<EntityRow>;
   static auto ReadRow(char** row, const unsigned long* lengths) -> EntityRow;
@@ -197,10 +208,11 @@ class MysqlDatabase : public IDatabase {
                               const CheckoutInfo& owner, int64_t now_ms) -> Result<uint64_t>;
   static auto CheckoutTail(st_mysql* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
                            const CheckoutInfo& new_owner, int64_t now_ms) -> GetResult;
-  static auto DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> bool;
-  static auto DoClearForAddress(st_mysql* conn, const Address& base_addr) -> int;
-  static auto DoGetAutoLoad(st_mysql* conn) -> std::vector<EntityData>;
-  static void DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load);
+  static auto DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> Result<bool>;
+  static auto DoClearForAddress(st_mysql* conn, const Address& base_addr) -> Result<int>;
+  static auto DoGetAutoLoad(st_mysql* conn) -> Result<std::vector<EntityData>>;
+  static auto DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
+      -> Result<void>;
   static auto DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high) -> DbidRangeResult;
   static auto DoReserveEntityIds(st_mysql* conn, uint32_t count) -> Result<EntityIdRange>;
   static auto DoReadAccountSession(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
@@ -214,6 +226,7 @@ class MysqlDatabase : public IDatabase {
   bool started_{false};
   bool stopping_{false};
   bool deferred_mode_{false};
+  std::atomic<std::size_t> pending_operations_{0};
 
   std::vector<std::unique_ptr<Worker>> workers_;
 

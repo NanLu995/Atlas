@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -85,7 +86,7 @@ auto runtime_config_path() -> std::filesystem::path {
 }
 
 auto runtime_assembly_path() -> std::filesystem::path {
-  return server_bin_dir() / "Atlas.Runtime.dll";
+  return server_bin_dir() / "Atlas.RpcFixture.Base.dll";
 }
 
 auto quote_arg(const std::wstring& arg) -> std::wstring {
@@ -248,7 +249,18 @@ struct ChildProcess {
 
 auto write_entity_defs_bin() -> std::filesystem::path {
   auto path = std::filesystem::temp_directory_path() / "atlas_login_flow_entity_defs.bin";
-  return atlas::test_fixtures::WriteAccountAtdfFile(path);
+  auto exporter =
+      ChildProcess::launch(std::filesystem::path(ATLAS_TEST_DOTNET),
+                           {std::filesystem::path(ATLAS_TEST_DEFDUMP).wstring(), L"--assembly",
+                            runtime_assembly_path().wstring(), L"--out", path.wstring()},
+                           server_bin_dir(), "defdump");
+  if (exporter.pi.hProcess == nullptr ||
+      ::WaitForSingleObject(exporter.pi.hProcess, 30000) != WAIT_OBJECT_0 ||
+      exporter.exit_code() != 0) {
+    ADD_FAILURE() << "entity definition export failed: " << exporter.diagnostic();
+    return {};
+  }
+  return path;
 }
 
 auto write_baseapp_config_json(const std::filesystem::path& runtime_cfg,
@@ -369,6 +381,10 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   }
 
   const auto entity_defs = write_entity_defs_bin();
+  ASSERT_FALSE(entity_defs.empty());
+  EntityDefRegistry definitions;
+  auto loaded_definitions = definitions.RegisterFromBinaryFile(entity_defs);
+  ASSERT_TRUE(loaded_definitions.HasValue()) << loaded_definitions.Error().Message();
   const auto baseapp_config = write_baseapp_config_json(runtime_cfg, runtime_dll);
   const auto sqlite_path = std::filesystem::temp_directory_path() / "atlas_login_flow.sqlite3";
   std::filesystem::remove(sqlite_path);
@@ -528,6 +544,7 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   ASSERT_TRUE(login_channel.HasValue()) << login_channel.Error().Message();
 
   login::LoginRequest login_req;
+  std::ranges::copy(definitions.Digest(), login_req.entity_def_digest.begin());
   login_req.username = "hero";
   login_req.password_hash = "pw_hash";
   ASSERT_TRUE((*login_channel)->SendMessage(login_req).HasValue());

@@ -74,10 +74,10 @@
         atlas::GetNativeApiProvider().SetEntityDefDigest( \
             reinterpret_cast<const std::byte*>(data), len)) \
  \
-    X(void, WriteToDb, \
-        (uint32_t entity_id, const uint8_t* entity_data, int32_t len), \
-        atlas::GetNativeApiProvider().WriteToDb( \
-            entity_id, reinterpret_cast<const std::byte*>(entity_data), len)) \
+    X(int32_t, WriteToDb, \
+        (uint32_t entity_id, const uint8_t* entity_data, int32_t len, uint64_t request_id), \
+        return static_cast<int32_t>(atlas::GetNativeApiProvider().WriteToDb( \
+            entity_id, reinterpret_cast<const std::byte*>(entity_data), len, request_id))) \
  \
     X(int32_t, TransferClient, \
         (uint32_t src_entity_id, uint32_t dest_entity_id, uint32_t base_ip, uint16_t base_port, \

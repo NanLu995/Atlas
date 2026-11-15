@@ -89,6 +89,43 @@ ServerApp
 
 `ServerApp` provides configuration, machined registration, watcher metrics, tick callbacks, and signal dispatch. `BaseApp` and `CellApp` extend it through `EntityApp` so C# gameplay can run on top of the C++ server core.
 
+`BgTaskManager` admits at most 4,096 tasks, counting queued work, running work and results
+awaiting their main-thread callback. `AddTask` returns `RateLimited` at capacity and
+`ReceiverGone` after `StopAccepting`; rejected submissions receive no completion callback.
+Work returns `Result<void>` and each accepted task reports its result on the dispatcher thread.
+`CancelPending` stops admission and reports `Cancelled` for work that has not started; it does
+not interrupt running work. Exceptions at the existing callback boundary report `InternalError`.
+
+Shutdown stops admission and normal simulation ticks while the dispatcher keeps processing
+accepted work and replies. `ScriptEngine::Drain` / `Lifecycle.OnDrain` keep managed continuations
+running without entity ticks or replication.
+New script entity creation, space requests and teleports are rejected; duplicate creation
+requests for an existing Real keep their confirmed acknowledgement.
+BaseApp confirms session release and persistent logoff saves before
+destroying entities; DBApp drains accepted operations and callbacks. The default deadline is
+30 seconds. A known save failure exits unsuccessfully; expiry logs unconfirmed work and exits
+with failure without blocking on worker destruction. A forced exit preserves only committed data.
+Stop LoginApp first, then BaseApps, CellApps/managers, DBApps and machined, keeping storage and
+control services available while their dependants drain. The cluster launcher waits 35 seconds
+per shutdown group and reports nonzero exits or forced termination as failures.
+
+Database admission is limited to 4,096 operations, including callbacks waiting for consumption.
+Capacity rejection precedes execution (`RateLimited` / `kOverloaded`); draining rejects new work
+as `ReceiverGone` / `kStopping`. `BeginDrain` and `PendingOperations` expose this lifecycle.
+Checkout cleanup and automatic-load APIs return `Result` callbacks, including setters, so backend
+errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV3`.
+Immediate reliable UDP sends obey the configured send window. Deferred bundles retain at most
+256 KiB per channel and reliability class; full admission returns `WouldBlock` without appending.
+RPC calls distinguish capacity rejection (`RateLimited`), duplicate requests (`AlreadyExists`)
+and a stopping registry (`ReceiverGone`), without sending a rejected request.
+Native login and authentication return busy or transport errors immediately when sending is
+rejected, clear the unfinished attempt, and permit a fresh login without waiting for a timeout.
+`atlas_tool watch` flushes its response before reporting success. A stdout write failure returns
+a nonzero exit code and a stderr error instead of silently succeeding without a response.
+LoginApp suspends the three-second client idle timer while an admitted login is processing,
+then restores it on completion. Existing RPC and client deadlines still apply; disconnects cancel
+the pending login. This does not add an overall server login deadline.
+
 ## Requirements
 
 Windows:
@@ -242,9 +279,9 @@ tools/bin/run_cluster.sh
 Scripted cluster validation:
 
 ```bash
-tools/bin/test_cluster.sh
+tools/bin/test_cluster.sh --base-assembly <your-base-assembly>
 # Windows
-tools\bin\test_cluster.bat
+tools\bin\test_cluster.bat --base-assembly <your-base-assembly>
 ```
 
 `test_cluster` also accepts `--base-assembly <script.dll>` to load a test script in
@@ -255,8 +292,12 @@ before any cluster process starts. The `atlas_rpc_fixture_base_dll_deploy` and
 `atlas_rpc_fixture_cell_dll_deploy` target builds the Cell peer. Missing assemblies fail
 before process startup. `--baseapps 2` starts a second BaseApp for handoff verification;
 run manifests and READY output record the actual BaseApp count and endpoints.
+`--log-level debug` enables existing server diagnostics for this isolated run; C# fixtures accept
+the same override through `ATLAS_TEST_CLUSTER_LOG_LEVEL`. The default remains `info`.
 The test launcher's stdin accepts `kill-baseapp <internal-port>` for crash injection and confirms
 termination with `KILLED`. It only terminates its own live BaseApp children.
+`shutdown-baseapp <internal-port>` requests normal shutdown through machined and confirms
+`SHUTDOWN` only after a zero process exit; expiry and a nonzero exit fail the test launcher.
 `restart-baseapp <internal-port>` restarts a stopped owned BaseApp with its original arguments,
 confirms `RESTARTED`, and retains earlier logs under the run directory. Confirmation means
 process creation; tests separately wait for registration and check that old sessions cannot bind.
@@ -296,8 +337,30 @@ checkout version history within the half-open shard range. Deleting an entity do
 its retained receipt or lease history, so those confirmed identities remain below the recovered
 cursor after restart. Backups must retain all three sources; this does not provide recovery
 from arbitrarily removed metadata or make raw backend deletion an ID reclamation operation.
-Concurrent MySQL startup serializes EntityID counter initialization on the existing schema
-metadata row before reading its initialization marker and creating the counter.
+Concurrent MySQL startup serializes schema initialization with a database-scoped advisory lock.
+Both backends initialize only empty databases. Existing databases must have the matching
+`schema_version` (currently 2); missing or incompatible metadata rejects startup without
+overwriting the version or upgrading the schema. Rebuild matching processes and use a new
+isolated database; no old-format migration is provided. SQLite initializes its schema and
+metadata in one transaction. Interrupted MySQL DDL may leave an incomplete database, which
+must be inspected rather than automatically repaired or stamped as compatible.
+Startup also checks the SHA-256 `storage_schema_digest`. It covers registered entity fields,
+component inheritance and slots, structs, nested containers and their ordering; RPC declarations
+are excluded. Saves currently contain full Base/Cell snapshots, including fields without
+`persistent`, so those fields are checked too. A missing or different digest rejects startup
+without replacing the stored digest. Changes to registered data schemas require a new database.
+`blob_format_version` must also match (currently 2). Each entity snapshot has an explicit version,
+Base/Cell section lengths and a SHA-256 checksum; truncated, altered, trailing and unversioned
+data are rejected. New accounts use an encoded empty snapshot. Explicit saves and logoff saves
+use the same envelope and include the last Cell backup. SHA-256 here detects corruption; it is
+not a replacement for transport authentication.
+ATDF definition files use version 4 with a whole-file SHA-256 checksum. DBApp rejects missing,
+empty or corrupt definitions before opening storage. Login authentication, entity checkout and
+writes carry the full entity-definition digest, which DBApp checks before database access;
+BaseApp also refuses checkout completion if definitions changed while it was waiting.
+Inline synchronized components carry their type name and flattened fields in the entity slot
+descriptor instead of requiring a global component ID. Their fields and nested types participate
+in both storage and definition validation; local components remain outside snapshot persistence.
 
 Transaction commit failures report an uncertain outcome rather than success. SQLite
 batch callbacks wait for the transaction result. Checkout distinguishes missing entities
@@ -325,8 +388,8 @@ logs an error and keeps that database identity fenced. A late matching success c
 DBApp confirms success after conditional release or a database read proving the original lease
 is inactive. Database read failures and a still-active original lease cannot confirm release;
 duplicate and old checkins never release a newer lease. `baseapp/pending_checkin_count` includes
-stalled work. This confirmation runs while BaseApp's event loop is active; shutdown draining
-remains separate work.
+stalled work. Shutdown keeps BaseApp's event loop active until these confirmations finish
+or the shutdown deadline expires.
 
 The first shared MySQL save creates the entity, acquires checkout and stores its receipt
 in one transaction. The confirmed reply supplies the ownership version. Replays return
@@ -411,7 +474,7 @@ and ownership version; success is returned after database confirmation. An unava
 changed version or uncertain commit rejects this login instead of assuming the session is offline.
 Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
 login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
-Database plugins must export `AtlasCreateDatabaseV2`; rebuild both plugins and the server.
+Database plugins must export `AtlasCreateDatabaseV3`; rebuild both plugins and the server.
 The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
 Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
 tracks peer process instances even for death-only subscriptions: a new instance at the same
@@ -480,12 +543,13 @@ They pass the password through the child environment, excluding it from generate
 
 ```bat
 rem MySQL is the default; use an existing isolated development database and local config.
-tools\bin\test_cluster.bat --database-config <local-dbapp-json>
+tools\bin\test_cluster.bat --database-config <local-dbapp-json> --base-assembly <your-base-assembly>
 tools\bin\run_login_stress.bat --database-config <local-dbapp-json>
 tools\bin\run_world_stress.bat --database-config <local-dbapp-json>
 rem Explicit single-DBApp quick smoke; this is not MySQL acceptance.
-tools\bin\test_cluster.bat --db-backend sqlite
-bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3
+tools\bin\test_cluster.bat --db-backend sqlite --base-assembly <your-base-assembly>
+dotnet build/debug/csharp/Atlas.Tools.DefDump.dll --assembly <your-base-assembly> --out .tmp/sqlite-smoke/entity_defs.bin
+bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3 --entitydef-bin-path .tmp/sqlite-smoke/entity_defs.bin
 ```
 
 Linux uses the matching `tools/bin/*.sh` wrappers and `bin/debug/atlas_dbapp` with the same
@@ -494,6 +558,15 @@ output directory before running. The real-cluster C# fixture defaults to MySQL; 
 `ATLAS_TEST_DB_BACKEND=sqlite` selects smoke coverage. Tools emit `database-run.json` with the
 backend, topology and scope, and include the backend in console/READY output. A smoke result
 is marked `sqlite_smoke_only`, never a capacity or shared-storage acceptance result.
+
+DBApp requires a nonempty ATDF definition file with a nonzero entity-definition digest before
+opening the database. The cluster tools export it from their selected Base assembly into the run
+directory using the matching build's DefDump. `test_cluster` requires `--base-assembly`;
+login/world stress use their stress Base assembly by default and accept an explicit override.
+The client digest comes from that export, never a generated source file in another build's `obj`.
+DefDump checks the generated offline-export contract before loading an assembly, then suppresses
+generated native registration only inside its own process. Older generated assemblies require a
+rebuild. Export only trusted assemblies: other user-written module initializers can still run.
 
 SQLite uses an OS-held lock beside the canonical local database path for the connection's
 lifetime. A second Atlas opener of the same store fails before schema/data access; process exit
@@ -587,8 +660,43 @@ public partial class Avatar : ClientEntity
 Containers (`list[T]`, `dict[K,V]`, `list[list[int32]]`, …) and user `<struct>` types replicate field- or op-level deltas through the same setter path; see `entity_defs/StressAvatar.def` and `samples/stress/` for the full coverage matrix.
 
 Entity RPC request and reply headers use 64-bit request IDs. Generated IDs are not reused
-within the server process; exhaustion rejects new calls. Native ABI version 10 requires
+within the server process; exhaustion rejects new calls. Native ABI version 11 requires
 rebuilding the runtime, server and generated callers together; old RPC headers are unsupported.
+The CLR host checks Bootstrap and server lifecycle ABI versions before callback/lifecycle binding.
+Managed server and desktop initialization also check the loaded engine DLL's ABI before
+registration. A missing version entry or a mismatch stops initialization with an explicit error.
+
+Base scripts can await `PersistToDbAsync(ct)` as `AtlasTask<RpcReply<long>>`; success contains
+the database-confirmed DBID. A definite database rejection fails the reply; an unconfirmed
+commit or DBApp disconnect returns `OutcomeUnknown` while native recovery keeps the write
+fenced. Cancellation and timeout stop waiting without undoing an issued write.
+`PersistToDb()` only submits a request and throws when local admission fails.
+
+Cell scripts use `AddProximity(range, userArg)` and override `OnProximityEnter` /
+`OnProximityLeave`. Events run through the existing main-thread queue after native range
+updates return, so callbacks may cancel controllers safely. Execution rechecks the original
+entity and its lifecycle; destroyed, Ghost or cancelled entities receive no event. Invalid
+or negative radii return zero; zero radius is supported. Cancel a controller with
+`CancelController(id)`. Queued callback exceptions are logged through the existing queue.
+
+`StartTimer` accepts only finite, positive intervals and returns zero on rejection. Timer
+notifications run synchronously on the main thread; script exceptions are logged without
+leaving a native CLR error pending. Ghost, destroyed and lifecycle-cancelled entities do not
+run timer callbacks. Hot reload cancels the old instance's native timers before unloading;
+scripts recreate timers in `OnInit(isReload: true)`.
+
+The optional EDR SDK exposes both named and inline components through
+`AtlasEdrEntityComponentAtSlot`; inline components have type ID zero and a slot-owned schema.
+Each EDR context accepts one load attempt. Failure clears partial definitions; retry with a
+new context. After success the schema remains read-only and returned views live until destroy.
+Server `NativeApi` calls must run on the main tick thread; the thread guard asserts this in Debug,
+and Release callers must follow the same contract. Input spans are borrowed for the call;
+async persistence copies the snapshot before returning. Native snapshot consumers copy managed
+output before the next serialization callback or runtime reset can release its pinned buffer.
+`Time.DeltaTime` reads the owning BaseApp/CellApp's `GameClock.FrameDelta` in seconds, including
+its time scale; it is zero before the first tick, while paused, and after a clock reset.
+`Time.ServerTime` is monotonic time in seconds with an unspecified epoch, not a UTC timestamp.
+`SpaceMaster.Register` is a BaseApp operation; unsupported providers log an explicit error.
 Pending RPC registrations reject duplicate keys without replacing the original waiter.
 Replies must arrive on the registered channel; duplicate, late and wrong-channel replies
 cannot complete that waiter. Cancellation stops waiting and prevents generated calls that
@@ -717,6 +825,12 @@ preparation. Rebuild all SDKs and servers together for the authentication layout
 Remote script waits allow 40 seconds; cancelling that wait does not undo remote execution.
 RUDP interfaces do not share bound endpoints; binding an endpoint already owned by another
 RUDP interface fails with `AddressInUse`, including explicit client source-port bindings.
+TCP frames and UDP/RUDP datagrams use connection protocol version 1, prefixed by `ATLS` and
+a little-endian 16-bit version. TCP then carries its 32-bit payload length; UDP/RUDP retain
+their existing payload/header after the prefix. Incompatible TCP peers are disconnected;
+incompatible or truncated datagrams are dropped before a peer channel is allocated. RUDP MTU
+and fragmentation include the six prefix bytes. Servers, SDKs and protocol tools must be rebuilt
+together; unversioned traffic has no compatibility path. Mesh gossip retains its separate version.
 
 ## Profiling and Stress
 

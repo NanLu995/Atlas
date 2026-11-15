@@ -10,12 +10,13 @@
 #include <format>
 #include <utility>
 
+#include "db/entity_blob.h"
 #include "foundation/log.h"
 
 namespace atlas {
 
 namespace {
-constexpr int kMysqlSchemaVersion = 1;
+constexpr int kMysqlSchemaVersion = 2;
 constexpr unsigned int kErDupEntry = 1062;  // MySQL ER_DUP_ENTRY
 
 auto UnixTimeMs() -> int64_t {
@@ -45,6 +46,8 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
   stopping_ = false;
   entity_defs_ = &entity_defs;
   config_ = config;
+  auto storage_schema = entity_defs.StorageSchemaDigest();
+  if (!storage_schema) return storage_schema.Error();
 
   conn_ = OpenConnection();
   if (conn_ == nullptr) {
@@ -53,7 +56,7 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
                              config.mysql_port, config.mysql_database)};
   }
 
-  auto schema = EnsureSchema(conn_);
+  auto schema = EnsureSchema(conn_, *storage_schema);
   if (!schema) {
     mysql_close(conn_);
     conn_ = nullptr;
@@ -75,7 +78,7 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
   return {};
 }
 
-void MysqlDatabase::Shutdown() {
+void MysqlDatabase::BeginDrain() {
   stopping_ = true;
   for (auto& w : workers_) {
     {
@@ -84,6 +87,10 @@ void MysqlDatabase::Shutdown() {
     }
     w->cv.notify_all();
   }
+}
+
+void MysqlDatabase::Shutdown() {
+  BeginDrain();
   for (auto& w : workers_) {
     if (w->thread.joinable()) w->thread.join();
   }
@@ -99,11 +106,15 @@ void MysqlDatabase::Shutdown() {
     mysql_close(conn_);
     conn_ = nullptr;
   }
-  {
-    std::lock_guard<std::mutex> lock(results_mutex_);
-    results_.clear();
-  }
   started_ = false;
+}
+
+auto MysqlDatabase::AdmitOperation() const -> Result<void> {
+  if (stopping_) return Error{ErrorCode::kReceiverGone, "database is stopping"};
+  if (!started_) return Error{ErrorCode::kIoError, "database is not started"};
+  if (deferred_mode_ && PendingOperations() >= kMaxPendingOperations)
+    return Error{ErrorCode::kRateLimited, "database operation capacity reached"};
+  return {};
 }
 
 auto MysqlDatabase::OpenConnection() const -> st_mysql* {
@@ -130,10 +141,55 @@ auto MysqlDatabase::OpenConnection() const -> st_mysql* {
   return conn;
 }
 
-auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
-  // Indexes live inside CREATE TABLE so the whole schema is idempotent through
-  // IF NOT EXISTS; MySQL has no CREATE INDEX IF NOT EXISTS. Columns are binary
-  // so identifier comparison stays byte-exact, matching the SQLite backend.
+auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema)
+    -> Result<void> {
+  constexpr std::string_view kLock = "CONCAT('atlas.schema.', LEFT(SHA2(DATABASE(), 256), 48))";
+  auto locked = QueryScalar(conn, std::format("SELECT GET_LOCK({}, 10)", kLock));
+  if (!locked) return locked.Error();
+  if (*locked != "1")
+    return Error{ErrorCode::kTimeout, "MysqlDatabase: schema initialization lock unavailable"};
+  auto schema = EnsureSchemaLocked(conn, storage_schema);
+  auto released = QueryScalar(conn, std::format("SELECT RELEASE_LOCK({})", kLock));
+  if (!schema) return schema.Error();
+  if (!released) return released.Error();
+  if (*released != "1")
+    return Error{ErrorCode::kInternalError, "MysqlDatabase: schema initialization lock lost"};
+  return {};
+}
+
+auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema)
+    -> Result<void> {
+  auto existing = QueryScalar(conn,
+                              "SELECT TABLE_NAME FROM information_schema.TABLES "
+                              "WHERE TABLE_SCHEMA = DATABASE() LIMIT 1");
+  if (!existing) return existing.Error();
+  if (existing->has_value()) {
+    auto version = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'schema_version'");
+    if (!version)
+      return Error{
+          version.Error().Code(),
+          std::format("MysqlDatabase: cannot read schema_version: {}", version.Error().Message())};
+    if (*version != std::to_string(kMysqlSchemaVersion))
+      return Error{ErrorCode::kInvalidArgument,
+                   "MysqlDatabase: missing or incompatible schema_version; use a new empty "
+                   "database with matching server binaries; automatic upgrade is disabled"};
+    auto format = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'blob_format_version'");
+    if (!format) return format.Error();
+    if (*format != std::to_string(kDbBlobVersion))
+      return Error{ErrorCode::kInvalidArgument,
+                   "MysqlDatabase: missing or incompatible blob_format_version"};
+    auto digest =
+        QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'storage_schema_digest'");
+    if (!digest) return digest.Error();
+    if (!digest->has_value() ||
+        **digest != std::string_view(reinterpret_cast<const char*>(storage_schema.data()),
+                                     storage_schema.size()))
+      return Error{ErrorCode::kInvalidArgument,
+                   "MysqlDatabase: missing or incompatible storage_schema_digest; "
+                   "database and entity definitions must have the same snapshot schema"};
+    return ExecSql(conn, "SELECT checkout_instance FROM entities LIMIT 0");
+  }
+
   auto entities = ExecSql(conn,
                           "CREATE TABLE IF NOT EXISTS entities ("
                           "dbid BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,"
@@ -168,12 +224,6 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
                       "PRIMARY KEY (`key`)"
                       ") ENGINE=InnoDB DEFAULT CHARSET=binary");
   if (!meta) return meta.Error();
-
-  auto version =
-      ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) VALUES('schema_version','{}') "
-                                "ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)",
-                                kMysqlSchemaVersion));
-  if (!version) return version.Error();
 
   auto counter = ExecSql(conn,
                          "CREATE TABLE IF NOT EXISTS atlas_entity_id_counter ("
@@ -217,21 +267,29 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn) -> Result<void> {
 
   auto begin = BeginTxn(conn);
   if (!begin) return begin.Error();
-  // Serialize seeding before the meta read and counter insert acquire opposite locks.
-  auto serialized =
-      ExecSql(conn, "UPDATE meta SET `value` = `value` WHERE `key` = 'schema_version'");
-  if (!serialized) {
-    Rollback(conn);
-    return serialized.Error();
-  }
   auto seed = ExecSql(conn,
                       "INSERT IGNORE INTO atlas_entity_id_counter(id, next_id) "
                       "SELECT 1, 1 WHERE NOT EXISTS "
                       "(SELECT 1 FROM meta WHERE `key` = 'entity_id_counter_initialized')");
   if (seed) {
+    seed = ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) "
+                                     "VALUES('storage_schema_digest',{})",
+                                     HexLiteral(storage_schema)));
+  }
+  if (seed) {
     seed = ExecSql(conn,
                    "INSERT IGNORE INTO meta(`key`, `value`) "
                    "VALUES('entity_id_counter_initialized', '1')");
+  }
+  if (seed) {
+    seed = ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) "
+                                     "VALUES('blob_format_version','{}')",
+                                     kDbBlobVersion));
+  }
+  if (seed) {
+    seed = ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) "
+                                     "VALUES('schema_version','{}')",
+                                     kMysqlSchemaVersion));
   }
   if (!seed) {
     Rollback(conn);
@@ -271,14 +329,6 @@ void MysqlDatabase::RefreshConnection(st_mysql*& conn) const {
 
 void MysqlDatabase::EnqueueForEntity(uint16_t type_id, uint64_t key,
                                      std::function<void(st_mysql*)> job) {
-  if (stopping_) {
-    job(nullptr);
-    return;
-  }
-  if (workers_.empty()) {
-    job(conn_);
-    return;
-  }
   const std::size_t idx =
       static_cast<std::size_t>(key * 1099511628211ULL + type_id) % workers_.size();
   Worker& w = *workers_[idx];
@@ -321,6 +371,18 @@ auto MysqlDatabase::ExecSql(st_mysql* conn, std::string_view sql) -> Result<void
     mysql_free_result(res);
   }
   return {};
+}
+
+auto MysqlDatabase::QueryScalar(st_mysql* conn, std::string_view sql)
+    -> Result<std::optional<std::string>> {
+  if (mysql_real_query(conn, sql.data(), static_cast<unsigned long>(sql.size())) != 0)
+    return MysqlErr(conn, "MysqlDatabase: schema query failed");
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(conn),
+                                                                mysql_free_result);
+  if (!rows) return MysqlErr(conn, "MysqlDatabase: schema query result unavailable");
+  auto row = mysql_fetch_row(rows.get());
+  if (!row || !row[0]) return std::optional<std::string>{};
+  return std::optional<std::string>{std::string(row[0], mysql_fetch_lengths(rows.get())[0])};
 }
 
 auto MysqlDatabase::QueryRow(st_mysql* conn, std::string_view sql) -> Result<EntityRow> {
@@ -1018,35 +1080,38 @@ auto MysqlDatabase::DoCheckoutByName(st_mysql* conn, uint16_t type_id,
   return CheckoutTail(conn, resolved_dbid, type_id, std::move(row), new_owner, now);
 }
 
-auto MysqlDatabase::DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> bool {
+auto MysqlDatabase::DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id)
+    -> Result<bool> {
   auto upd = ExecSql(
       conn, std::format("UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
                         "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = {} "
                         "WHERE dbid = {} AND type_id = {} AND checked_out = 1",
                         UnixTimeMs(), static_cast<uint64_t>(dbid), type_id));
-  return upd && mysql_affected_rows(conn) > 0;
+  if (!upd) return upd.Error();
+  return mysql_affected_rows(conn) > 0;
 }
 
-auto MysqlDatabase::DoClearForAddress(st_mysql* conn, const Address& base_addr) -> int {
+auto MysqlDatabase::DoClearForAddress(st_mysql* conn, const Address& base_addr) -> Result<int> {
   auto upd = ExecSql(
       conn, std::format("UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
                         "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = {} "
                         "WHERE checked_out = 1 AND checkout_ip = {} AND checkout_port = {}",
                         UnixTimeMs(), base_addr.Ip(), base_addr.Port()));
-  return upd ? static_cast<int>(mysql_affected_rows(conn)) : 0;
+  if (!upd) return upd.Error();
+  return static_cast<int>(mysql_affected_rows(conn));
 }
 
-auto MysqlDatabase::DoGetAutoLoad(st_mysql* conn) -> std::vector<EntityData> {
+auto MysqlDatabase::DoGetAutoLoad(st_mysql* conn) -> Result<std::vector<EntityData>> {
   std::vector<EntityData> result;
   static constexpr std::string_view kSql =
       "SELECT dbid, type_id, `blob`, identifier FROM entities WHERE auto_load = 1 "
       "ORDER BY type_id, dbid";
   if (conn == nullptr ||
       mysql_real_query(conn, kSql.data(), static_cast<unsigned long>(kSql.size())) != 0) {
-    return result;
+    return MysqlErr(conn, "auto-load query failed");
   }
   MYSQL_RES* res = mysql_store_result(conn);
-  if (res == nullptr) return result;
+  if (res == nullptr) return MysqlErr(conn, "auto-load results unavailable");
   while (MYSQL_ROW row = mysql_fetch_row(res)) {
     const unsigned long* len = mysql_fetch_lengths(res);
     EntityData data;
@@ -1063,12 +1128,12 @@ auto MysqlDatabase::DoGetAutoLoad(st_mysql* conn) -> std::vector<EntityData> {
   return result;
 }
 
-void MysqlDatabase::DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
-                                  bool auto_load) {
-  (void)ExecSql(conn,
-                std::format("UPDATE entities SET auto_load = {}, updated_at_ms = {} "
-                            "WHERE dbid = {} AND type_id = {}",
-                            auto_load ? 1 : 0, UnixTimeMs(), static_cast<uint64_t>(dbid), type_id));
+auto MysqlDatabase::DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
+    -> Result<void> {
+  return ExecSql(
+      conn, std::format("UPDATE entities SET auto_load = {}, updated_at_ms = {} "
+                        "WHERE dbid = {} AND type_id = {}",
+                        auto_load ? 1 : 0, UnixTimeMs(), static_cast<uint64_t>(dbid), type_id));
 }
 
 auto MysqlDatabase::DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high)
@@ -1347,29 +1412,34 @@ void MysqlDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t ins
 }
 
 void MysqlDatabase::ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                                  std::function<void(bool)> callback) {
-  Dispatch<bool>(
+                                  std::function<void(Result<bool>)> callback) {
+  Dispatch<Result<bool>>(
       type_id, dbid,
       [dbid, type_id](st_mysql* conn) { return DoClearCheckout(conn, dbid, type_id); },
       std::move(callback));
 }
 
 void MysqlDatabase::ClearCheckoutsForAddress(const Address& base_addr,
-                                             std::function<void(int)> callback) {
-  Dispatch<int>(
+                                             std::function<void(Result<int>)> callback) {
+  Dispatch<Result<int>>(
       0, 0, [base_addr](st_mysql* conn) { return DoClearForAddress(conn, base_addr); },
       std::move(callback));
 }
 
-void MysqlDatabase::GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) {
-  Dispatch<std::vector<EntityData>>(
+void MysqlDatabase::GetAutoLoadEntities(
+    std::function<void(Result<std::vector<EntityData>>)> callback) {
+  Dispatch<Result<std::vector<EntityData>>>(
       0, 0, [](st_mysql* conn) { return DoGetAutoLoad(conn); }, std::move(callback));
 }
 
-void MysqlDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load) {
-  DispatchVoid(type_id, dbid, [dbid, type_id, auto_load](st_mysql* conn) {
-    DoSetAutoLoad(conn, dbid, type_id, auto_load);
-  });
+void MysqlDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
+                                std::function<void(Result<void>)> callback) {
+  Dispatch<Result<void>>(
+      type_id, dbid,
+      [dbid, type_id, auto_load](st_mysql* conn) {
+        return DoSetAutoLoad(conn, dbid, type_id, auto_load);
+      },
+      std::move(callback));
 }
 
 void MysqlDatabase::GetMaxDbidInRange(DatabaseID low, DatabaseID high,

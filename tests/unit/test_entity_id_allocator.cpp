@@ -48,6 +48,8 @@ class StubDatabase : public IDatabase {
     return {};
   }
   void Shutdown() override {}
+  void BeginDrain() override {}
+  auto PendingOperations() const -> std::size_t override { return 0; }
   void PutEntity(DatabaseID, uint16_t, WriteFlags, std::span<const std::byte>, const std::string&,
                  std::function<void(PutResult)>) override {}
   void GetEntity(DatabaseID, uint16_t, std::function<void(GetResult)>) override {}
@@ -57,10 +59,13 @@ class StubDatabase : public IDatabase {
                       std::function<void(GetResult)>) override {}
   void CheckoutEntityByName(uint16_t, const std::string&, const CheckoutInfo&,
                             std::function<void(GetResult)>) override {}
-  void ClearCheckout(DatabaseID, uint16_t, std::function<void(bool)>) override {}
-  void ClearCheckoutsForAddress(const Address&, std::function<void(int)>) override {}
-  void GetAutoLoadEntities(std::function<void(std::vector<EntityData>)>) override {}
-  void SetAutoLoad(DatabaseID, uint16_t, bool) override {}
+  void ClearCheckout(DatabaseID, uint16_t, std::function<void(Result<bool>)>) override {}
+  void ClearCheckoutsForAddress(const Address&, std::function<void(Result<int>)>) override {}
+  void GetAutoLoadEntities(std::function<void(Result<std::vector<EntityData>>)>) override {}
+  void SetAutoLoad(DatabaseID, uint16_t, bool,
+                   std::function<void(Result<void>)> callback) override {
+    callback({});
+  }
   void GetMaxDbidInRange(DatabaseID, DatabaseID,
                          std::function<void(DbidRangeResult)> callback) override {
     callback(DbidRangeResult{true, kInvalidDBID, {}});

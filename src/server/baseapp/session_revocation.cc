@@ -167,6 +167,13 @@ auto BaseApp::CheckSessionBeforeLogin(PendingLogin pending, uint64_t ticket) -> 
 }
 
 void BaseApp::OnPrepareLogin(Channel& ch, const login::PrepareLogin& msg) {
+  if (IsShuttingDown()) {
+    login::PrepareLoginResult reply;
+    reply.request_id = msg.request_id;
+    reply.error = "server_stopping";
+    (void)ch.SendMessage(reply);
+    return;
+  }
   ATLAS_LOG_DEBUG("BaseApp: prepare login request_id={} dbid={} type_id={} blob={}B from {}:{}",
                   msg.request_id, msg.dbid, msg.type_id, msg.entity_blob.size(),
                   ch.RemoteAddress().Ip(), ch.RemoteAddress().Port());
@@ -189,6 +196,7 @@ void BaseApp::OnPrepareLogin(Channel& ch, const login::PrepareLogin& msg) {
   }
 
   PendingLogin pending;
+  pending.entity_def_digest = msg.entity_def_digest;
   pending.login_request_id = msg.request_id;
   pending.loginapp_addr = ch.RemoteAddress();
   pending.type_id = msg.type_id;

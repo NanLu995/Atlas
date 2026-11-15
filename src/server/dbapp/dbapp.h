@@ -37,6 +37,10 @@ class DBApp : public ManagerApp {
   static auto Run(int argc, char* argv[]) -> int;
 
  protected:
+  void BeginShutdown() override;
+  void OnShutdownTick() override;
+  [[nodiscard]] auto PendingShutdownOperations() const -> std::size_t override;
+  void LogShutdownPending() const override;
   auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
   void OnTickComplete() override;

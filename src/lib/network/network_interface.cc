@@ -5,6 +5,7 @@
 #include "foundation/log.h"
 #include "foundation/profiler.h"
 #include "network/event_dispatcher.h"
+#include "network/protocol_version.h"
 #include "network/reliable_udp.h"
 #include "network/tcp_channel.h"
 #include "network/udp_channel.h"
@@ -381,6 +382,7 @@ void NetworkInterface::SetDisconnectCallback(DisconnectCallback cb) {
 }
 
 void NetworkInterface::PrepareForShutdown() {
+  StopAccepting();
   shutting_down_ = true;
 
   while (!channels_.empty()) {
@@ -389,6 +391,22 @@ void NetworkInterface::PrepareForShutdown() {
 
   ATLAS_LOG_INFO("NetworkInterface preparing for shutdown, {} channels condemned",
                  condemned_.size());
+}
+
+auto NetworkInterface::PendingSendCount() const -> std::size_t {
+  auto pending = [this](Channel* channel) {
+    if (channel->HasUnackedReliablePackets() || dirty_channels_.contains(channel)) return true;
+    const auto* tcp = dynamic_cast<const TcpChannel*>(channel);
+    return tcp != nullptr && tcp->WriteBufferSize() != 0;
+  };
+  std::size_t count = 0;
+  for (const auto& [_, channel] : channels_) {
+    if (pending(channel.get())) ++count;
+  }
+  for (const auto& condemned : condemned_) {
+    if (pending(condemned.channel.get())) ++count;
+  }
+  return count;
 }
 
 void NetworkInterface::DoTask() {
@@ -434,7 +452,7 @@ void NetworkInterface::OnTcpAccept() {
       continue;
     }
 
-    if (shutting_down_) {
+    if (shutting_down_ || !accepting_connections_) {
       continue;
     }
 
@@ -500,7 +518,7 @@ void NetworkInterface::OnUdpReadable() {
 
     auto [bytes, src_addr] = *result;
     ++datagrams;
-    if (bytes == 0) {
+    if (!HasConnectionProtocolHeader(recv_buffer.first(bytes))) {
       continue;
     }
 
@@ -510,7 +528,7 @@ void NetworkInterface::OnUdpReadable() {
 
     auto it = channels_.find(src_addr);
     if (it == channels_.end()) {
-      if (shutting_down_ || channels_.size() >= kMaxChannels) {
+      if (shutting_down_ || !accepting_connections_ || channels_.size() >= kMaxChannels) {
         continue;
       }
 
@@ -553,7 +571,7 @@ void NetworkInterface::OnRudpReadable() {
 
     auto [bytes, src_addr] = *result;
     ++datagrams;
-    if (bytes == 0) continue;
+    if (!HasConnectionProtocolHeader(recv_buffer.first(bytes))) continue;
 
     if (rate_limit_ > 0 && !CheckRateLimit(src_addr.Ip())) continue;
 
@@ -565,7 +583,9 @@ void NetworkInterface::OnRudpReadable() {
         continue;
       }
 
-      if (!rudp_server_mode_ || shutting_down_ || channels_.size() >= kMaxChannels) continue;
+      if (!rudp_server_mode_ || shutting_down_ || !accepting_connections_ ||
+          channels_.size() >= kMaxChannels)
+        continue;
 
       auto channel = make_intrusive<ReliableUdpChannel>(dispatcher_, interface_table_,
                                                         *rudp_socket_, src_addr);

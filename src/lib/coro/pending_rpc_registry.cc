@@ -31,12 +31,22 @@ PendingRpcRegistry::~PendingRpcRegistry() {
 
 auto PendingRpcRegistry::RegisterPending(MessageID reply_id, uint64_t request_id,
                                          ReplyCallback on_reply, ErrorCallback on_error,
-                                         Duration timeout, Channel* channel) -> PendingHandle {
+                                         Duration timeout, Channel* channel, Error* rejection)
+    -> PendingHandle {
   auto key = PendingKey{reply_id, request_id};
-  if (reply_id == 0 || !on_reply || stopping_ || cancelling_all_ || next_handle_ == 0 ||
-      pending_.size() >= kMaxPendingRpcs || pending_.contains(key)) {
+  auto reject = [rejection](Error error) -> PendingHandle {
+    if (rejection) *rejection = std::move(error);
     return {};
-  }
+  };
+  if (stopping_ || cancelling_all_)
+    return reject(Error{ErrorCode::kReceiverGone, "RPC registry is stopping"});
+  if (reply_id == 0 || !on_reply)
+    return reject(Error{ErrorCode::kInvalidArgument, "invalid RPC registration"});
+  if (pending_.contains(key))
+    return reject(Error{ErrorCode::kAlreadyExists, "RPC request already registered"});
+  if (next_handle_ == 0) return reject(Error{ErrorCode::kOutOfRange, "RPC handles exhausted"});
+  if (pending_.size() >= kMaxPendingRpcs)
+    return reject(Error{ErrorCode::kRateLimited, "RPC wait capacity reached"});
   PendingHandle handle{next_handle_++};
   TimerHandle timer;
   if (timeout > Duration::zero()) {

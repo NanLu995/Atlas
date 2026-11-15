@@ -28,7 +28,7 @@ atlas_dotnet_project(
   NAME atlas_rpc_fixture_base_dll
   PROJECT_FILE Atlas.RpcFixture/Base/Atlas.RpcFixture.Base.csproj
   ASSEMBLY_NAME Atlas.RpcFixture.Base.dll
-  DEPENDS atlas_runtime_dll
+  DEPENDS atlas_runtime_dll atlas_generators_def_dll
   DEPLOY
 )
 
@@ -36,7 +36,7 @@ atlas_dotnet_project(
   NAME atlas_rpc_fixture_client_dll
   PROJECT_FILE Atlas.RpcFixture/Client/Atlas.RpcFixture.Client.csproj
   ASSEMBLY_NAME Atlas.RpcFixture.Client.dll
-  DEPENDS atlas_client_dll
+  DEPENDS atlas_client_dll atlas_generators_def_dll
   DEPLOY
 )
 
@@ -44,7 +44,7 @@ atlas_dotnet_project(
   NAME atlas_rpc_fixture_cell_dll
   PROJECT_FILE Atlas.RpcFixture/Cell/Atlas.RpcFixture.Cell.csproj
   ASSEMBLY_NAME Atlas.RpcFixture.Cell.dll
-  DEPENDS atlas_runtime_dll
+  DEPENDS atlas_runtime_dll atlas_generators_def_dll
   DEPLOY
 )
 
@@ -54,6 +54,23 @@ foreach(_fixture IN ITEMS base client cell)
     DEPENDS Atlas.RpcFixture/Account.def Atlas.RpcFixture/Probe.def Atlas.RpcFixture/entity_ids.xml
   )
 endforeach()
+
+add_test(NAME test_entitydef_export
+  COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../integration/test_entitydef_export.py"
+    --dotnet "${DOTNET_EXECUTABLE}"
+    --defdump "$<GENEX_EVAL:$<TARGET_PROPERTY:atlas_tools_defdump,DOTNET_ASSEMBLY>>"
+    --assembly "$<GENEX_EVAL:$<TARGET_PROPERTY:atlas_rpc_fixture_base_dll,DOTNET_ASSEMBLY>>"
+    --runtime-assembly "$<GENEX_EVAL:$<TARGET_PROPERTY:atlas_runtime_dll,DOTNET_ASSEMBLY>>"
+    --dbapp "$<TARGET_FILE:atlas_dbapp>")
+set_tests_properties(test_entitydef_export PROPERTIES LABELS "integration" TIMEOUT 150)
+
+if(WIN32)
+  add_dependencies(test_login_flow atlas_tools_defdump atlas_rpc_fixture_base_dll_deploy)
+  target_compile_definitions(test_login_flow PRIVATE
+    "ATLAS_TEST_DOTNET=\"${DOTNET_EXECUTABLE}\""
+    "ATLAS_TEST_DEFDUMP=\"$<GENEX_EVAL:$<TARGET_PROPERTY:atlas_tools_defdump,DOTNET_ASSEMBLY>>\"")
+endif()
 
 foreach(_suite IN ITEMS Runtime Generators Client)
   add_test(NAME test_csharp_${_suite}

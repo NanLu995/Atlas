@@ -5,9 +5,11 @@
 
 #include <gtest/gtest.h>
 
+#include "atdf_account_fixture.h"
 #include "db_sqlite/sqlite_database.h"
 #include "entitydef/entity_def_registry.h"
 #include "test_account_session_contract.h"
+#include "test_database_admission.h"
 
 using namespace atlas;
 
@@ -24,54 +26,9 @@ auto make_blob(std::string_view text) -> std::vector<std::byte> {
 
 void register_account_entity() {
   EntityDefRegistry::Instance().clear();
-
-  std::vector<std::byte> buf;
-  auto write_str = [&](const std::string& s) {
-    auto len = static_cast<uint32_t>(s.size());
-    if (len < 128) {
-      buf.push_back(static_cast<std::byte>(len));
-    } else {
-      buf.push_back(static_cast<std::byte>((len & 0x7F) | 0x80));
-      buf.push_back(static_cast<std::byte>(len >> 7));
-    }
-    for (char c : s) {
-      buf.push_back(static_cast<std::byte>(c));
-    }
-  };
-  auto write_u8 = [&](uint8_t v) { buf.push_back(static_cast<std::byte>(v)); };
-  auto write_u16 = [&](uint16_t v) {
-    buf.push_back(static_cast<std::byte>(v & 0xFF));
-    buf.push_back(static_cast<std::byte>(v >> 8));
-  };
-
-  write_str("Account");
-  write_u16(1);
-  write_u8(0);
-  write_u8(1);
-  write_u8(2);
-
-  write_str("accountName");
-  write_u8(11);
-  write_u8(1);
-  write_u8(1);
-  write_u8(5);
-  write_u16(0);
-  write_u8(1);  // identifier
-  write_u8(0);  // reliable
-
-  write_str("level");
-  write_u8(6);
-  write_u8(1);
-  write_u8(1);
-  write_u8(5);
-  write_u16(1);
-  write_u8(0);  // identifier
-  write_u8(0);  // reliable
-
-  write_u8(0);
-
+  const auto blob = atlas::test_fixtures::MakeAccountTypeBlob();
   ASSERT_TRUE(
-      EntityDefRegistry::Instance().RegisterType(buf.data(), static_cast<int32_t>(buf.size())));
+      EntityDefRegistry::Instance().RegisterType(blob.data(), static_cast<int32_t>(blob.size())));
 }
 
 }  // namespace
@@ -144,6 +101,98 @@ class SqliteDatabaseTest : public ::testing::Test {
   SqliteDatabase db_;
   std::filesystem::path test_dir_;
 };
+
+TEST_F(SqliteDatabaseTest, AdmissionIncludesUnconsumedResultsAndRejectsBeforeWriting) {
+  atlas::test_support::CheckDatabaseAdmission(db_);
+}
+
+TEST_F(SqliteDatabaseTest, StartupRejectsSchemaVersionWithoutOverwritingIt) {
+  ASSERT_TRUE(SqliteDatabaseTestAccess::Execute(
+      db_, "UPDATE meta SET value = 'unsupported' WHERE key = 'schema_version'"));
+  db_.Shutdown();
+
+  DatabaseConfig config;
+  config.type = "sqlite";
+  config.sqlite_path = test_dir_ / "atlas.sqlite3";
+  auto started = db_.Startup(config, EntityDefRegistry::Instance());
+  EXPECT_FALSE(started.HasValue());
+  if (!started) {
+    EXPECT_NE(started.Error().Message().find("schema_version"), std::string_view::npos);
+  }
+  db_.Shutdown();
+
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open(config.sqlite_path.string().c_str(), &raw), SQLITE_OK);
+  std::unique_ptr<sqlite3, decltype(&sqlite3_close)> connection(raw, sqlite3_close);
+  std::string version;
+  ASSERT_EQ(sqlite3_exec(
+                raw, "SELECT value FROM meta WHERE key = 'schema_version'",
+                [](void* output, int, char** values, char**) {
+                  *static_cast<std::string*>(output) = values[0];
+                  return 0;
+                },
+                &version, nullptr),
+            SQLITE_OK);
+  EXPECT_EQ(version, "unsupported");
+}
+
+TEST_F(SqliteDatabaseTest, StartupRejectsMissingSchemaVersion) {
+  ASSERT_TRUE(
+      SqliteDatabaseTestAccess::Execute(db_, "DELETE FROM meta WHERE key = 'schema_version'"));
+  db_.Shutdown();
+  DatabaseConfig config;
+  config.type = "sqlite";
+  config.sqlite_path = test_dir_ / "atlas.sqlite3";
+  auto started = db_.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("schema_version"), std::string_view::npos);
+}
+
+TEST_F(SqliteDatabaseTest, StartupRejectsUnsupportedBlobFormatWithoutUpdatingMetadata) {
+  ASSERT_TRUE(SqliteDatabaseTestAccess::Execute(
+      db_, "UPDATE meta SET value = 'unsupported' WHERE key = 'blob_format_version'"));
+  db_.Shutdown();
+  DatabaseConfig config;
+  config.type = "sqlite";
+  config.sqlite_path = test_dir_ / "atlas.sqlite3";
+  auto started = db_.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("blob_format_version"), std::string_view::npos);
+}
+
+TEST_F(SqliteDatabaseTest, StartupRejectsChangedSnapshotSchemaWithoutReplacingTheDigest) {
+  db_.Shutdown();
+  DatabaseConfig config;
+  config.type = "sqlite";
+  config.sqlite_path = test_dir_ / "atlas.sqlite3";
+  auto& registry = EntityDefRegistry::Instance();
+  const auto original = registry.types[0].properties[1].data_type;
+  registry.types[0].properties[1].data_type = PropertyDataType::kUInt64;
+  auto started = db_.Startup(config, registry);
+  EXPECT_FALSE(started.HasValue());
+  if (!started) {
+    EXPECT_NE(started.Error().Message().find("storage_schema_digest"), std::string_view::npos);
+  }
+  db_.Shutdown();
+  registry.types[0].properties[1].data_type = original;
+  ASSERT_TRUE(db_.Startup(config, registry));
+}
+
+TEST_F(SqliteDatabaseTest, StartupRejectsMissingSnapshotSchemaDigest) {
+  ASSERT_TRUE(SqliteDatabaseTestAccess::Execute(
+      db_, "DELETE FROM meta WHERE key = 'storage_schema_digest'"));
+  db_.Shutdown();
+  DatabaseConfig config;
+  config.type = "sqlite";
+  config.sqlite_path = test_dir_ / "atlas.sqlite3";
+  auto started = db_.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("storage_schema_digest"), std::string_view::npos);
+}
+
+TEST_F(SqliteDatabaseTest, DrainRejectsNewWorkAndCompletesAcceptedCallbacks) {
+  atlas::test_support::CheckDatabaseDrain(db_);
+}
 
 TEST_F(SqliteDatabaseTest, AccountSessionOwnershipContract) {
   atlas::test_support::CheckAccountSessionContract(db_);
@@ -885,7 +934,10 @@ TEST_F(SqliteDatabaseTest, CheckoutAndClear) {
   EXPECT_EQ(second.checked_out_by->app_id, 10u);
 
   bool cleared = false;
-  db_.ClearCheckout(put.dbid, 1, [&](bool ok) { cleared = ok; });
+  db_.ClearCheckout(put.dbid, 1, [&](Result<bool> ok) {
+    ASSERT_TRUE(ok);
+    cleared = *ok;
+  });
   EXPECT_TRUE(cleared);
 }
 
@@ -1058,7 +1110,10 @@ TEST_F(SqliteDatabaseTest, AutoLoadAndDeferredCallbacks) {
   ASSERT_TRUE(put.success);
 
   std::vector<EntityData> entities;
-  db_.GetAutoLoadEntities([&](std::vector<EntityData> rows) { entities = std::move(rows); });
+  db_.GetAutoLoadEntities([&](Result<std::vector<EntityData>> rows) {
+    ASSERT_TRUE(rows);
+    entities = std::move(*rows);
+  });
   EXPECT_TRUE(entities.empty());
   db_.ProcessResults();
   ASSERT_EQ(entities.size(), 1u);
@@ -1403,7 +1458,10 @@ TEST_F(SqliteDatabaseTest, CheckoutByNameAndClearCheckoutsForAddress) {
   EXPECT_FALSE(checkout_chris.checked_out_by.has_value());
 
   int cleared = 0;
-  db_.ClearCheckoutsForAddress(owner_a.base_addr, [&](int count) { cleared = count; });
+  db_.ClearCheckoutsForAddress(owner_a.base_addr, [&](Result<int> count) {
+    ASSERT_TRUE(count);
+    cleared = *count;
+  });
   EXPECT_EQ(cleared, 2);
 
   GetResult alice_after_clear;
@@ -1455,8 +1513,10 @@ TEST_F(SqliteDatabaseTest, PutEntityWithPasswordPreservesAutoLoadAndClearsChecko
   EXPECT_EQ(lookup.password_hash, "pw_hash_2");
 
   std::vector<EntityData> auto_load_entities;
-  db_.GetAutoLoadEntities(
-      [&](std::vector<EntityData> rows) { auto_load_entities = std::move(rows); });
+  db_.GetAutoLoadEntities([&](Result<std::vector<EntityData>> rows) {
+    ASSERT_TRUE(rows);
+    auto_load_entities = std::move(*rows);
+  });
   ASSERT_EQ(auto_load_entities.size(), 1u);
   EXPECT_EQ(auto_load_entities[0].dbid, put.dbid);
 }

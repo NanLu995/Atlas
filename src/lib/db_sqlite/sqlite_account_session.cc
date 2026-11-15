@@ -34,11 +34,13 @@ auto SqliteDatabase::ReadAccountSessionImpl(DatabaseID dbid, uint16_t type_id)
 
 void SqliteDatabase::ReadAccountSession(DatabaseID dbid, uint16_t type_id,
                                         std::function<void(Result<AccountSession>)> callback) {
+  if (!AdmitCallback(callback)) return;
   FireOrDefer(std::move(callback), ReadAccountSessionImpl(dbid, type_id));
 }
 
 void SqliteDatabase::UpdateAccountSession(const AccountSessionOperation& op,
                                           std::function<void(Result<AccountSession>)> callback) {
+  if (!AdmitCallback(callback)) return;
   if (auto valid = ValidateSessionOperation(op); !valid) {
     FireOrDefer(std::move(callback), Result<AccountSession>{valid.Error()});
     return;

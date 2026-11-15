@@ -147,7 +147,16 @@ auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp
   req.username = std::string(username);
   req.password_hash = std::string(password_hash);
   req.entity_def_digest = entity_def_digest_;
-  (void)loginapp_channel_->SendMessage(req);
+  auto sent = loginapp_channel_->SendMessage(req);
+  if (!sent) {
+    last_error_ = std::format("Send(LoginRequest) failed: {}", sent.Error().Message());
+    (void)Disconnect(ATLAS_DISCONNECT_USER);
+    if (sent.Error().Code() == ErrorCode::kWouldBlock ||
+        sent.Error().Code() == ErrorCode::kRateLimited)
+      return ATLAS_NET_ERR_BUSY;
+    if (sent.Error().Code() == ErrorCode::kChannelCondemned) return ATLAS_NET_ERR_NOCONN;
+    return ATLAS_NET_ERR_IO;
+  }
 
   login_callback_ = callback;
   login_user_data_ = user_data;
@@ -248,6 +257,15 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
   auto send_result = baseapp_channel_->SendMessage(auth_msg);
   ATLAS_LOG_INFO("ClientSession: sent Authenticate to {} (send_ok={})",
                  baseapp_addr_.ToString(), static_cast<bool>(send_result));
+  if (!send_result) {
+    last_error_ = std::format("Send(Authenticate) failed: {}", send_result.Error().Message());
+    (void)Disconnect(ATLAS_DISCONNECT_USER);
+    if (send_result.Error().Code() == ErrorCode::kWouldBlock ||
+        send_result.Error().Code() == ErrorCode::kRateLimited)
+      return ATLAS_NET_ERR_BUSY;
+    if (send_result.Error().Code() == ErrorCode::kChannelCondemned) return ATLAS_NET_ERR_NOCONN;
+    return ATLAS_NET_ERR_IO;
+  }
 
   auth_callback_ = callback;
   auth_user_data_ = user_data;

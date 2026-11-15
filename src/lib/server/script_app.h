@@ -30,6 +30,7 @@ class ScriptApp : public ServerApp {
   void Fini() override;
 
   void OnTickComplete() override;
+  void OnShutdownTick() override;
 
   // Create the per-process INativeApiProvider implementation.
   // Called before CLR initialisation; must NOT use any CLR APIs.

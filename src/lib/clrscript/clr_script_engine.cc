@@ -36,6 +36,11 @@ auto ClrScriptEngine::Initialize() -> Result<void> {
     return Error{ErrorCode::kScriptError, std::format("ClrScriptEngine: CLR init failed: {}",
                                                       host_result.Error().Message())};
 
+  if (!config_.lifecycle_type.empty()) {
+    auto abi = VerifyClrAbi(host_, config_.runtime_assembly_path, config_.lifecycle_type);
+    if (!abi) return abi.Error();
+  }
+
   auto bootstrap_result =
       config_.bootstrap_args
           ? ClrBootstrap(host_, config_.runtime_assembly_path, *config_.bootstrap_args)
@@ -65,6 +70,8 @@ auto ClrScriptEngine::Initialize() -> Result<void> {
     r = bind(on_tick_, kLifecycle, "OnTick");
     if (!r) return r.Error();
     r = bind(on_shutdown_, kLifecycle, "OnShutdown");
+    if (!r) return r.Error();
+    r = bind(on_drain_, kLifecycle, "OnDrain");
     if (!r) return r.Error();
   }
 
@@ -143,6 +150,13 @@ void ClrScriptEngine::OnShutdown() {
   if (!result) ATLAS_LOG_ERROR("ClrScriptEngine::OnShutdown failed: {}", result.Error().Message());
 }
 
+auto ClrScriptEngine::Drain() -> Result<void> {
+  if (!initialized_ || !on_drain_.IsBound()) return {};
+  auto result = on_drain_.Invoke();
+  if (!result) return result.Error();
+  return {};
+}
+
 auto ClrScriptEngine::CallFunction(std::string_view /*module_name*/,
                                    std::string_view /*function_name*/,
                                    std::span<const ScriptValue> /*args*/) -> Result<ScriptValue> {
@@ -185,6 +199,7 @@ void ClrScriptEngine::ResetAllMethods() {
   on_init_.Reset();
   on_tick_.Reset();
   on_shutdown_.Reset();
+  on_drain_.Reset();
   load_scripts_.Reset();
   serialize_and_unload_.Reset();
   load_and_restore_.Reset();

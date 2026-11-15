@@ -32,6 +32,33 @@ def resolve_program(repo_root: Path, bin_name: str, subdirs: Iterable[str], stem
     return bin_base / f"{stem}{'.exe' if os.name == 'nt' else ''}"
 
 
+def export_entity_definitions(repo_root: Path, build_dir: str, assembly: Path, output: Path) -> str:
+    tool = repo_root / "build" / Path(build_dir).name / "csharp" / "Atlas.Tools.DefDump.dll"
+    if not tool.is_file():
+        raise RuntimeError(f"missing {tool}; build atlas_tools_defdump in the selected build directory")
+    if not assembly.is_file():
+        raise RuntimeError(f"missing entity assembly {assembly}; build or select --base-assembly")
+    try:
+        result = subprocess.run(
+            ["dotnet", str(tool), "--assembly", str(assembly), "--out", str(output)],
+            cwd=repo_root, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"cannot export definitions from {assembly}: {error}") from error
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"DefDump failed for {assembly}: {detail}")
+    try:
+        with output.open("rb") as source:
+            header = source.read(40)
+    except OSError as error:
+        raise RuntimeError(f"DefDump did not create {output}: {error}") from error
+    if (len(header) != 40 or header[:4] != b"ATDF" or int.from_bytes(header[4:6], "little") != 4
+            or header[6:8] != b"\0\0" or header[8:] == bytes(32)):
+        raise RuntimeError(f"invalid definition header or digest in {output}; rebuild the entity assembly")
+    return header[8:].hex()
+
+
 @dataclass
 class LoggedProcess:
     name: str
@@ -87,11 +114,14 @@ def start_logged_process(
 
 
 def stop_logged_processes(processes: list[LoggedProcess]) -> None:
+    failures = []
     for order in sorted({entry.start_order for entry in processes}, reverse=True):
         group = [entry for entry in processes if entry.start_order == order]
+        stopping = []
         for entry in group:
             proc = entry.process
             if proc.poll() is None:
+                stopping.append(entry)
                 _log(f"Stopping {entry.name} (pid={proc.pid})")
                 try:
                     if os.name == "nt":
@@ -102,28 +132,36 @@ def stop_logged_processes(processes: list[LoggedProcess]) -> None:
                 except ProcessLookupError:
                     pass
 
-        for entry in group:
+        deadline = time.monotonic() + 35
+        for entry in stopping:
             proc = entry.process
-            if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                failures.append(f"{entry.name}: shutdown exceeded 35 seconds; forced termination")
                 try:
-                    proc.wait(timeout=8)
+                    if os.name == "nt":
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    try:
-                        if os.name == "nt":
-                            proc.kill()
-                        else:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    failures.append(f"{entry.name}: process did not exit after forced termination")
+            else:
+                if proc.returncode != 0:
+                    failures.append(f"{entry.name}: shutdown exit code {proc.returncode}")
 
+        for entry in group:
             if entry.stdout_handle:
                 entry.stdout_handle.close()
             if entry.stderr_handle:
                 entry.stderr_handle.close()
+
+    if failures:
+        raise RuntimeError("Cluster shutdown failed: " + "; ".join(failures))
 
 
 def wait_for_registration(

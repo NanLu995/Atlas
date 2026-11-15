@@ -25,6 +25,9 @@ namespace atlas {
 
 struct CellAppMigrationTestAccess {
   static void TickTimeouts(CellApp& app) { app.TickOffloadAckTimeouts(); }
+  static void RecordSuccess(CellApp& app, EntityID id, const Address& source, uint32_t epoch) {
+    app.offload_receipts_[id] = {epoch, source, cellapp::OffloadRejectReason::kNone};
+  }
 
   static void FillReceipts(CellApp& app) {
     for (uint32_t id = 1; id <= app.kMaxOffloadReceipts; ++id) {
@@ -209,6 +212,45 @@ TEST(OffloadRevert, ReceiptCapacityRejectsNewEntityBeforeCreation) {
 
   EXPECT_EQ(h.app.FindEntity(msg.entity_id), nullptr);
   EXPECT_EQ(h.app.FindSpace(msg.space_id), nullptr);
+}
+
+TEST(OffloadRevert, ShutdownReplaysConfirmedSuccessInsteadOfAllowingSourceRollback) {
+  Harness harness;
+  InterfaceTable table;
+  class ReplyChannel : public Channel {
+   public:
+    using Channel::Channel;
+    auto Fd() const -> FdHandle override { return kInvalidFd; }
+    std::optional<cellapp::OffloadEntityAck> reply;
+
+   protected:
+    auto DoSend(std::span<const std::byte> data) -> Result<std::size_t> override {
+      BinaryReader reader(data);
+      auto id = reader.ReadPackedInt();
+      EXPECT_TRUE(id);
+      auto result = cellapp::OffloadEntityAck::Deserialize(reader);
+      EXPECT_TRUE(result);
+      if (result) reply = *result;
+      return data.size();
+    }
+  };
+  const Address source("127.0.0.1", 30007);
+  auto channel = make_intrusive<ReplyChannel>(harness.dispatcher, table, source);
+  harness.app.PeerRegistryForTest().InsertForTest(source, channel.get());
+  CellAppMigrationTestAccess::RecordSuccess(harness.app, 100, source, 7);
+  harness.app.Shutdown();
+  cellapp::OffloadEntity request;
+  request.entity_id = 100;
+  request.cell_epoch = 7;
+  harness.app.OnOffloadEntity(source, channel.get(), request);
+  ASSERT_TRUE(channel->reply);
+  EXPECT_TRUE(channel->reply->success);
+  EXPECT_EQ(channel->reply->reject_reason, cellapp::OffloadRejectReason::kNone);
+  request.cell_epoch = 8;
+  harness.app.OnOffloadEntity(source, channel.get(), request);
+  ASSERT_TRUE(channel->reply);
+  EXPECT_FALSE(channel->reply->success);
+  EXPECT_EQ(channel->reply->reject_reason, cellapp::OffloadRejectReason::kRejected);
 }
 
 TEST(OffloadRevert, RevertRestoresRealWithHauntsCellAndControllers) {

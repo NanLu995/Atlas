@@ -6,6 +6,7 @@ import argparse
 import json
 import random
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from common.cluster import (
     LoggedProcess,
+    export_entity_definitions,
     resolve_program,
     start_logged_process,
     stop_logged_processes,
@@ -29,12 +31,15 @@ def parse_args() -> argparse.Namespace:
         "loginapp + baseapp) on 127.0.0.1 for integration testing. Outputs a "
         "READY line to stdout once every process has registered, then blocks "
         "until stdin is closed before tearing the cluster down. Stdin accepts "
-        "kill-baseapp or restart-baseapp <internal-port> for this launcher's own BaseApps.",
+        "kill-baseapp, shutdown-baseapp or restart-baseapp <internal-port> for owned BaseApps.",
     )
     parser.add_argument("--build-dir", default="debug",
                         help="Subdirectory of bin/ where binaries live (default: debug).")
+    parser.add_argument("--log-level", default="info",
+                        choices=('trace', 'debug', 'info', 'warning', 'error', 'critical', 'off'),
+                        help="Server log level for this isolated cluster (default: info).")
     parser.add_argument("--base-assembly", type=Path,
-                        help="BaseApp script assembly (default: bin/<build-dir>/Atlas.Runtime.dll).")
+                        help="Required BaseApp entity assembly, built with the current .def generator.")
     parser.add_argument("--cell-assembly", type=Path,
                         help="Also start CellAppMgr and one CellApp with this script assembly.")
     parser.add_argument("--baseapps", type=int, choices=(1, 2), default=1,
@@ -100,28 +105,30 @@ _RC_RETRY = -42
 _EARLY_EXIT_GRACE_SEC = 2.0
 
 
-def _kill_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int) -> None:
+def _baseapp_index(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int) -> int:
     index = next((i for i, pair in enumerate(ports) if pair[0] == port), None)
     if index is None:
         raise RuntimeError(f"BaseApp port {port} is not in this test cluster")
     name = 'baseapp' if index == 0 else 'baseapp-2'
-    process = next(entry.process for entry in processes if entry.name == name)
+    return next(i for i, entry in enumerate(processes) if entry.name == name)
+
+
+def _kill_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int) -> None:
+    entry = processes[_baseapp_index(processes, ports, port)]
+    process = entry.process
     if process.poll() is not None:
-        raise RuntimeError(f"{name} already exited; inspect its test cluster log")
+        raise RuntimeError(f"{entry.name} already exited; inspect its test cluster log")
     process.kill()
     process.wait(timeout=5)
 
 
 def _restart_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int,
                      repo_root: Path, log_dir: Path) -> None:
-    index = next((i for i, pair in enumerate(ports) if pair[0] == port), None)
-    if index is None:
-        raise RuntimeError(f"BaseApp port {port} is not in this test cluster")
-    name = 'baseapp' if index == 0 else 'baseapp-2'
-    entry_index = next(i for i, entry in enumerate(processes) if entry.name == name)
+    entry_index = _baseapp_index(processes, ports, port)
     previous = processes[entry_index]
+    name = previous.name
     if previous.process.poll() is None:
-        raise RuntimeError(f"{name} is still running; kill it before restart")
+        raise RuntimeError(f"{name} is still running; stop it before restart")
     arguments = previous.process.args
     restart_logs = log_dir / 'restarts' / f'{name}-{time.monotonic_ns()}'
     restart_logs.mkdir(parents=True)
@@ -129,6 +136,22 @@ def _restart_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]
         arguments=arguments[1:], working_directory=repo_root, log_directory=restart_logs)
     replacement.start_order = previous.start_order
     processes[entry_index] = replacement
+
+
+def _shutdown_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]],
+                      port: int, atlas_tool: Path, machined_address: str) -> None:
+    entry = processes[_baseapp_index(processes, ports, port)]
+    name = entry.name
+    if entry.process.poll() is not None:
+        raise RuntimeError(f"{name} is not running")
+    sent = subprocess.run([str(atlas_tool), '--machined', machined_address,
+                           'shutdown', f'baseapp:{name}'], capture_output=True, text=True,
+                          timeout=10, check=False)
+    if sent.returncode != 0:
+        raise RuntimeError(f"cannot request shutdown of {name}: atlas_tool exit {sent.returncode}")
+    code = entry.process.wait(timeout=35)
+    if code != 0:
+        raise RuntimeError(f"{name} shutdown exit code {code}")
 
 
 def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
@@ -145,7 +168,11 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     bin_name = args.build_dir
     runtime_config = repo_root / "runtime" / "atlas_server.runtimeconfig.json"
     runtime_assembly = repo_root / "bin" / bin_name / "Atlas.Runtime.dll"
-    base_assembly = args.base_assembly or runtime_assembly
+    if args.base_assembly is None:
+        print("missing --base-assembly; select a compiled game entity assembly with .def definitions",
+              file=sys.stderr, flush=True)
+        return 1
+    base_assembly = args.base_assembly
 
     machined = resolve_program(repo_root, bin_name, [], "machined")
     loginapp = resolve_program(repo_root, bin_name, [], "atlas_loginapp")
@@ -174,6 +201,13 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     db_dir.mkdir(parents=True, exist_ok=True)
 
+    entitydef_path = run_root / "entity_defs.bin"
+    try:
+        export_entity_definitions(repo_root, bin_name, base_assembly, entitydef_path)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr, flush=True)
+        return 1
+
     database = database_config(args, db_dir / 'test_cluster.sqlite3')
     record_database_run(run_root, database, baseapps=args.baseapps,
                         cellapps=1 if args.cell_assembly else 0)
@@ -196,7 +230,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             name="machined", file_path=machined,
             working_directory=repo_root, log_directory=log_dir,
             arguments=["--type", "machined", "--name", "machined",
-                       "--internal-port", str(machined_port), "--log-level", "info"]))
+                       "--internal-port", str(machined_port), "--log-level", args.log_level]))
         processes[-1].start_order = 1
         time.sleep(1)
 
@@ -207,7 +241,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        "--machined", machined_address,
                        "--internal-port", str(dbapp_port),
                        "--config", str(db_config_path),
-                       "--update-hertz", "50", "--log-level", "info"]))
+                       "--entitydef-bin-path", str(entitydef_path),
+                       "--update-hertz", "50", "--log-level", args.log_level]))
         processes[-1].start_order = 2
         wait_for_database_start(processes[-1].process, log_dir)
 
@@ -217,7 +252,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             arguments=["--type", "baseappmgr", "--name", "baseappmgr",
                        "--machined", machined_address,
                        "--internal-port", str(baseappmgr_port),
-                       "--update-hertz", "50", "--log-level", "info"]))
+                       "--update-hertz", "50", "--log-level", args.log_level]))
         processes[-1].start_order = 3
 
         if args.cell_assembly:
@@ -227,7 +262,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                 arguments=["--type", "cellappmgr", "--name", "cellappmgr",
                            "--machined", machined_address,
                            "--internal-port", str(port_base + 8),
-                           "--update-hertz", "50", "--log-level", "info"]))
+                           "--update-hertz", "50", "--log-level", args.log_level]))
             processes[-1].start_order = 3
             processes.append(start_logged_process(
                 name="cellapp", file_path=cellapp,
@@ -237,7 +272,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--internal-port", str(port_base + 9),
                            "--assembly", str(args.cell_assembly),
                            "--runtime-config", str(runtime_config),
-                           "--update-hertz", "50", "--log-level", "info"]))
+                           "--update-hertz", "50", "--log-level", args.log_level]))
             processes[-1].start_order = 3
 
         baseapp_ports = [(baseapp_internal_port, baseapp_external_port)]
@@ -254,7 +289,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--external-port", str(external_port),
                            "--assembly", str(base_assembly),
                            "--runtime-config", str(runtime_config),
-                           "--update-hertz", "50", "--log-level", "info"]))
+                           "--update-hertz", "50", "--log-level", args.log_level]))
             processes[-1].start_order = 4
 
         processes.append(start_logged_process(
@@ -268,7 +303,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        # sequential RealCluster tests sharing 127.0.0.1.
                        "--login-rate-limit-per-ip", "10000",
                        "--login-rate-limit-global", "100000",
-                       "--update-hertz", "50", "--log-level", "info"]))
+                       "--update-hertz", "50", "--log-level", args.log_level]))
         processes[-1].start_order = 5
 
         # Grace window for bind failures (WSAEACCES → immediate exit).
@@ -317,16 +352,20 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
 
         for line in iter(sys.stdin.readline, ""):
             command = line.split()
-            if (len(command) != 2 or command[0] not in ('kill-baseapp', 'restart-baseapp')
+            if (len(command) != 2 or command[0] not in
+                    ('kill-baseapp', 'shutdown-baseapp', 'restart-baseapp')
                     or not command[1].isdigit()):
-                raise RuntimeError("expected kill-baseapp or restart-baseapp <internal-port>")
+                raise RuntimeError("expected kill-baseapp, shutdown-baseapp or restart-baseapp <internal-port>")
             port = int(command[1])
             if command[0] == 'kill-baseapp':
                 _kill_baseapp(processes, baseapp_ports, port)
                 print(f"KILLED baseapp_internal_port={port}", flush=True)
-            else:
+            elif command[0] == 'restart-baseapp':
                 _restart_baseapp(processes, baseapp_ports, port, repo_root, log_dir)
                 print(f"RESTARTED baseapp_internal_port={port}", flush=True)
+            else:
+                _shutdown_baseapp(processes, baseapp_ports, port, atlas_tool, machined_address)
+                print(f"SHUTDOWN baseapp_internal_port={port}", flush=True)
         return 0
     except KeyboardInterrupt:
         return 0

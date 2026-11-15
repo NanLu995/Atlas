@@ -72,7 +72,9 @@ class MockNativeProvider : public INativeApiProvider {
   void UnregisterAllEntityTypes() override {}
   void RegisterStruct(const std::byte*, int32_t) override {}
   void SetEntityDefDigest(const std::byte*, int32_t) override {}
-  void WriteToDb(uint32_t, const std::byte*, int32_t) override {}
+  auto WriteToDb(uint32_t, const std::byte*, int32_t, uint64_t) -> RpcSendResult override {
+    return RpcSendResult::kQueued;
+  }
   auto TransferClient(uint32_t, uint32_t, uint32_t, uint16_t, uint64_t, uint64_t)
       -> RpcSendResult override {
     return RpcSendResult::kInvalidTarget;

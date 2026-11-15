@@ -1,5 +1,11 @@
 <entity name="Account">
+  <properties>
+    <property name="notification" type="int32" scope="base" persistent="true" />
+  </properties>
   <base_methods>
+    <method name="Save" exposed="own_client" reply="int64">
+      <arg name="cancelled" type="bool" />
+    </method>
     <method name="Throw" exposed="own_client" reply="int32" />
     <method name="BadAsyncReply" exposed="own_client" reply="list[int32]" />
     <method name="Echo" exposed="own_client" reply="int32">

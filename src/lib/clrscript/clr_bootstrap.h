@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 
 #include "clrscript/clr_error.h"
 #include "clrscript/clr_host.h"
@@ -11,6 +12,9 @@
 #include "foundation/error.h"
 
 namespace atlas {
+
+[[nodiscard]] auto VerifyClrAbi(ClrHost& host, const std::filesystem::path& assembly,
+                                std::string_view type_name) -> Result<void>;
 
 // Must match Atlas.Core.BootstrapArgs (C# [StructLayout(Sequential)]).
 struct ClrBootstrapArgs {

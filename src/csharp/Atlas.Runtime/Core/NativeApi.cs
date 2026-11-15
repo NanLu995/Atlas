@@ -34,7 +34,13 @@ internal static unsafe partial class NativeApi
     public static partial double ServerTime();
 
     [LibraryImport(LibName, EntryPoint = "AtlasDeltaTime")]
-    public static partial float DeltaTime();
+    private static partial float DeltaTimeNative();
+
+    public static float DeltaTime()
+    {
+        ThreadGuard.EnsureMainThread();
+        return DeltaTimeNative();
+    }
 
     [LibraryImport(LibName, EntryPoint = "AtlasGetProcessPrefix")]
     public static partial byte GetProcessPrefix();
@@ -269,6 +275,15 @@ internal static unsafe partial class NativeApi
     private static partial int AddTimerControllerNative(uint entityId, float interval,
                                                         [MarshalAs(UnmanagedType.U1)] bool repeat,
                                                         int userArg);
+
+    [LibraryImport(LibName, EntryPoint = "AtlasAddProximityController")]
+    private static partial int AddProximityControllerNative(uint entityId, float range, int userArg);
+
+    public static int AddProximityController(uint entityId, float range, int userArg)
+    {
+        ThreadGuard.EnsureMainThread();
+        return AddProximityControllerNative(entityId, range, userArg);
+    }
 
     [LibraryImport(LibName, EntryPoint = "AtlasCancelController")]
     private static partial void CancelControllerNative(uint entityId, int controllerId);
@@ -564,16 +579,16 @@ internal static unsafe partial class NativeApi
         }
     }
 
-    // Synchronous full-state write to DBApp. Only BaseApp implements this;
-    // other process types no-op.
     [LibraryImport(LibName, EntryPoint = "AtlasWriteToDb")]
-    private static partial void WriteToDbNative(uint entityId, byte* entityData, int len);
+    private static partial RpcSendResult WriteToDbNative(uint entityId, byte* entityData, int len,
+        ulong requestId);
 
-    public static void WriteEntityToDb(uint entityId, ReadOnlySpan<byte> entityData)
+    public static RpcSendResult WriteEntityToDb(uint entityId, ReadOnlySpan<byte> entityData,
+        ulong requestId = 0)
     {
         ThreadGuard.EnsureMainThread();
         fixed (byte* p = entityData)
-            WriteToDbNative(entityId, p, entityData.Length);
+            return WriteToDbNative(entityId, p, entityData.Length, requestId);
     }
 
     [LibraryImport(LibName, EntryPoint = "AtlasGetAbiVersion")]

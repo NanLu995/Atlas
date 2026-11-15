@@ -37,6 +37,19 @@ struct NetTestMsg {
   }
 };
 
+struct BatchedNetTestMsg : NetTestMsg {
+  static auto Deserialize(BinaryReader& reader) -> Result<BatchedNetTestMsg> {
+    auto value = reader.Read<uint32_t>();
+    if (!value) return value.Error();
+    return BatchedNetTestMsg{{*value}};
+  }
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc desc{201, "BatchedNetTestMsg",           MessageLengthStyle::kVariable,
+                                  -1,  MessageReliability::kReliable, MessageUrgency::kBatched};
+    return desc;
+  }
+};
+
 // Poll dispatcher until predicate returns true or timeout expires.
 // Avoids flaky sleep_for patterns.
 template <typename Pred>
@@ -65,10 +78,147 @@ TEST_F(NetworkInterfaceTest, StartTcpServer) {
   EXPECT_NE(ni_.TcpAddress().Port(), 0);
 }
 
+TEST_F(NetworkInterfaceTest, FullRudpWindowRetainsBoundedDeferredWorkAndDrainsAfterAck) {
+  NetworkInterface receiver(dispatcher_);
+  ASSERT_TRUE(receiver.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = ni_.ConnectRudpNocwnd(receiver.RudpAddress());
+  ASSERT_TRUE(connected);
+  auto* channel = *connected;
+  channel->SetSendWindow(1);
+  ASSERT_TRUE(channel->SendMessage(NetTestMsg{1}));
+  ASSERT_TRUE(channel->SendMessage(BatchedNetTestMsg{{2}}));
+  ni_.FlushDirtySendChannels();
+  ASSERT_TRUE(channel->HasDeferredPayload());
+  int received = 0;
+  ASSERT_TRUE(receiver.InterfaceTable().RegisterTypedHandler<BatchedNetTestMsg>(
+      [&](const Address&, Channel*, const BatchedNetTestMsg&) { ++received; }));
+  ASSERT_TRUE(poll_until(dispatcher_, [&] {
+    ni_.FlushDirtySendChannels();
+    return received == 1;
+  }));
+  EXPECT_FALSE(channel->HasDeferredPayload());
+}
+
+TEST_F(NetworkInterfaceTest, RejectedImmediateRudpSendsDoNotAccumulateOrDeliverLater) {
+  NetworkInterface receiver(dispatcher_);
+  ASSERT_TRUE(receiver.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = ni_.ConnectRudpNocwnd(receiver.RudpAddress());
+  ASSERT_TRUE(connected);
+  auto* channel = *connected;
+  channel->SetSendWindow(1);
+  ASSERT_TRUE(channel->SendMessage(NetTestMsg{1}));
+  for (uint32_t i = 0; i < 100; ++i) {
+    auto rejected = channel->SendMessage(NetTestMsg{2});
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.Error().Code(), ErrorCode::kWouldBlock);
+  }
+  EXPECT_EQ(channel->Bundle().TotalSize(), 0u);
+}
+
+TEST_F(NetworkInterfaceTest, DrainKeepsExistingRudpPeerAndRejectsNewInboundPeer) {
+  ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)));
+  NetworkInterface established(dispatcher_), newcomer(dispatcher_);
+  auto first = established.ConnectRudpNocwnd(ni_.RudpAddress());
+  ASSERT_TRUE(first);
+  int received = 0;
+  ASSERT_TRUE(ni_.InterfaceTable().RegisterTypedHandler<NetTestMsg>(
+      [&](const Address&, Channel*, const NetTestMsg&) { ++received; }));
+  ASSERT_TRUE((*first)->SendMessage(NetTestMsg{1}));
+  ASSERT_TRUE(poll_until(dispatcher_, [&] { return received == 1; }));
+  ni_.StopAccepting();
+  auto second = newcomer.ConnectRudpNocwnd(ni_.RudpAddress());
+  ASSERT_TRUE(second);
+  ASSERT_TRUE((*second)->SendMessage(NetTestMsg{2}));
+  ASSERT_TRUE((*first)->SendMessage(NetTestMsg{3}));
+  ASSERT_TRUE(poll_until(dispatcher_, [&] { return received >= 2; }));
+  const auto deadline = Clock::now() + Milliseconds(40);
+  while (Clock::now() < deadline) dispatcher_.ProcessOnce();
+  EXPECT_EQ(received, 2);
+  EXPECT_EQ(ni_.ChannelCount(), 1u);
+}
+
 TEST_F(NetworkInterfaceTest, StartUdp) {
   auto result = ni_.StartUdp(Address("127.0.0.1", 0));
   ASSERT_TRUE(result.HasValue()) << result.Error().Message();
   EXPECT_NE(ni_.UdpAddress().Port(), 0);
+}
+
+TEST_F(NetworkInterfaceTest, UdpRejectsUnversionedDatagramsBeforeCreatingAChannel) {
+  ASSERT_TRUE(ni_.StartUdp(Address("127.0.0.1", 0)));
+  auto sender = Socket::CreateUdp();
+  ASSERT_TRUE(sender);
+  ASSERT_TRUE(sender->Bind(Address("127.0.0.1", 0)));
+  Bundle bundle;
+  bundle.AddMessage(NetTestMsg{42});
+  ASSERT_TRUE(sender->SendTo(bundle.Finalize(), ni_.UdpAddress()));
+  EXPECT_FALSE(poll_until(
+      dispatcher_, [&] { return ni_.ChannelCount() != 0; }, std::chrono::milliseconds(50)));
+  EXPECT_EQ(ni_.ChannelCount(), 0u);
+}
+
+TEST_F(NetworkInterfaceTest, RudpRejectsUnversionedDatagramsBeforeCreatingAChannel) {
+  ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)));
+  auto sender = Socket::CreateUdp();
+  ASSERT_TRUE(sender);
+  ASSERT_TRUE(sender->Bind(Address("127.0.0.1", 0)));
+  const std::array<std::byte, 1> unversioned{std::byte{0}};
+  ASSERT_TRUE(sender->SendTo(unversioned, ni_.RudpAddress()));
+  EXPECT_FALSE(poll_until(
+      dispatcher_, [&] { return ni_.ChannelCount() != 0; }, std::chrono::milliseconds(50)));
+  EXPECT_EQ(ni_.ChannelCount(), 0u);
+}
+
+TEST_F(NetworkInterfaceTest, TcpRejectsUnversionedFramesBeforeBusinessDispatch) {
+  ASSERT_TRUE(ni_.StartTcpServer(Address("127.0.0.1", 0)));
+  int dispatched = 0;
+  ASSERT_TRUE(ni_.InterfaceTable().RegisterTypedHandler<NetTestMsg>(
+      [&](const Address&, Channel*, const NetTestMsg&) { ++dispatched; }));
+  auto sender = Socket::CreateTcp();
+  ASSERT_TRUE(sender);
+  auto connected = sender->Connect(ni_.TcpAddress());
+  ASSERT_TRUE(connected || connected.Error().Code() == ErrorCode::kWouldBlock);
+  ASSERT_TRUE(poll_until(dispatcher_, [&] { return ni_.ChannelCount() != 0; }));
+  Bundle bundle;
+  bundle.AddMessage(NetTestMsg{42});
+  const auto payload = bundle.Finalize();
+  BinaryWriter frame;
+  frame.Write(static_cast<uint32_t>(payload.size()));
+  frame.WriteBytes(payload);
+  ASSERT_TRUE(sender->Send(frame.Data()));
+  EXPECT_TRUE(poll_until(dispatcher_, [&] { return ni_.ChannelCount() == 0; }));
+  EXPECT_EQ(dispatched, 0);
+}
+
+TEST_F(NetworkInterfaceTest, DatagramVersionMismatchAndTruncationNeverCreateChannels) {
+  ASSERT_TRUE(ni_.StartUdp(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(ni_.StartRudpServer(Address("127.0.0.1", 0)));
+  auto sender = Socket::CreateUdp();
+  ASSERT_TRUE(sender);
+  ASSERT_TRUE(sender->Bind(Address("127.0.0.1", 0)));
+  auto header = kConnectionProtocolHeader;
+  header.back() = std::byte{0xff};
+  for (const auto& address : {ni_.UdpAddress(), ni_.RudpAddress()}) {
+    ASSERT_TRUE(sender->SendTo(header, address));
+    for (std::size_t count = 1; count < kConnectionProtocolHeader.size(); ++count) {
+      ASSERT_TRUE(sender->SendTo(std::span(kConnectionProtocolHeader).first(count), address));
+    }
+  }
+  EXPECT_FALSE(poll_until(
+      dispatcher_, [&] { return ni_.ChannelCount() != 0; }, std::chrono::milliseconds(50)));
+  EXPECT_EQ(ni_.ChannelCount(), 0u);
+}
+
+TEST_F(NetworkInterfaceTest, TcpRejectsAMismatchedVersionBeforeReadingTheLength) {
+  ASSERT_TRUE(ni_.StartTcpServer(Address("127.0.0.1", 0)));
+  auto sender = Socket::CreateTcp();
+  ASSERT_TRUE(sender);
+  auto connected = sender->Connect(ni_.TcpAddress());
+  ASSERT_TRUE(connected || connected.Error().Code() == ErrorCode::kWouldBlock);
+  ASSERT_TRUE(poll_until(dispatcher_, [&] { return ni_.ChannelCount() != 0; }));
+  auto header = kConnectionProtocolHeader;
+  header.back() = std::byte{0xff};
+  ASSERT_TRUE(sender->Send(header));
+  EXPECT_TRUE(poll_until(dispatcher_, [&] { return ni_.ChannelCount() == 0; }));
 }
 
 TEST_F(NetworkInterfaceTest, TcpConnectAndAccept) {
@@ -111,9 +261,8 @@ TEST_F(NetworkInterfaceTest, TcpMessageDispatch) {
   bundle.AddMessage(NetTestMsg{42});
   auto payload = bundle.Finalize();
 
-  // TCP frame: [uint32 length LE][payload]
   uint32_t frame_len = endian::ToLittle(static_cast<uint32_t>(payload.size()));
-  std::vector<std::byte> frame;
+  std::vector<std::byte> frame(kConnectionProtocolHeader.begin(), kConnectionProtocolHeader.end());
   auto* len_bytes = reinterpret_cast<const std::byte*>(&frame_len);
   frame.insert(frame.end(), len_bytes, len_bytes + 4);
   frame.insert(frame.end(), payload.begin(), payload.end());
@@ -157,6 +306,7 @@ TEST_F(NetworkInterfaceTest, TcpReadableCallbackDrainsAllBufferedFrames) {
 
     uint32_t frame_len = endian::ToLittle(static_cast<uint32_t>(payload.size()));
     auto* len_bytes = reinterpret_cast<const std::byte*>(&frame_len);
+    frames.insert(frames.end(), kConnectionProtocolHeader.begin(), kConnectionProtocolHeader.end());
     frames.insert(frames.end(), len_bytes, len_bytes + sizeof(frame_len));
     frames.insert(frames.end(), payload.begin(), payload.end());
   }
@@ -221,7 +371,7 @@ TEST_F(NetworkInterfaceTest, RateLimitRejectsExcess) {
   ASSERT_TRUE(sender.HasValue());
 
   // Burst 10 packets instantly — rate limiter should cap accepted channels at 2
-  std::array<std::byte, 4> data{};
+  const auto data = WithConnectionProtocolHeader(std::array<std::byte, 4>{});
   for (int i = 0; i < 10; ++i) {
     (void)sender->SendTo(data, udp_addr);
   }
@@ -258,7 +408,7 @@ TEST_F(NetworkInterfaceTest, UdpRateLimitOnlyAdmitsFirstSourcePerPoll) {
   for (uint32_t i = 0; i < kDatagramCount; ++i) {
     Bundle bundle;
     bundle.AddMessage(NetTestMsg{i});
-    auto payload = bundle.Finalize();
+    auto payload = WithConnectionProtocolHeader(bundle.Finalize());
 
     // WSL2 loopback throttles bursts via skb-overhead-bounded queues much
     // earlier than native Linux; retry on kWouldBlock instead of failing.
@@ -283,7 +433,7 @@ TEST_F(NetworkInterfaceTest, UdpRateLimitOnlyAdmitsFirstSourcePerPoll) {
   ni_.SetRateLimit(0);
   Bundle extra;
   extra.AddMessage(NetTestMsg{9999u});
-  auto extra_payload = extra.Finalize();
+  auto extra_payload = WithConnectionProtocolHeader(extra.Finalize());
   ASSERT_TRUE(sender->SendTo(extra_payload, ni_.UdpAddress()).HasValue());
 
   ASSERT_TRUE(poll_until(
@@ -395,10 +545,11 @@ TEST_F(NetworkInterfaceTest, DisconnectCallbackRunsAfterTcpProtocolDisconnect) {
 
   const uint32_t oversized_frame_len = endian::ToLittle(static_cast<uint32_t>(kMaxBundleSize + 1));
   auto* len_bytes = reinterpret_cast<const std::byte*>(&oversized_frame_len);
-  auto send_result =
-      client_sock->Send(std::span<const std::byte>(len_bytes, sizeof(oversized_frame_len)));
+  auto header = WithConnectionProtocolHeader(
+      std::span<const std::byte>(len_bytes, sizeof(oversized_frame_len)));
+  auto send_result = client_sock->Send(header);
   ASSERT_TRUE(send_result.HasValue()) << send_result.Error().Message();
-  ASSERT_EQ(*send_result, sizeof(oversized_frame_len));
+  ASSERT_EQ(*send_result, header.size());
 
   ASSERT_TRUE(poll_until(
       dispatcher_, [&] { return callback_seen.load(std::memory_order_acquire); },
@@ -454,7 +605,9 @@ TEST_F(NetworkInterfaceTest, CondemnedTcpChannelReclaimsExpandedRecvBufferImmedi
   uint32_t frame_len_le = endian::ToLittle(static_cast<uint32_t>(kFrameLength));
 
   std::vector<std::byte> partial_frame;
-  partial_frame.reserve(sizeof(frame_len_le) + kPartialPayload);
+  partial_frame.reserve(TcpChannel::kFrameHeaderSize + kPartialPayload);
+  partial_frame.insert(partial_frame.end(), kConnectionProtocolHeader.begin(),
+                       kConnectionProtocolHeader.end());
   auto* len_bytes = reinterpret_cast<const std::byte*>(&frame_len_le);
   partial_frame.insert(partial_frame.end(), len_bytes, len_bytes + sizeof(frame_len_le));
   partial_frame.insert(partial_frame.end(), kPartialPayload, std::byte{'x'});
@@ -544,7 +697,7 @@ TEST_F(NetworkInterfaceTest, RudpServerAutoCreatesChannelOnFirstDatagram) {
   pkt[7] = std::byte{0};
   pkt[8] = std::byte{0};  // ack lo
 
-  (void)sender->SendTo(pkt, server_addr);
+  (void)sender->SendTo(WithConnectionProtocolHeader(pkt), server_addr);
 
   // Dispatcher should accept the datagram and create a channel
   EXPECT_TRUE(poll_until(dispatcher_, [&] { return ni_.ChannelCount() >= 1u; }));
@@ -576,6 +729,7 @@ TEST_F(NetworkInterfaceTest, RudpRateLimitOnlyAdmitsFirstSourcePerPoll) {
   std::array<std::byte, 9> pkt{};
   pkt[0] = std::byte{rudp::kFlagHasSeq};
   pkt[4] = std::byte{1};
+  const auto packet = WithConnectionProtocolHeader(pkt);
 
   for (uint32_t i = 0; i < kSenderCount; ++i) {
     auto sender = Socket::CreateUdp();
@@ -584,9 +738,9 @@ TEST_F(NetworkInterfaceTest, RudpRateLimitOnlyAdmitsFirstSourcePerPoll) {
     senders.push_back(std::move(*sender));
   }
   for (uint32_t i = 0; i < kDatagramCount; ++i) {
-    auto sent = senders[i % kSenderCount].SendTo(pkt, ni_.RudpAddress());
+    auto sent = senders[i % kSenderCount].SendTo(packet, ni_.RudpAddress());
     ASSERT_TRUE(sent.HasValue()) << sent.Error().Message();
-    ASSERT_EQ(*sent, pkt.size());
+    ASSERT_EQ(*sent, packet.size());
   }
 
   dispatcher_.ProcessOnce();
@@ -604,7 +758,7 @@ TEST_F(NetworkInterfaceTest, RudpRateLimitOnlyAdmitsFirstSourcePerPoll) {
   ASSERT_TRUE(poll_until(
       dispatcher_,
       [&] {
-        (void)extra_sender->SendTo(extra_pkt, ni_.RudpAddress());
+        (void)extra_sender->SendTo(WithConnectionProtocolHeader(extra_pkt), ni_.RudpAddress());
         return ni_.ChannelCount() > 1u;
       },
       std::chrono::milliseconds(2000)));

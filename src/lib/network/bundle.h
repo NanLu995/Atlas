@@ -27,6 +27,17 @@ class Bundle {
     EndMessage();
   }
 
+  template <NetworkMessage Msg>
+  [[nodiscard]] auto TryAddMessage(const Msg& msg, std::size_t limit) -> Result<void> {
+    const auto size = buffer_.size();
+    const auto count = message_count_;
+    AddMessage(msg);
+    if (buffer_.size() <= limit) return {};
+    buffer_.resize(size);
+    message_count_ = count;
+    return Error{ErrorCode::kWouldBlock, "Pending send bundle capacity reached"};
+  }
+
   [[nodiscard]] auto Finalize() -> std::vector<std::byte>;
 
   [[nodiscard]] auto MessageCount() const -> uint32_t { return message_count_; }

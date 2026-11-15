@@ -14,12 +14,16 @@
 namespace atlas {
 
 class CellEntity;
+class GameClock;
 class NetworkInterface;
 
 // INativeApiProvider for CellApp; a lookup function keeps tests decoupled
 // from CellApp internals.
 class CellAppNativeProvider : public BaseNativeProvider {
  public:
+  void StopAcceptingCalls() { stopping_ = true; }
+  void SetGameClock(const GameClock& clock) { game_clock_ = &clock; }
+  float DeltaTime() override;
   // Returns nullptr for unknown ids; methods log+skip rather than crash.
   using EntityLookupFn = std::function<CellEntity*(uint32_t entity_id)>;
   using CreateLocalEntityFn =
@@ -171,6 +175,8 @@ class CellAppNativeProvider : public BaseNativeProvider {
   void SetTeleportFailedFnForTest(TeleportFailedFn fn) { teleport_failed_fn_ = fn; }
 
  private:
+  bool stopping_{false};
+  const GameClock* game_clock_{nullptr};
   EntityLookupFn lookup_;
   CreateLocalEntityFn create_local_entity_fn_;
   DestroyLocalEntityFn destroy_local_entity_fn_;

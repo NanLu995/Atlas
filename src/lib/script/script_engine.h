@@ -24,6 +24,7 @@ class ScriptEngine {
   [[nodiscard]] virtual auto LoadModule(const std::filesystem::path& path) -> Result<void> = 0;
 
   virtual void OnTick(float dt) = 0;
+  [[nodiscard]] virtual auto Drain() -> Result<void> { return {}; }
 
   virtual void OnInit(bool is_reload) = 0;
 

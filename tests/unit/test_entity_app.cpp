@@ -123,12 +123,17 @@ TEST(EntityApp, BgTaskRunsOnBackgroundThread) {
     auto Init(int argc, char* argv[]) -> bool override {
       if (!TestEntityApp::Init(argc, argv)) return false;
 
-      GetBgTaskManager().AddTask([this]() { *bg_ran = true; },
-                                 [this]() {
-                                   *main_ran = true;
-                                   Shutdown();
-                                 });
-      return true;
+      auto accepted = GetBgTaskManager().AddTask(
+          [this]() -> Result<void> {
+            *bg_ran = true;
+            return {};
+          },
+          [this](Result<void> result) {
+            EXPECT_TRUE(result);
+            *main_ran = true;
+            Shutdown();
+          });
+      return accepted.HasValue();
     }
   };
 

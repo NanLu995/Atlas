@@ -166,6 +166,7 @@ CellApp::~CellApp() = default;
 auto CellApp::CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> {
   auto provider = std::make_unique<CellAppNativeProvider>(
       [this](uint32_t id) { return FindEntity(id); }, Network());
+  provider->SetGameClock(GetGameClock());
   provider->SetRpcRegistry(rpc_registry_);
   provider->SetCreateLocalEntityFn([this](uint16_t type_id, uint32_t space_id, float px, float py,
                                           float pz, float dx, float dy, float dz, bool on_ground) {
@@ -515,6 +516,22 @@ void CellApp::Fini() {
   physics::jolt::Shutdown();
 #endif
   EntityApp::Fini();
+}
+
+void CellApp::BeginShutdown() {
+  EntityApp::BeginShutdown();
+  if (native_provider_) native_provider_->StopAcceptingCalls();
+}
+
+void CellApp::OnShutdownTick() {
+  EntityApp::OnShutdownTick();
+  TickOffloadAckTimeouts();
+  TickTeleportTimeouts();
+}
+
+auto CellApp::PendingShutdownOperations() const -> std::size_t {
+  return EntityApp::PendingShutdownOperations() + rpc_registry_.PendingCount() +
+         rpc_registry_.ReplyCount() + pending_offloads_.size() + pending_teleports_.size();
 }
 
 auto CellApp::MakeSpace(SpaceID id) -> std::unique_ptr<Space> {
@@ -1179,6 +1196,11 @@ void CellApp::OnCreateCellEntity(const Address& src, Channel* ch,
     base_addr = ch->RemoteAddress();
   }
 
+  if (IsShuttingDown() && FindRealEntity(cell_id) == nullptr) {
+    send_failed(baseapp::CellEntityCreateFailureReason::kRejected);
+    return;
+  }
+
   if (auto it = entity_population_.find(cell_id); it != entity_population_.end()) {
     auto* entity = it->second;
     if (entity != nullptr && entity->IsReal()) {
@@ -1279,6 +1301,7 @@ void CellApp::OnDestroyCellEntity(const Address& /*src*/, Channel* ch,
 
 auto CellApp::CreateLocalEntity(uint16_t type_id, SpaceID space_id, math::Vector3 pos,
                                 math::Vector3 dir, bool on_ground) -> EntityID {
+  if (IsShuttingDown()) return kInvalidEntityID;
   if (space_id == kInvalidSpaceID) {
     ATLAS_LOG_WARNING("CellApp::CreateLocalEntity: invalid space_id");
     return kInvalidEntityID;
@@ -1333,6 +1356,10 @@ void CellApp::DestroyLocalEntity(EntityID entity_id) {
 
 void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
                                      const cellapp::ClientCellRpcForward& msg) {
+  if (IsShuttingDown()) {
+    entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4, "Server is stopping");
+    return;
+  }
   // Hard trust boundary: outside peers bypass BaseApp validation.
   // source_entity_id stamping must come from a trusted BaseApp.
   if (!trusted_baseapps_.contains(src)) {
@@ -1428,6 +1455,10 @@ void CellApp::OnClientMovementInputForward(const Address& src, Channel* /*ch*/,
 
 void CellApp::OnInternalCellRpc(const Address& /*src*/, Channel* ch,
                                 const cellapp::InternalCellRpc& msg) {
+  if (IsShuttingDown()) {
+    entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4, "Server is stopping");
+    return;
+  }
   // Server-internal Base -> Cell call; BaseApp is trusted so skip the
   // exposed / sourceEntityID validation.
   auto* entity = FindRealEntity(msg.target_entity_id);
@@ -2194,6 +2225,14 @@ void CellApp::OnGhostSetNextReal(const Address& src, Channel* ch,
 void CellApp::OnOffloadEntity(const Address& src, Channel* ch, const cellapp::OffloadEntity& msg) {
   if (RejectUntrustedCellAppPeer(src, "OffloadEntity")) return;
   if (ch == nullptr || FindPeerChannel(src) != ch) return;
+  if (IsShuttingDown()) {
+    const auto receipt = offload_receipts_.find(msg.entity_id);
+    if (receipt == offload_receipts_.end() || msg.cell_epoch > receipt->second.cell_epoch) {
+      SendOffloadResult(ch, src, msg.entity_id, msg.cell_epoch,
+                        cellapp::OffloadRejectReason::kRejected);
+      return;
+    }
+  }
   ReceiveOffload(src, ch, msg);
 }
 
@@ -3313,6 +3352,7 @@ void CellApp::PreserveOffloadSource(CellEntity& entity, Channel* peer, const Add
 
 auto CellApp::RequestTeleport(EntityID entity_id, SpaceID target_space_id, math::Vector3 pos,
                               math::Vector3 dir) -> bool {
+  if (IsShuttingDown()) return false;
   if (target_space_id == kInvalidSpaceID) return false;
   auto* entity = FindEntity(entity_id);
   if (entity == nullptr || !entity->IsReal()) {

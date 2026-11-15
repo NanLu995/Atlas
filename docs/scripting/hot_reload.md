@@ -3,8 +3,8 @@
 > **状态**:✅ 已落地。基础设施(`AssemblyLoadContext` 隔离、
 > `ScriptHost`、`HotReloadManager`、`ClrHotReload`、`FileWatcher`、
 > `ClrObjectRegistry`)、`ScriptApp` 接入(由 `ServerConfig.enable_hot_reload`
-> 等字段驱动,BaseApp / CellApp 自动获得)、reload 前 lifecycle cancel +
-> `ManagedAtlasLoop` drain、C++ 集成测试 `tests/integration/test_hot_reload.cpp`
+> 等字段驱动,BaseApp / CellApp 自动获得)、reload 前 lifecycle cancel、原生定时器取消、
+> 主线程队列和 `ManagedAtlasLoop` drain、C++ 集成测试 `tests/integration/test_hot_reload.cpp`
 > 与 C# drain 单测已就位。`Config.assembly_name` 默认
 > `Atlas.GameScripts.dll`,可在 JSON 配置中通过
 > `hot_reload.assembly_name` 覆盖。
@@ -36,6 +36,7 @@ ScriptLoadContext (isCollectible: true):
      → [HotReloadManager.SerializeAndUnload]
            · 遍历 EntityManager.Instance.GetAllEntities()
            · 触发每个实体的 LifecycleCancellation
+           · 取消旧实例的原生定时器并排空主线程队列
            · drain ManagedAtlasLoop 续延队列,最多 16 轮
            · 使用同一实体列表写入 (typeName, entityId, byteLen, payload)
            · EntityManager.Clear() + ScriptHost.Unload()

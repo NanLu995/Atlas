@@ -25,6 +25,18 @@ using atlas::test::FakeCluster;
 namespace atlas::net_client {
 
 struct ClientSessionTestAccess {
+  static void FillSendWindow(ClientSession& session, const Address& address, bool authenticate) {
+    auto channel = session.network_.ConnectRudp(address);
+    ASSERT_TRUE(channel);
+    (*channel)->SetNocwnd(true);
+    (*channel)->SetSendWindow(1);
+    ASSERT_TRUE((*channel)->SendMessage(baseapp::Authenticate{}));
+    ASSERT_EQ((*channel)->UnackedCount(), 1u);
+    if (authenticate) {
+      session.baseapp_addr_ = address;
+      session.state_ = ATLAS_NET_STATE_LOGIN_SUCCEEDED;
+    }
+  }
   static auto Setup(ClientSession& session, Channel* channel) -> InterfaceTable& {
     session.baseapp_channel_ = channel;
     session.InstallDefaultHandler();
@@ -174,6 +186,27 @@ TEST(NetClientFlow, ServerMessagesRequireBoundBaseAppChannel) {
   EXPECT_EQ(deliveries, 3);
   net_client::ClientSessionTestAccess::Clear(session);
   counter = nullptr;
+}
+
+TEST(NetClientFlow, LoginAndAuthenticateRejectFullSendWindowBeforeWaiting) {
+  for (const bool authenticate : {false, true}) {
+    net_client::ClientSession session;
+    const Address address("127.0.0.1", 31004);
+    net_client::ClientSessionTestAccess::FillSendWindow(session, address, authenticate);
+    LoginCallbackState login;
+    AuthCallbackState auth;
+    const auto result = authenticate ? session.StartAuthenticate(AuthCallback, &auth)
+                                     : session.StartLogin("127.0.0.1", 31004, "test-user",
+                                                          "<test-password>", LoginCallback, &login);
+    EXPECT_EQ(result, ATLAS_NET_ERR_BUSY);
+    EXPECT_EQ(session.GetState(), ATLAS_NET_STATE_DISCONNECTED);
+    EXPECT_FALSE(login.done.load());
+    EXPECT_FALSE(auth.done.load());
+    EXPECT_EQ(session.StartLogin("127.0.0.1", 31004, "test-user", "<test-password>", LoginCallback,
+                                 &login),
+              ATLAS_NET_OK);
+    EXPECT_EQ(session.GetState(), ATLAS_NET_STATE_LOGGING_IN);
+  }
 }
 
 class ClientHandoffFlowTest : public ::testing::Test {

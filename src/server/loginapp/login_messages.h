@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,7 @@ struct LoginResult {
 static_assert(NetworkMessage<LoginResult>);
 
 struct AuthLogin {
+  std::array<uint8_t, 32> entity_def_digest{};
   uint32_t request_id{0};
   std::string username;
   std::string password_hash;
@@ -134,6 +136,7 @@ struct AuthLogin {
     w.WriteString(username);
     w.WriteString(password_hash);
     w.Write(static_cast<uint8_t>(auto_create ? 1 : 0));
+    w.WriteBytes(std::as_bytes(std::span(entity_def_digest)));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<AuthLogin> {
@@ -147,6 +150,9 @@ struct AuthLogin {
     msg.username = std::move(*u);
     msg.password_hash = std::move(*p);
     msg.auto_create = (*ac != 0);
+    auto digest = r.ReadBytes(msg.entity_def_digest.size());
+    if (!digest) return digest.Error();
+    std::memcpy(msg.entity_def_digest.data(), digest->data(), msg.entity_def_digest.size());
     return msg;
   }
 };

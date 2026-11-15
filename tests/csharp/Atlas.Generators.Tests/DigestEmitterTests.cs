@@ -7,6 +7,82 @@ namespace Atlas.Generators.Tests;
 
 public class DigestEmitterTests
 {
+    [Fact]
+    public void InlineComponentFieldsAreExportedAndChangeTheDefinitionDigest()
+    {
+        var entity = MakeAvatar();
+        var component = new ComponentDefModel
+        {
+            TypeName = "Inventory", SlotName = "inventory", SlotIdx = 1,
+        };
+        var field = new PropertyDefModel { Name = "inlineValue", Type = "int32" };
+        component.Properties.Add(field);
+        entity.Components.Add(component);
+        var types = new Dictionary<string, ushort> { ["Avatar"] = 1 };
+        string Digest() => ExtractHex(DigestEmitter.Emit(new[] { entity }, new List<StructDefModel>(),
+                                                        new List<ComponentDefModel>(), types));
+        var before = Digest();
+        field.Type = "int64";
+        Assert.NotEqual(before, Digest());
+        var code = TypeRegistryEmitter.Emit(
+            new List<(EntityDefModel, string, string)> { (entity, "Avatar", "Game") },
+            types, ProcessContext.Base);
+        Assert.Contains("writer.WriteString(\"Inventory\")", code);
+        Assert.Contains("writer.WriteString(\"inlineValue\")", code);
+        Assert.Contains("writer.WriteUInt16(0)", code);
+    }
+
+    [Fact]
+    public void ContainerSizeLimitChangesTheDigest()
+    {
+        var entity = MakeAvatar();
+        var property = new PropertyDefModel
+        {
+            Name = "values",
+            Type = "list<int32>",
+            TypeRef = new DataTypeRefModel
+            {
+                Kind = PropertyDataKind.List,
+                Elem = new DataTypeRefModel { Kind = PropertyDataKind.Int32 },
+            },
+        };
+        entity.Properties.Add(property);
+        var types = new Dictionary<string, ushort> { ["Avatar"] = 1 };
+        string Emit() => ExtractHex(DigestEmitter.Emit(new[] { entity }, new List<StructDefModel>(),
+                                                      new List<ComponentDefModel>(), types));
+        var before = Emit();
+        property.MaxSize = 12;
+        Assert.NotEqual(before, Emit());
+    }
+
+    [Theory]
+    [InlineData("name")]
+    [InlineData("lazy")]
+    [InlineData("id")]
+    [InlineData("parent")]
+    public void ComponentStorageMetadataChangesTheDigest(string change)
+    {
+        var entity = MakeAvatar();
+        var component = new ComponentDefModel
+        {
+            TypeName = "Equipment", SlotName = "equipment", SlotIdx = 1, ComponentTypeId = 3,
+        };
+        entity.Components.Add(component);
+        var types = new Dictionary<string, ushort> { ["Avatar"] = 1 };
+        var components = new List<ComponentDefModel> { component };
+        string Emit() => ExtractHex(DigestEmitter.Emit(new[] { entity }, new List<StructDefModel>(),
+                                                      components, types));
+        var before = Emit();
+        switch (change)
+        {
+            case "name": component.SlotName = "other"; break;
+            case "lazy": component.Lazy = true; break;
+            case "id": component.ComponentTypeId = 4; break;
+            case "parent": component.BaseTypeName = "Stats"; break;
+        }
+        Assert.NotEqual(before, Emit());
+    }
+
     private static EntityDefModel MakeAvatar()
     {
         var def = new EntityDefModel { Name = "Avatar" };

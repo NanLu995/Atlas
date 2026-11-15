@@ -26,6 +26,7 @@ class ServerApp {
   auto RunApp(int argc, char* argv[]) -> int;
 
   void Shutdown();
+  [[nodiscard]] auto IsShuttingDown() const -> bool { return shutdown_requested_; }
 
   [[nodiscard]] auto Dispatcher() -> EventDispatcher& { return dispatcher_; }
   [[nodiscard]] auto Network() -> NetworkInterface& { return network_; }
@@ -68,6 +69,11 @@ class ServerApp {
       -> TimePoint;
 
  protected:
+  virtual void BeginShutdown();
+  virtual void OnShutdownTick() {}
+  [[nodiscard]] virtual auto PendingShutdownOperations() const -> std::size_t;
+  virtual void LogShutdownPending() const;
+  void MarkShutdownFailed(Error error);
   [[nodiscard]] virtual auto Init(int argc, char* argv[]) -> bool;
 
   virtual void Fini();
@@ -91,6 +97,8 @@ class ServerApp {
   virtual void RegisterWatchers();
 
  private:
+  friend struct ServerAppShutdownTestAccess;
+  void PollShutdown();
   void AdvanceTime();
 
   void RaiseFdLimit();
@@ -118,6 +126,12 @@ class ServerApp {
   FrequentTaskRegistration signal_registration_;
 
   bool shutdown_requested_{false};
+  bool shutdown_timed_out_{false};
+  bool shutdown_deregistered_{false};
+  Error shutdown_error_;
+  TimePoint shutdown_deadline_{};
+  TimerHandle shutdown_timer_{};
+  static constexpr Duration kShutdownTimeout = std::chrono::seconds(30);
 
   MachinedClient machined_client_;
 };

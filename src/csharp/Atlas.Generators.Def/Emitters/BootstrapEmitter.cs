@@ -16,9 +16,12 @@ internal static class BootstrapEmitter
         sb.AppendLine();
         sb.AppendLine("public static class DefBootstrap");
         sb.AppendLine("{");
+        sb.AppendLine("    public const int OfflineExportVersion = 1;");
         sb.AppendLine("    [System.Runtime.CompilerServices.ModuleInitializer]");
         sb.AppendLine("    internal static void RegisterAll()");
         sb.AppendLine("    {");
+        sb.AppendLine("        if (System.AppContext.TryGetSwitch(\"Atlas.EntityDef.ExportOnly\", out var exportOnly) && exportOnly)");
+        sb.AppendLine("            return;");
         if (hasStructs)
             sb.AppendLine("        DefStructRegistry.RegisterAllStructs();");
         if (hasComponents)

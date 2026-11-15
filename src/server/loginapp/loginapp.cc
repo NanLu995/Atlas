@@ -126,6 +126,7 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
       machined::ListenerType::kBoth, ProcessType::kDbApp,
       [this](const machined::BirthNotification& n) { OnDbAppBirth(n); },
       [this](const machined::DeathNotification& n) { OnDbAppDeath(n); });
+  GetMachinedClient().Subscribe(machined::ListenerType::kBoth, ProcessType::kBaseApp, {}, {});
 
   GetMachinedClient().Subscribe(
       machined::ListenerType::kBoth, ProcessType::kDbAppMgr,
@@ -175,6 +176,16 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
       trusted_rate_limit_sources_.size());
   ATLAS_LOG_INFO("LoginApp: initialised");
   return true;
+}
+
+void LoginApp::BeginShutdown() {
+  ManagerApp::BeginShutdown();
+  external_network_.StopAccepting();
+}
+
+auto LoginApp::PendingShutdownOperations() const -> std::size_t {
+  return ManagerApp::PendingShutdownOperations() + external_network_.PendingSendCount() +
+         rpc_registry_.PendingCount() + pending_by_username_.size();
 }
 
 void LoginApp::Fini() {
@@ -354,6 +365,10 @@ void LoginApp::OnLoginRequest(const Address& src, Channel* ch, const login::Logi
   if (ch == nullptr) {
     return;
   }
+  if (IsShuttingDown()) {
+    SendLoginError(ch->ChannelId(), login::LoginStatus::kServerNotReady, "server_stopping");
+    return;
+  }
 
   ++login_requests_total_;
   ATLAS_LOG_DEBUG("LoginApp: login request user='{}' from {}:{}", msg.username, src.Ip(),
@@ -421,7 +436,15 @@ auto LoginApp::HandleLoginCoro(uint64_t client_channel_id, Address client_addr,
   ScopeGuard cancel_guard(
       [this, client_channel_id] { channel_cancel_sources_.erase(client_channel_id); });
 
+  if (auto* channel = external_network_.FindChannel(client_channel_id))
+    channel->SetInactivityTimeout(Duration::zero());
+  ScopeGuard idle_guard([this, client_channel_id] {
+    if (auto* channel = external_network_.FindChannel(client_channel_id))
+      channel->SetInactivityTimeout(std::chrono::seconds(kClientChannelInactivitySec));
+  });
+
   login::AuthLogin auth;
+  auth.entity_def_digest = request.entity_def_digest;
   auth.request_id = rid;
   auth.username = request.username;
   auth.password_hash = request.password_hash;

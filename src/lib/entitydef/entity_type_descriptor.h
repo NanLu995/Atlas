@@ -135,6 +135,8 @@ struct EntitySlotDescriptor {
   uint16_t component_type_id{0};
   ReplicationScope scope{ReplicationScope::kAllClients};
   bool lazy{false};
+  // Zero component_type_id stores the synchronized inline schema in this slot.
+  ComponentDescriptor inline_component{};
 };
 
 struct EntityTypeDescriptor {

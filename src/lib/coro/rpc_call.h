@@ -48,6 +48,7 @@ auto RpcCall(PendingRpcRegistry& registry, Channel& channel, const Request& requ
     auto await_suspend(std::coroutine_handle<> caller) -> std::coroutine_handle<> {
       auto reply_id = Reply::Descriptor().id;
       auto request_id = request.request_id;
+      Error rejection;
 
       pending_handle = registry.RegisterPending(
           reply_id, request_id,
@@ -66,10 +67,10 @@ auto RpcCall(PendingRpcRegistry& registry, Channel& channel, const Request& requ
             completed = true;
             if (!suspending) caller.resume();
           },
-          timeout, &channel);
+          timeout, &channel, &rejection);
 
       if (!pending_handle.IsValid()) {
-        result = Error{ErrorCode::kAlreadyExists, "rpc_call: pending registration rejected"};
+        result = std::move(rejection);
         return caller;
       }
       if (token.IsValid()) {

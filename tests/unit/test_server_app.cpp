@@ -7,6 +7,7 @@
 
 #include "server/common_messages.h"
 #include "server/server_app.h"
+#include "test_shutdown_access.h"
 
 using namespace atlas;
 
@@ -152,6 +153,29 @@ TEST(ServerApp, InitRunFiniOrder) {
   EXPECT_EQ(app.hook_order.back(), "fini");
 }
 
+TEST(ServerApp, ShutdownPumpsCompletionsBeforeStoppingWithNoPendingOperations) {
+  EventDispatcher dispatcher("shutdown_completion");
+  NetworkInterface network(dispatcher);
+  class CompletionApp : public TestServerApp {
+   public:
+    using TestServerApp::TestServerApp;
+    int drain_count{0};
+
+   protected:
+    void OnShutdownTick() override { ++drain_count; }
+  } app(dispatcher, network);
+  app.max_ticks = 1;
+  char executable[] = "server";
+  char type_option[] = "--type";
+  char type[] = "machined";
+  char hertz_option[] = "--update-hertz";
+  char hertz[] = "10";
+  char* args[] = {executable, type_option, type, hertz_option, hertz};
+  EXPECT_EQ(app.RunApp(5, args), 0);
+  EXPECT_GT(app.drain_count, 0);
+  EXPECT_EQ(app.on_tick_count, 1);
+}
+
 TEST(ServerApp, TickHookOrder) {
   EventDispatcher dispatcher("test");
   NetworkInterface network(dispatcher);
@@ -187,6 +211,78 @@ TEST(ServerApp, ShutdownStopsRun) {
   int exit_code = app.RunApp(args.argc(), args.argv());
   EXPECT_EQ(exit_code, 0);
   EXPECT_EQ(app.on_tick_count, 3);
+}
+
+TEST(ServerApp, ShutdownKeepsLoopAliveUntilAcceptedWorkCompletes) {
+  EventDispatcher dispatcher("shutdown_drain");
+  NetworkInterface network(dispatcher);
+  class DrainApp : public TestServerApp {
+   public:
+    using TestServerApp::TestServerApp;
+    bool completed{false};
+    bool completed_before_fini{false};
+
+   protected:
+    auto PendingShutdownOperations() const -> std::size_t override {
+      return TestServerApp::PendingShutdownOperations() + (completed ? 0 : 1);
+    }
+    void OnTickComplete() override {
+      (void)Dispatcher().AddTimer(std::chrono::milliseconds(20),
+                                  [this](TimerHandle) { completed = true; });
+      Shutdown();
+    }
+    void Fini() override {
+      completed_before_fini = completed;
+      TestServerApp::Fini();
+    }
+  } app(dispatcher, network);
+  MinimalArgv args;
+  EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
+  EXPECT_TRUE(app.completed);
+  EXPECT_TRUE(app.completed_before_fini);
+}
+
+TEST(ServerApp, FailedDrainReturnsFailureAfterCleanup) {
+  EventDispatcher dispatcher("shutdown_failure");
+  NetworkInterface network(dispatcher);
+  class FailedApp : public TestServerApp {
+   public:
+    using TestServerApp::TestServerApp;
+
+   protected:
+    void BeginShutdown() override {
+      TestServerApp::BeginShutdown();
+      MarkShutdownFailed(Error{ErrorCode::kIoError, "test save failed"});
+    }
+  } app(dispatcher, network);
+  app.max_ticks = 1;
+  MinimalArgv args;
+  EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 1);
+  EXPECT_TRUE(app.fini_called);
+}
+
+TEST(ServerAppDeathTest, ExpiredDrainExitsFailureBeforeBlockingCleanup) {
+  ASSERT_EXIT(
+      {
+        EventDispatcher dispatcher("shutdown_expired");
+        NetworkInterface network(dispatcher);
+        class ExpiredApp : public TestServerApp {
+         public:
+          using TestServerApp::TestServerApp;
+
+         protected:
+          auto PendingShutdownOperations() const -> std::size_t override { return 1; }
+          void OnTickComplete() override {
+            Shutdown();
+            ServerAppShutdownTestAccess::Expire(*this);
+          }
+          void Fini() override { std::abort(); }
+        } app(dispatcher, network);
+        MinimalArgv args;
+        app.RunApp(args.argc(), args.argv());
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(EXIT_FAILURE), ".*");
 }
 
 TEST(ServerApp, UpdatableCalledEachTick) {

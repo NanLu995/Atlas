@@ -180,6 +180,12 @@ void ScriptApp::Fini() {
   ServerApp::Fini();
 }
 
+void ScriptApp::OnShutdownTick() {
+  if (script_engine_) {
+    if (auto result = script_engine_->Drain(); !result) MarkShutdownFailed(result.Error());
+  }
+}
+
 void ScriptApp::OnTickComplete() {
   if (script_engine_) {
     using namespace std::chrono;

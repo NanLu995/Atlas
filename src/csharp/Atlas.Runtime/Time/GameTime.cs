@@ -2,14 +2,12 @@ using Atlas.Core;
 
 namespace Atlas;
 
-/// <summary>
-/// Provides engine timing values. Each access reads the latest value from C++.
-/// </summary>
+/// <summary>Reads timing values from the native server clock.</summary>
 public static class Time
 {
-    /// <summary>Server wall-clock time in seconds since epoch.</summary>
+    /// <summary>Monotonic server time in seconds with an unspecified epoch.</summary>
     public static double ServerTime => NativeApi.ServerTime();
 
-    /// <summary>Duration of the last frame in seconds.</summary>
+    /// <summary>Last game-frame duration in seconds, including the game clock's time scale.</summary>
     public static float DeltaTime => NativeApi.DeltaTime();
 }

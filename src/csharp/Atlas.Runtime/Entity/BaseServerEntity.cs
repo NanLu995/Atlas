@@ -61,9 +61,39 @@ public abstract class BaseServerEntity : ServerEntity
         try
         {
             Serialize(ref w);
-            NativeApi.WriteEntityToDb(EntityId, w.WrittenSpan);
+            var result = NativeApi.WriteEntityToDb(EntityId, w.WrittenSpan);
+            if (result != RpcSendResult.Queued)
+                throw new InvalidOperationException($"Persistence request rejected: {result}");
         }
         finally { w.Dispose(); }
+    }
+
+    public AtlasTask<RpcReply<long>> PersistToDbAsync(AtlasCancellationToken ct = default)
+    {
+        ThreadGuard.EnsureMainThread();
+        var requestId = AtlasRpc.NextRequestId();
+        var source = AtlasRpcSource<RpcReply<long>>.Rent();
+        source.Start(NativeRpcRegistry.Instance, MessageIds.EntityRpcReply, requestId,
+            static (ref SpanReader reader) => RpcReply<long>.Ok(reader.ReadInt64()),
+            RpcReplyHelpers.For<long>(), AtlasRpc.DefaultTimeoutMs, ct, LifecycleCancellation);
+        var task = source.Task;
+        if (task.GetAwaiter().IsCompleted) return task;
+        var writer = new SpanWriter(256);
+        try
+        {
+            Serialize(ref writer);
+            if (!task.GetAwaiter().IsCompleted &&
+                NativeApi.WriteEntityToDb(EntityId, writer.WrittenSpan, requestId) !=
+                RpcSendResult.Queued)
+                source.FailSend();
+        }
+        catch (Exception ex)
+        {
+            Atlas.Diagnostics.Log.Error($"Persistence serialization failed for entity {EntityId}: {ex}");
+            source.FailSend();
+        }
+        finally { writer.Dispose(); }
+        return task;
     }
 }
 

@@ -1,6 +1,7 @@
 #include "baseapp_native_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <span>
 
@@ -51,10 +52,16 @@ uint8_t BaseAppNativeProvider::GetProcessPrefix() {
   return static_cast<uint8_t>(ProcessType::kBaseApp);
 }
 
+float BaseAppNativeProvider::DeltaTime() {
+  return static_cast<float>(
+      std::chrono::duration_cast<Seconds>(app_.GetGameClock().FrameDelta()).count());
+}
+
 RpcSendResult BaseAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id,
                                                    RpcTarget target, const std::byte* payload,
                                                    int32_t len, uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (app_.IsShuttingDown() || (rpc_registry_ && rpc_registry_->IsStopping()))
+    return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("BaseApp: SendClientRpc rejected invalid payload len={}", len);
     return RpcSendResult::kInvalidTarget;
@@ -90,7 +97,8 @@ RpcSendResult BaseAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t 
 RpcSendResult BaseAppNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
                                                  const std::byte* payload, int32_t len,
                                                  uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (app_.IsShuttingDown() || (rpc_registry_ && rpc_registry_->IsStopping()))
+    return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("BaseApp: SendCellRpc rejected invalid payload len={}", len);
     return RpcSendResult::kInvalidTarget;
@@ -129,7 +137,8 @@ RpcSendResult BaseAppNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rp
 RpcSendResult BaseAppNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t rpc_id,
                                                  const std::byte* payload, int32_t len,
                                                  uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (app_.IsShuttingDown() || (rpc_registry_ && rpc_registry_->IsStopping()))
+    return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("BaseApp: SendBaseRpc rejected invalid payload len={}", len);
     return RpcSendResult::kInvalidTarget;
@@ -155,9 +164,9 @@ RpcSendResult BaseAppNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t rp
   return RpcSendResult::kQueued;
 }
 
-void BaseAppNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* entity_data,
-                                      int32_t len) {
-  app_.DoWriteToDb(entity_id, entity_data, len);
+auto BaseAppNativeProvider::WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len,
+                                      uint64_t request_id) -> RpcSendResult {
+  return app_.DoWriteToDb(entity_id, entity_data, len, request_id);
 }
 
 auto BaseAppNativeProvider::TransferClient(uint32_t src_entity_id, uint32_t dest_entity_id,
@@ -261,6 +270,7 @@ void BaseAppNativeProvider::SetNativeCallbacks(const void* native_callbacks, int
 auto BaseAppNativeProvider::CoroRegisterPending(uint16_t reply_id, uint64_t request_id,
                                                 int32_t timeout_ms, intptr_t managed_handle)
     -> uint64_t {
+  if (app_.IsShuttingDown()) return 0;
   if (coro_on_rpc_complete_fn_ == nullptr) {
     ATLAS_LOG_WARNING("BaseApp: CoroRegisterPending: managed runtime did not register callback");
     return 0;

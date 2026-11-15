@@ -1,6 +1,8 @@
 #include "cellapp_native_provider.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <string_view>
 #include <unordered_map>
@@ -9,6 +11,7 @@
 #include "baseapp/baseapp_messages.h"
 #include "cell_entity.h"
 #include "cellapp_messages.h"
+#include "foundation/clock.h"
 #include "foundation/log.h"
 #include "math/vector3.h"
 #include "movement_sim/movement_codec.h"
@@ -116,9 +119,16 @@ uint8_t CellAppNativeProvider::GetProcessPrefix() {
   return static_cast<uint8_t>(ProcessType::kCellApp);
 }
 
+float CellAppNativeProvider::DeltaTime() {
+  return game_clock_ ? static_cast<float>(
+                           std::chrono::duration_cast<Seconds>(game_clock_->FrameDelta()).count())
+                     : 0.f;
+}
+
 auto CellAppNativeProvider::CoroRegisterPending(uint16_t reply_id, uint64_t request_id,
                                                 int32_t timeout_ms, intptr_t managed_handle)
     -> uint64_t {
+  if (stopping_) return 0;
   if (!rpc_registry_) return 0;
   return coro_bridge::RegisterPending(*rpc_registry_, coro_on_rpc_complete_fn_, reply_id,
                                       request_id, timeout_ms, managed_handle);
@@ -131,7 +141,7 @@ void CellAppNativeProvider::CoroCancelPending(uint64_t handle) {
 RpcSendResult CellAppNativeProvider::SendBaseRpc(uint32_t entity_id, uint32_t rpc_id,
                                                  const std::byte* payload, int32_t len,
                                                  uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (stopping_ || (rpc_registry_ && rpc_registry_->IsStopping())) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) return RpcSendResult::kInvalidTarget;
   const std::span<const std::byte> bytes{payload, static_cast<size_t>(len)};
   auto fail = [&](Error error) {
@@ -167,7 +177,7 @@ void CellAppNativeProvider::ReportScriptTick(uint32_t entity_id, uint64_t elapse
 RpcSendResult CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t rpc_id,
                                                    RpcTarget target, const std::byte* payload,
                                                    int32_t len, uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (stopping_ || (rpc_registry_ && rpc_registry_->IsStopping())) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("CellApp: SendClientRpc rejected invalid payload len={}", len);
     return RpcSendResult::kInvalidTarget;
@@ -264,7 +274,7 @@ RpcSendResult CellAppNativeProvider::SendClientRpc(uint32_t entity_id, uint32_t 
 RpcSendResult CellAppNativeProvider::SendCellRpc(uint32_t entity_id, uint32_t rpc_id,
                                                  const std::byte* payload, int32_t len,
                                                  uint64_t trace_id) {
-  if (rpc_registry_ && rpc_registry_->IsStopping()) return RpcSendResult::kStopping;
+  if (stopping_ || (rpc_registry_ && rpc_registry_->IsStopping())) return RpcSendResult::kStopping;
   if (!IsValidNativePayload(payload, len)) {
     ATLAS_LOG_WARNING("CellApp: SendCellRpc rejected invalid payload len={}", len);
     return RpcSendResult::kInvalidTarget;
@@ -685,6 +695,7 @@ auto CellAppNativeProvider::AddNavMoveController(uint32_t entity_id, float dest_
 
 auto CellAppNativeProvider::AddTimerController(uint32_t entity_id, float interval, bool repeat,
                                                int32_t user_arg) -> int32_t {
+  if (!std::isfinite(interval) || interval <= 0.f) return 0;
   auto* entity = lookup_ ? lookup_(entity_id) : nullptr;
   if (!entity) {
     ATLAS_LOG_WARNING("atlas_add_timer_controller: unknown entity_id={}", entity_id);
@@ -705,6 +716,10 @@ auto CellAppNativeProvider::AddTimerController(uint32_t entity_id, float interva
 
 auto CellAppNativeProvider::AddProximityController(uint32_t entity_id, float range,
                                                    int32_t user_arg) -> int32_t {
+  if (!std::isfinite(range) || range < 0.f) {
+    ATLAS_LOG_WARNING("atlas_add_proximity_controller: invalid range for entity_id={}", entity_id);
+    return 0;
+  }
   auto* entity = lookup_ ? lookup_(entity_id) : nullptr;
   if (!entity) {
     ATLAS_LOG_WARNING("atlas_add_proximity_controller: unknown entity_id={}", entity_id);

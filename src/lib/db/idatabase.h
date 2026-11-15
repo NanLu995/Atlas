@@ -2,6 +2,7 @@
 #define ATLAS_LIB_DB_IDATABASE_H_
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -52,6 +53,8 @@ enum class DatabaseErrorKind : uint8_t {
   kNotFound,
   kOperationConflict,
   kOwnershipConflict,
+  kOverloaded,
+  kStopping,
 };
 
 [[nodiscard]] inline auto operator|(WriteFlags a, WriteFlags b) -> WriteFlags {
@@ -212,6 +215,8 @@ struct EntityIdRange {
 
 class IDatabase {
  public:
+  static constexpr std::size_t kMaxPendingOperations = 4096;
+
   virtual ~IDatabase() = default;
 
   IDatabase(const IDatabase&) = delete;
@@ -221,6 +226,8 @@ class IDatabase {
                                      const EntityDefRegistry& entity_defs) -> Result<void> = 0;
 
   virtual void Shutdown() = 0;
+  virtual void BeginDrain() = 0;
+  [[nodiscard]] virtual auto PendingOperations() const -> std::size_t = 0;
 
   virtual void PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                          std::span<const std::byte> blob, const std::string& identifier,
@@ -278,23 +285,28 @@ class IDatabase {
   }
 
   virtual void ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                             std::function<void(bool)> callback) = 0;
+                             std::function<void(Result<bool>)> callback) = 0;
 
   virtual void ClearCheckoutsForAddress(const Address& base_addr,
-                                        std::function<void(int cleared_count)> callback) = 0;
+                                        std::function<void(Result<int>)> callback) = 0;
 
   virtual void RetireCheckoutProcess(const Address& /*base_addr*/, uint64_t /*instance*/,
                                      std::function<void(Result<int>)> callback) {
     callback(Error{ErrorCode::kNotSupported, "process-fenced checkout retirement unsupported"});
   }
 
-  virtual void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id) {
-    ClearCheckout(dbid, type_id, [](bool) {});
+  virtual void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id,
+                                   std::function<void(Result<void>)> callback) {
+    ClearCheckout(dbid, type_id, [cb = std::move(callback)](Result<bool> result) {
+      cb(result ? Result<void>{} : Result<void>{result.Error()});
+    });
   }
 
-  virtual void GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) = 0;
+  virtual void GetAutoLoadEntities(
+      std::function<void(Result<std::vector<EntityData>>)> callback) = 0;
 
-  virtual void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load) = 0;
+  virtual void SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
+                           std::function<void(Result<void>)> callback) = 0;
 
   // Includes retained operation receipts and lease history; deletion does not erase used IDs.
   virtual void GetMaxDbidInRange(DatabaseID low, DatabaseID high,

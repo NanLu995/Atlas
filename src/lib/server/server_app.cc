@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <format>
 
 #include "foundation/log.h"
@@ -72,19 +73,70 @@ auto ServerApp::RunApp(int argc, char* argv[]) -> int {
   ATLAS_LOG_INFO("{} started (pid={})", config_.process_name, pid);
 
   bool run_ok = RunLoop();
+  if (shutdown_timed_out_) {
+    Logger::Instance().Flush();
+    std::_Exit(EXIT_FAILURE);
+  }
 
   OnRunComplete();
 
   Fini();
   Runtime::Finalize();
 
-  return run_ok ? 0 : 1;
+  return run_ok && !shutdown_error_ ? 0 : 1;
 }
 
 void ServerApp::Shutdown() {
   if (!shutdown_requested_) {
     shutdown_requested_ = true;
+    shutdown_deadline_ = Clock::now() + kShutdownTimeout;
+    BeginShutdown();
+    shutdown_timer_ = dispatcher_.AddRepeatingTimer(std::chrono::milliseconds(10),
+                                                    [this](TimerHandle) { PollShutdown(); });
+  }
+}
+
+void ServerApp::BeginShutdown() {
+  network_.StopAccepting();
+}
+
+auto ServerApp::PendingShutdownOperations() const -> std::size_t {
+  return network_.PendingSendCount();
+}
+
+void ServerApp::LogShutdownPending() const {
+  ATLAS_LOG_ERROR("{} shutdown incomplete: pending_operations={}", config_.process_name,
+                  PendingShutdownOperations());
+}
+
+void ServerApp::MarkShutdownFailed(Error error) {
+  if (shutdown_error_) return;
+  shutdown_error_ = std::move(error);
+  ATLAS_LOG_ERROR("{} shutdown failed: {}", config_.process_name, shutdown_error_.Message());
+}
+
+void ServerApp::PollShutdown() {
+  if (Clock::now() >= shutdown_deadline_) {
+    ATLAS_LOG_ERROR("{} shutdown deadline expired", config_.process_name);
+    LogShutdownPending();
+    shutdown_timed_out_ = true;
     dispatcher_.Stop();
+    return;
+  }
+  OnShutdownTick();
+  FlushTickDirtyChannels();
+  if (PendingShutdownOperations() == 0) {
+    if (!shutdown_deregistered_) {
+      shutdown_deregistered_ = true;
+      if (config_.process_type != ProcessType::kMachined && machined_client_.IsConnected()) {
+        machined_client_.SendDeregister(config_);
+        FlushTickDirtyChannels();
+      }
+    }
+    if (PendingShutdownOperations() == 0) {
+      dispatcher_.Stop();
+      return;
+    }
   }
 }
 
@@ -171,11 +223,13 @@ auto ServerApp::Init(int argc, char* argv[]) -> bool {
 }
 
 void ServerApp::Fini() {
-  if (config_.process_type != ProcessType::kMachined && machined_client_.IsConnected()) {
+  if (!shutdown_deregistered_ && config_.process_type != ProcessType::kMachined &&
+      machined_client_.IsConnected()) {
     machined_client_.SendDeregister(config_);
   }
 
   if (tick_timer_.IsValid()) dispatcher_.CancelTimer(tick_timer_);
+  if (shutdown_timer_.IsValid()) dispatcher_.CancelTimer(shutdown_timer_);
 
   RemoveSignalHandler(Signal::kInterrupt);
   RemoveSignalHandler(Signal::kTerminate);
@@ -239,6 +293,11 @@ void ServerApp::RegisterWatchers() {
 }
 
 void ServerApp::AdvanceTime() {
+  if (shutdown_requested_) {
+    if (!shutdown_deregistered_ && config_.process_type != ProcessType::kMachined)
+      machined_client_.Tick();
+    return;
+  }
   auto now = Clock::now();
   auto actual_duration = now - last_tick_time_;
   last_tick_time_ = now;

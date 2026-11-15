@@ -127,6 +127,31 @@ public abstract class CellServerEntity : ServerEntity
         if (!IsDestroyed) OnTeleportFailed(reason);
     }
 
+    protected virtual void OnProximityEnter(int userArg, uint peerEntityId) { }
+
+    protected virtual void OnProximityLeave(int userArg, uint peerEntityId) { }
+
+    public int AddProximity(float range, int userArg = 0)
+    {
+        if (IsDestroyed || IsGhost || LifecycleCancellation.IsCancellationRequested ||
+            !float.IsFinite(range) || range < 0) return 0;
+        return NativeApi.AddProximityController(EntityId, range, userArg);
+    }
+
+    public void CancelController(int controllerId)
+    {
+        if (controllerId == 0 || IsDestroyed || IsGhost ||
+            LifecycleCancellation.IsCancellationRequested) return;
+        NativeApi.CancelController(EntityId, controllerId);
+    }
+
+    internal void DispatchProximity(int userArg, uint peerEntityId, bool isEnter)
+    {
+        if (IsDestroyed || IsGhost || LifecycleCancellation.IsCancellationRequested) return;
+        if (isEnter) OnProximityEnter(userArg, peerEntityId);
+        else OnProximityLeave(userArg, peerEntityId);
+    }
+
     public static bool RegisterMovementCurve(ushort curveId, System.ReadOnlySpan<float> samples)
     {
         return NativeApi.SetMovementCurve(curveId, samples);

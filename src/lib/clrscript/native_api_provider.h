@@ -96,7 +96,8 @@ class INativeApiProvider {
   // LoginRequest.entity_def_digest to bounce mismatched builds.
   virtual void SetEntityDefDigest(const std::byte* data, int32_t len) = 0;
 
-  virtual void WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len) = 0;
+  virtual auto WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len,
+                         uint64_t request_id) -> RpcSendResult = 0;
 
   virtual auto TransferClient(uint32_t src_entity_id, uint32_t dest_entity_id, uint32_t base_ip,
                               uint16_t base_port, uint64_t base_instance, uint64_t request_id)

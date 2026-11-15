@@ -9,6 +9,7 @@
 #include "network/interface_table.h"
 #include "network/socket.h"
 #include "network/tcp_channel.h"
+#include "test_null_channel.h"
 
 using namespace atlas;
 
@@ -74,6 +75,26 @@ TEST_F(ChannelTest, SendOnCondemnedReturnsError) {
   auto result = channel.Send();
   EXPECT_FALSE(result.HasValue());
   EXPECT_EQ(result.Error().Code(), ErrorCode::kChannelCondemned);
+}
+
+TEST_F(ChannelTest, NonpositiveInactivityTimeoutDisablesTimerAndCanBeRestored) {
+  for (const auto disabled : std::array<Duration, 2>{Duration::zero(), -Milliseconds(1)}) {
+    test_support::TestNullChannel channel(dispatcher_, table_, Address{});
+    channel.Activate();
+    int disconnected = 0;
+    channel.SetDisconnectCallback([&](Channel&) { ++disconnected; });
+    channel.SetInactivityTimeout(Milliseconds(10));
+    channel.SetInactivityTimeout(disabled);
+    const auto after_original_timeout = Clock::now() + Milliseconds(30);
+    while (Clock::now() < after_original_timeout) dispatcher_.ProcessOnce();
+    EXPECT_TRUE(channel.IsConnected());
+    EXPECT_EQ(disconnected, 0);
+    channel.SetInactivityTimeout(Milliseconds(10));
+    const auto deadline = Clock::now() + Milliseconds(100);
+    while (disconnected == 0 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+    EXPECT_EQ(disconnected, 1);
+    EXPECT_TRUE(channel.IsCondemned());
+  }
 }
 
 TEST_F(ChannelTest, TcpLoopbackSendAndDispatch) {

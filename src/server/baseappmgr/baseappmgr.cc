@@ -222,6 +222,13 @@ void BaseAppMgr::RegisterWatchers() {
   auto& wr = GetWatcherRegistry();
   wr.Add<std::size_t>("baseappmgr/baseapp_count",
                       std::function<std::size_t()>([this] { return baseapps_.size(); }));
+  wr.Add<std::size_t>("baseappmgr/available_baseapp_count", [this] {
+    const auto now = Clock::now();
+    const auto stale_after = LoadReportStaleAfter();
+    return static_cast<std::size_t>(std::count_if(
+        baseapps_.begin(), baseapps_.end(),
+        [&](const auto& entry) { return IsAllocationCandidate(entry.second, now, stale_after); }));
+  });
   wr.Add<std::size_t>("baseappmgr/dbid_affinity_count",
                       std::function<std::size_t()>([this] { return dbid_affinity_.size(); }));
 

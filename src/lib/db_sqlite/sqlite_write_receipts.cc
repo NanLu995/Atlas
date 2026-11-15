@@ -79,11 +79,13 @@ void SqliteDatabase::FinishWrite(const std::string& scope, const DatabaseWriteOp
 
 void SqliteDatabase::CheckoutWithOperation(const DatabaseCheckoutOperation& operation,
                                            std::function<void(GetResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   CheckoutOperationImpl(operation, true, std::move(callback));
 }
 
 void SqliteDatabase::ResolveCheckoutOperation(const DatabaseCheckoutOperation& operation,
                                               std::function<void(GetResult)> callback) {
+  if (!AdmitCallback(callback)) return;
   CheckoutOperationImpl(operation, false, std::move(callback));
 }
 

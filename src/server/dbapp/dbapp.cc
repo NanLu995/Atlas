@@ -4,6 +4,7 @@
 #include <chrono>
 #include <format>
 
+#include "db/entity_blob.h"
 #include "db/write_operation.h"
 #include "foundation/clock.h"
 #include "foundation/log.h"
@@ -41,23 +42,29 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
 
   const auto& cfg = Config();
 
-  // DBApp cannot host CoreCLR, so it consumes the DefDump ATDF blob
-  // that mirrors generated registration metadata.
   if (cfg.entitydef_bin_path.empty()) {
-    ATLAS_LOG_INFO("DBApp: no --entitydef-bin-path configured; entity_defs will be empty");
-    entity_defs_.emplace();
-  } else {
-    entity_defs_.emplace();
-    auto result = entity_defs_->RegisterFromBinaryFile(cfg.entitydef_bin_path);
-    if (!result) {
-      ATLAS_LOG_ERROR("DBApp: failed to load entity_defs from '{}': {}",
-                      cfg.entitydef_bin_path.string(), result.Error().Message());
-      return false;
-    }
-    ATLAS_LOG_INFO("DBApp: loaded entity_defs from '{}' (structs={}, components={}, types={})",
-                   cfg.entitydef_bin_path.string(), result->structs, result->components,
-                   result->types);
+    ATLAS_LOG_ERROR(
+        "DBApp requires --entitydef-bin-path; export the matching entity assembly "
+        "with Atlas.Tools.DefDump before starting the database process");
+    return false;
   }
+  entity_defs_.emplace();
+  auto result = entity_defs_->RegisterFromBinaryFile(cfg.entitydef_bin_path);
+  if (!result) {
+    ATLAS_LOG_ERROR("DBApp: failed to load entity_defs from '{}': {}",
+                    cfg.entitydef_bin_path.string(), result.Error().Message());
+    return false;
+  }
+  if (entity_defs_->TypeCount() == 0 ||
+      std::ranges::all_of(entity_defs_->Digest(), [](uint8_t byte) { return byte == 0; })) {
+    ATLAS_LOG_ERROR(
+        "DBApp: entity definitions require entity types and a nonzero definition "
+        "digest; rebuild and export the matching game entity assembly");
+    return false;
+  }
+  ATLAS_LOG_INFO("DBApp: loaded entity_defs from '{}' (structs={}, components={}, types={})",
+                 cfg.entitydef_bin_path.string(), result->structs, result->components,
+                 result->types);
 
   auto db_cfg = BuildDbConfig();
   database_ = CreateDatabase(db_cfg);
@@ -161,6 +168,28 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
   ATLAS_LOG_INFO("DBApp: initialised (backend={}, auto_create={}, account_type={})", db_cfg.type,
                  auto_create_accounts_, account_type_id_);
   return true;
+}
+
+void DBApp::BeginShutdown() {
+  ManagerApp::BeginShutdown();
+  if (database_) database_->BeginDrain();
+}
+
+void DBApp::OnShutdownTick() {
+  if (database_) database_->ProcessResults();
+}
+
+auto DBApp::PendingShutdownOperations() const -> std::size_t {
+  return ManagerApp::PendingShutdownOperations() +
+         (database_ ? database_->PendingOperations() : 0) + pending_write_requests_.size() +
+         pending_checkout_requests_.size() + account_session_requests_ +
+         process_retirements_.size();
+}
+
+void DBApp::LogShutdownPending() const {
+  ManagerApp::LogShutdownPending();
+  ATLAS_LOG_ERROR("DBApp: shutdown database_operations={} retirements={}",
+                  database_ ? database_->PendingOperations() : 0, process_retirements_.size());
 }
 
 void DBApp::Fini() {
@@ -648,6 +677,15 @@ void DBApp::OnWriteEntity(const Address& src, Channel* ch, const dbapp::WriteEnt
     reject("invalid_checkout_process_instance", DatabaseErrorKind::kOwnershipConflict);
     return;
   }
+  if (!entity_defs_ || !std::ranges::equal(msg.entity_def_digest, entity_defs_->Digest())) {
+    reject("entity_def_mismatch", DatabaseErrorKind::kOperationConflict);
+    return;
+  }
+  if (auto decoded = DecodeDbBlob(msg.blob); !decoded) {
+    reject(std::format("invalid_entity_snapshot: {}", decoded.Error().Message()),
+           DatabaseErrorKind::kOperationConflict);
+    return;
+  }
   auto hash = HashWriteOperation(operation, msg.type_id, msg.blob, msg.identifier);
   if (!hash) {
     reject(std::string(hash.Error().Message()), DatabaseErrorKind::kNone);
@@ -728,7 +766,9 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
   operation.identifier = msg.identifier;
   operation.owner =
       CheckoutInfo{src, msg.owner_app_id, msg.entity_id, 0, msg.owner_process_instance};
-  if (!operation.IsValid() || msg.owner_process_instance == 0 ||
+  const bool schema_mismatch =
+      !entity_defs_ || !std::ranges::equal(msg.entity_def_digest, entity_defs_->Digest());
+  if (schema_mismatch || !operation.IsValid() || msg.owner_process_instance == 0 ||
       msg.owner_process_instance > (UINT64_MAX >> 1) ||
       (msg.mode != dbapp::LoadMode::kByName && msg.mode != dbapp::LoadMode::kByDbid) ||
       (msg.mode == dbapp::LoadMode::kByDbid && msg.dbid == kInvalidDBID)) {
@@ -736,7 +776,7 @@ void DBApp::OnCheckoutEntity(const Address& src, Channel* ch, const dbapp::Check
     ack.operation_id = msg.operation_id;
     ack.request_id = msg.request_id;
     ack.status = dbapp::CheckoutStatus::kDbError;
-    ack.error = "invalid_checkout_operation";
+    ack.error = schema_mismatch ? "entity_def_mismatch" : "invalid_checkout_operation";
     ack.error_kind = DatabaseErrorKind::kOperationConflict;
     (void)SendCheckoutAck({src, msg.request_id, msg.operation_id}, ack, ch);
     return;
@@ -1190,6 +1230,13 @@ void DBApp::RetireBaseappProcess(const Address& internal_addr, uint64_t process_
 void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin& msg) {
   ATLAS_LOG_DEBUG("DBApp: auth login request_id={} user='{}' from {}:{}", msg.request_id,
                   msg.username, src.Ip(), src.Port());
+  if (!entity_defs_ || !std::ranges::equal(msg.entity_def_digest, entity_defs_->Digest())) {
+    login::AuthLoginResult reply;
+    reply.request_id = msg.request_id;
+    reply.status = login::LoginStatus::kDefMismatch;
+    if (ch != nullptr) (void)ch->SendMessage(reply);
+    return;
+  }
   if (!database_ || msg.username.empty() || msg.password_hash.empty()) {
     login::AuthLoginResult reply;
     reply.request_id = msg.request_id;
@@ -1247,7 +1294,18 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
             EntityData data;
             data.type_id = account_type_id_;
             data.identifier = username;
-            data.blob = {};
+            auto encoded = EncodeDbBlob({}, {});
+            if (!encoded) {
+              ATLAS_LOG_ERROR("DBApp: cannot encode initial account snapshot: {}",
+                              encoded.Error().Message());
+              reply.success = false;
+              reply.status = login::LoginStatus::kInternalError;
+              if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
+                (void)reply_ch->SendMessage(reply);
+              }
+              return;
+            }
+            data.blob = std::move(*encoded);
             DatabaseID create_dbid = kInvalidDBID;
             WriteFlags create_flags = WriteFlags::kCreateNew;
             std::optional<dbappmgr::ShardEntry> create_shard;

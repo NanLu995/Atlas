@@ -3,6 +3,7 @@
 add_library(atlas_baseapp_lib STATIC
   base_entity.cc
   baseapp.cc
+  shutdown.cc
   account_session.cc
   session_revocation.cc
   client_handoff.cc

@@ -33,6 +33,8 @@ class LoginApp : public ManagerApp {
            NetworkInterface& external_network);
 
  protected:
+  void BeginShutdown() override;
+  [[nodiscard]] auto PendingShutdownOperations() const -> std::size_t override;
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
   void OnTickComplete() override;

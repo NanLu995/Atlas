@@ -74,8 +74,8 @@ C++ 网络层收到 RPC 消息
    `Atlas.Generators.Def` 的诊断会在客户端/服务端版本不匹配时告警。
    客户端登录携带 32-byte `EntityDefDigest`,BaseApp 用
    `EntityDefRegistry::Digest()` 比对并拒绝不一致的客户端构建;
-   `PersistentPropertiesDigest()` 目前只是本地持久字段摘要 helper,尚未接入
-   BaseApp ↔ DBApp 握手。
+   `StorageSchemaDigest()` 覆盖完整快照结构和嵌套类型，数据库后端启动时核对存档摘要；
+   DBApp 在认证、checkout 和写入访问数据库前，核对请求中的完整定义摘要。
 4. **`exposed` 检查**。客户端 → Cell 方向必须显式在 `.def` 里 `exposed`,
    否则 Provider 侧拒绝分发。
 

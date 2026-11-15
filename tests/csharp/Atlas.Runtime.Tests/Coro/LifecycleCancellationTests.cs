@@ -2,6 +2,8 @@ using System;
 using Atlas.Coro;
 using Atlas.Coro.Rpc;
 using Atlas.Coro.Testing;
+using Atlas.Core;
+using Atlas.Coro.Hosting;
 using Atlas.Entity;
 using Atlas.Serialization;
 using Xunit;
@@ -31,9 +33,39 @@ public sealed class LifecycleCancellationTests : IDisposable
 
     private sealed class Dummy : ServerEntity
     {
+        public int TickCount { get; private set; }
         public override string TypeName => "Dummy";
+        protected internal override void OnTick(float deltaTime) => ++TickCount;
         public override void Serialize(ref SpanWriter w) { }
         public override void Deserialize(ref SpanReader r) { }
+    }
+
+    [Fact]
+    public void ShutdownDrainProcessesQueuedContinuationsWithoutEntityTick()
+    {
+        using var loop = new ManagedAtlasLoop();
+        var previousLoop = EngineContext.CoroLoop;
+        var previousContext = EngineContext.SyncContext;
+        EngineContext.CoroLoop = loop;
+        EngineContext.SyncContext = new AtlasSynchronizationContext();
+        var entity = EntityManager.Instance.Create<Dummy>();
+        var posted = 0;
+        try
+        {
+            loop.PostMainThread(_ => ++posted, null);
+            EngineContext.SyncContext.Post(_ => ++posted, null);
+            Assert.Equal(0, posted);
+            Lifecycle.DoOnDrain();
+            Assert.Equal(2, posted);
+            Assert.Equal(0, entity.TickCount);
+            Lifecycle.DoOnDrain();
+            Assert.Equal(2, posted);
+        }
+        finally
+        {
+            EngineContext.CoroLoop = previousLoop;
+            EngineContext.SyncContext = previousContext;
+        }
     }
 
     private static readonly AtlasRpcSource<RpcReply<int>>.SpanDeserializer Deser =

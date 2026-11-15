@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "baseapp.h"
 #include "coro/rpc_call.h"
 #include "foundation/log.h"
@@ -132,6 +134,10 @@ auto BaseApp::ApplyClientSessionOperation(std::shared_ptr<ClientSession> session
 }
 
 void BaseApp::OnClientAuthenticate(Channel& channel, const baseapp::Authenticate& request) {
+  if (IsShuttingDown()) {
+    RejectAuthentication(channel, "server_stopping");
+    return;
+  }
   if (TryAuthenticateClientHandoff(channel, request)) return;
   auto* proxy = entity_mgr_.FindProxyBySession(request.session_key);
   if (proxy == nullptr) {
@@ -368,7 +374,7 @@ auto BaseApp::MoveClientSession(EntityID source, EntityID destination) -> Task<R
 
 auto BaseApp::StartClientTransfer(EntityID source, EntityID destination, uint64_t request_id,
                                   AccountSessionOwner target) -> RpcSendResult {
-  if (rpc_registry_.IsStopping()) return RpcSendResult::kStopping;
+  if (IsShuttingDown() || rpc_registry_.IsStopping()) return RpcSendResult::kStopping;
   if ((target.base_addr != Address{} || target.process_instance != 0) &&
       !IsValidSessionOwner(target))
     return RpcSendResult::kInvalidTarget;
@@ -445,6 +451,7 @@ void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t t
 
   std::vector<std::byte> blob;
   if (!CaptureEntitySnapshot(entity_id, blob)) {
+    FinishShutdownSave(entity_id, false, "snapshot failed");
     if (continuation_request_id != 0)
       FailPendingForceLogoff(continuation_request_id, "force_logoff_snapshot_failed");
     FlushRemoteForceLogoffAcks(entity_id, false);
@@ -453,7 +460,9 @@ void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t t
   }
 
   dbapp::WriteEntity msg;
+  std::ranges::copy(EntityDefRegistry::Instance().Digest(), msg.entity_def_digest.begin());
   if (auto generated = FillSecureRandom(msg.operation_id); !generated) {
+    FinishShutdownSave(entity_id, false, "operation ID generation failed");
     if (continuation_request_id != 0)
       FailPendingForceLogoff(continuation_request_id, "operation_id_generation_failed");
     FailDeferredPrepareLogins(entity_id, "operation_id_generation_failed");
@@ -482,6 +491,7 @@ void BaseApp::BeginLogoffPersist(EntityID entity_id, DatabaseID dbid, uint16_t t
   logoff_entities_in_flight_.insert(entity_id);
   auto [it, inserted] = pending_logoff_writes_.emplace(kRequestId, std::move(pending));
   if (!inserted) {
+    FinishShutdownSave(entity_id, false, "duplicate logoff write request ID");
     logoff_entities_in_flight_.erase(entity_id);
     ATLAS_LOG_ERROR("BaseApp: duplicate logoff write request_id={} entity_id={}", kRequestId,
                     entity_id);
@@ -523,7 +533,10 @@ void BaseApp::BeginForceLogoffPersist(uint32_t force_request_id, EntityID entity
 void BaseApp::StartDisconnectLogoff(EntityID entity_id) {
   if (client_sessions_.contains(entity_id)) {
     ReleaseClientSessionThen(entity_id, [this, entity_id](bool success) {
-      if (success) StartDisconnectLogoff(entity_id);
+      if (success)
+        StartDisconnectLogoff(entity_id);
+      else
+        FinishShutdownSave(entity_id, false, "session release failed");
     });
     return;
   }
@@ -531,6 +544,7 @@ void BaseApp::StartDisconnectLogoff(EntityID entity_id) {
 
   auto* ent = entity_mgr_.Find(entity_id);
   if (!ent || ent->IsPendingDestroy()) {
+    FinishShutdownSave(entity_id, true, {});
     return;
   }
 
@@ -540,7 +554,8 @@ void BaseApp::StartDisconnectLogoff(EntityID entity_id) {
   }
 
   if (kDbid == kInvalidDBID) {
-    (void)FinalizeForceLogoff(entity_id);
+    const bool finalized = FinalizeForceLogoff(entity_id);
+    FinishShutdownSave(entity_id, finalized, "temporary entity teardown failed");
     return;
   }
 

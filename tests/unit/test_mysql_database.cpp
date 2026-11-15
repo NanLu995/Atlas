@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -19,10 +20,12 @@
 
 #include <gtest/gtest.h>
 
+#include "atdf_account_fixture.h"
 #include "db_mysql/mysql_database.h"
 #include "entitydef/entity_def_registry.h"
 #include "network/socket.h"
 #include "test_account_session_contract.h"
+#include "test_database_admission.h"
 
 using namespace atlas;
 
@@ -44,54 +47,9 @@ auto make_blob(std::string_view text) -> std::vector<std::byte> {
 
 void register_account_entity() {
   EntityDefRegistry::Instance().clear();
-
-  std::vector<std::byte> buf;
-  auto write_str = [&](const std::string& s) {
-    auto len = static_cast<uint32_t>(s.size());
-    if (len < 128) {
-      buf.push_back(static_cast<std::byte>(len));
-    } else {
-      buf.push_back(static_cast<std::byte>((len & 0x7F) | 0x80));
-      buf.push_back(static_cast<std::byte>(len >> 7));
-    }
-    for (char c : s) {
-      buf.push_back(static_cast<std::byte>(c));
-    }
-  };
-  auto write_u8 = [&](uint8_t v) { buf.push_back(static_cast<std::byte>(v)); };
-  auto write_u16 = [&](uint16_t v) {
-    buf.push_back(static_cast<std::byte>(v & 0xFF));
-    buf.push_back(static_cast<std::byte>(v >> 8));
-  };
-
-  write_str("Account");
-  write_u16(1);
-  write_u8(0);
-  write_u8(1);
-  write_u8(2);
-
-  write_str("accountName");
-  write_u8(11);
-  write_u8(1);
-  write_u8(1);
-  write_u8(5);
-  write_u16(0);
-  write_u8(1);  // identifier
-  write_u8(0);  // reliable
-
-  write_str("level");
-  write_u8(6);
-  write_u8(1);
-  write_u8(1);
-  write_u8(5);
-  write_u16(1);
-  write_u8(0);  // identifier
-  write_u8(0);  // reliable
-
-  write_u8(0);
-
+  const auto blob = atlas::test_fixtures::MakeAccountTypeBlob();
   ASSERT_TRUE(
-      EntityDefRegistry::Instance().RegisterType(buf.data(), static_cast<int32_t>(buf.size())));
+      EntityDefRegistry::Instance().RegisterType(blob.data(), static_cast<int32_t>(blob.size())));
 }
 
 auto make_config() -> DatabaseConfig {
@@ -266,6 +224,115 @@ class MysqlDatabaseTest : public ::testing::Test {
   MysqlDatabase db_;
   DatabaseConfig cfg_;
 };
+
+TEST_F(MysqlDatabaseTest, StartupRejectsSchemaVersionWithoutOverwritingIt) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(),
+                        "UPDATE meta SET `value` = 'unsupported' WHERE `key` = 'schema_version'"),
+            0);
+  db_.Shutdown();
+
+  auto started = db_.Startup(cfg_, EntityDefRegistry::Instance());
+  EXPECT_FALSE(started.HasValue());
+  if (!started) {
+    EXPECT_NE(started.Error().Message().find("schema_version"), std::string_view::npos);
+  }
+  db_.Shutdown();
+  ASSERT_EQ(mysql_query(admin.get(), "SELECT `value` FROM meta WHERE `key` = 'schema_version'"), 0);
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(admin.get()),
+                                                                mysql_free_result);
+  ASSERT_TRUE(rows);
+  auto row = mysql_fetch_row(rows.get());
+  ASSERT_NE(row, nullptr);
+  EXPECT_STREQ(row[0], "unsupported");
+}
+
+TEST_F(MysqlDatabaseTest, StartupRejectsMissingSchemaVersion) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(), "DELETE FROM meta WHERE `key` = 'schema_version'"), 0);
+  db_.Shutdown();
+  auto started = db_.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("schema_version"), std::string_view::npos);
+}
+
+TEST_F(MysqlDatabaseTest, StartupRejectsUnsupportedBlobFormatWithoutUpdatingMetadata) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(),
+                        "UPDATE meta SET `value` = 'unsupported' "
+                        "WHERE `key` = 'blob_format_version'"),
+            0);
+  db_.Shutdown();
+  auto started = db_.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("blob_format_version"), std::string_view::npos);
+}
+
+TEST_F(MysqlDatabaseTest, StartupRejectsChangedSnapshotSchemaWithoutReplacingTheDigest) {
+  db_.Shutdown();
+  auto& registry = EntityDefRegistry::Instance();
+  const auto original = registry.types[0].properties[1].data_type;
+  registry.types[0].properties[1].data_type = PropertyDataType::kUInt64;
+  auto started = db_.Startup(cfg_, registry);
+  EXPECT_FALSE(started.HasValue());
+  if (!started) {
+    EXPECT_NE(started.Error().Message().find("storage_schema_digest"), std::string_view::npos);
+  }
+  db_.Shutdown();
+  registry.types[0].properties[1].data_type = original;
+  ASSERT_TRUE(db_.Startup(cfg_, registry));
+}
+
+TEST_F(MysqlDatabaseTest, StartupRejectsMissingSnapshotSchemaDigest) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(), "DELETE FROM meta WHERE `key` = 'storage_schema_digest'"), 0);
+  db_.Shutdown();
+  auto started = db_.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_FALSE(started.HasValue());
+  EXPECT_NE(started.Error().Message().find("storage_schema_digest"), std::string_view::npos);
+}
+
+TEST_F(MysqlDatabaseTest, ConcurrentStartupInitializesOneSchemaAndDisjointIdRanges) {
+  db_.Shutdown();
+  ASSERT_TRUE(reset_schema(cfg_));
+  MysqlDatabase peer;
+  Result<void> first;
+  Result<void> second;
+  std::barrier ready(2);
+  std::jthread other([&] {
+    ready.arrive_and_wait();
+    second = peer.Startup(cfg_, EntityDefRegistry::Instance());
+  });
+  ready.arrive_and_wait();
+  first = db_.Startup(cfg_, EntityDefRegistry::Instance());
+  other.join();
+  ASSERT_TRUE(first.HasValue()) << first.Error().Message();
+  ASSERT_TRUE(second.HasValue()) << second.Error().Message();
+  EntityIdRange first_range;
+  EntityIdRange second_range;
+  db_.ReserveEntityIds(10, [&](Result<EntityIdRange> result) {
+    ASSERT_TRUE(result.HasValue());
+    first_range = *result;
+  });
+  peer.ReserveEntityIds(10, [&](Result<EntityIdRange> result) {
+    ASSERT_TRUE(result.HasValue());
+    second_range = *result;
+  });
+  EXPECT_TRUE(first_range.last < second_range.first || second_range.last < first_range.first);
+  peer.Shutdown();
+}
+
+TEST_F(MysqlDatabaseTest, AdmissionIncludesUnconsumedResultsAndRejectsBeforeWriting) {
+  atlas::test_support::CheckDatabaseAdmission(db_);
+}
+
+TEST_F(MysqlDatabaseTest, DrainRejectsNewWorkAndCompletesAcceptedCallbacks) {
+  atlas::test_support::CheckDatabaseDrain(db_);
+}
 
 TEST_F(MysqlDatabaseTest, AccountSessionOwnershipContract) {
   atlas::test_support::CheckAccountSessionContract(db_);
@@ -607,7 +674,10 @@ TEST_F(MysqlDatabaseTest, CheckoutAndClear) {
   EXPECT_EQ(second.checked_out_by->app_id, 10u);
 
   bool cleared = false;
-  db_.ClearCheckout(put.dbid, 1, [&](bool ok) { cleared = ok; });
+  db_.ClearCheckout(put.dbid, 1, [&](Result<bool> ok) {
+    ASSERT_TRUE(ok);
+    cleared = *ok;
+  });
   EXPECT_TRUE(cleared);
 }
 
@@ -628,8 +698,9 @@ TEST_F(MysqlDatabaseTest, AutoLoadAndDeferredCallbacks) {
 
   std::vector<EntityData> entities;
   bool load_done = false;
-  db_.GetAutoLoadEntities([&](std::vector<EntityData> rows) {
-    entities = std::move(rows);
+  db_.GetAutoLoadEntities([&](Result<std::vector<EntityData>> rows) {
+    ASSERT_TRUE(rows);
+    entities = std::move(*rows);
     load_done = true;
   });
   EXPECT_TRUE(entities.empty());
@@ -710,7 +781,10 @@ TEST_F(MysqlDatabaseTest, CheckoutByNameAndClearCheckoutsForAddress) {
   EXPECT_FALSE(checkout_chris.checked_out_by.has_value());
 
   int cleared = 0;
-  db_.ClearCheckoutsForAddress(owner_a.base_addr, [&](int count) { cleared = count; });
+  db_.ClearCheckoutsForAddress(owner_a.base_addr, [&](Result<int> count) {
+    ASSERT_TRUE(count);
+    cleared = *count;
+  });
   EXPECT_EQ(cleared, 2);
 
   GetResult alice_after_clear;
@@ -762,8 +836,10 @@ TEST_F(MysqlDatabaseTest, PutEntityWithPasswordPreservesAutoLoadAndClearsCheckou
   EXPECT_EQ(lookup.password_hash, "pw_hash_2");
 
   std::vector<EntityData> auto_load_entities;
-  db_.GetAutoLoadEntities(
-      [&](std::vector<EntityData> rows) { auto_load_entities = std::move(rows); });
+  db_.GetAutoLoadEntities([&](Result<std::vector<EntityData>> rows) {
+    ASSERT_TRUE(rows);
+    auto_load_entities = std::move(*rows);
+  });
   ASSERT_EQ(auto_load_entities.size(), 1u);
   EXPECT_EQ(auto_load_entities[0].dbid, put.dbid);
 }

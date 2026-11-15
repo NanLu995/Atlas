@@ -17,6 +17,8 @@ class EntityApp : public ScriptApp {
   [[nodiscard]] auto EntityDefs() -> EntityDefRegistry& { return EntityDefRegistry::Instance(); }
 
  protected:
+  void BeginShutdown() override;
+  [[nodiscard]] auto PendingShutdownOperations() const -> std::size_t override;
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
 

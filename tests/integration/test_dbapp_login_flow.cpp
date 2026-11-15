@@ -89,7 +89,10 @@ class TestDBApp final : public DBApp {
 
  protected:
   auto Init(int argc, char* argv[]) -> bool override {
-    if (!DBApp::Init(argc, argv)) return false;
+    if (!DBApp::Init(argc, argv)) {
+      addr_promise_.set_value(Address{});
+      return false;
+    }
 
     Address addr = Network().RudpAddress();
     if (addr.Ip() == 0) addr = Address("127.0.0.1", addr.Port());
@@ -163,6 +166,7 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
   ASSERT_TRUE(ch.HasValue()) << ch.Error().Message();
 
   login::AuthLogin missing;
+  missing.entity_def_digest = atlas::test_fixtures::kAccountDefinitionDigest;
   missing.request_id = 1;
   missing.username = "hero";
   missing.password_hash = "pw";

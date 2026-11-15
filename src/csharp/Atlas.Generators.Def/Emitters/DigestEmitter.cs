@@ -6,14 +6,11 @@ using System.Text;
 
 namespace Atlas.Generators.Def.Emitters;
 
-// Hashes the entity-def surface that affects RPC routing and replication
-// layout, so a client / server with diverged .def files refuses to handshake
-// instead of silently misrouting RPCs at runtime. Inputs are normalized in
-// stable order — manifest type_id for entities, struct id for structs,
-// declaration order for properties / methods / fields.
+// Schema IDs use manifest order; fields and methods retain declaration order
+// because reordering them changes decoding and dispatch.
 internal static class DigestEmitter
 {
-    public const string Header = "ATLAS_DEF_DIGEST_v1";
+    public const string Header = "ATLAS_DEF_DIGEST_v2";
 
     public static string Emit(IEnumerable<EntityDefModel> defs,
                               List<StructDefModel> structs,
@@ -93,15 +90,26 @@ internal static class DigestEmitter
             AppendMethods(sb, "base", def.BaseMethods);
             foreach (var c in def.Components.OrderBy(c => c.SlotIdx))
             {
-                sb.Append("C|").Append(c.SlotIdx).Append('|').Append(c.TypeName).Append('|')
-                  .Append(c.Scope).Append('|').Append(c.Locality).Append('\n');
+                sb.Append("C|").Append(c.SlotIdx).Append('|').Append(c.SlotName).Append('|')
+                  .Append(c.TypeName).Append('|').Append(c.ComponentTypeId).Append('|')
+                  .Append(c.Scope).Append('|').Append(c.Locality).Append('|')
+                  .Append(c.Lazy ? '1' : '0').Append('\n');
+                if (c.ComponentTypeId <= 0)
+                {
+                    AppendProperties(sb, ComponentEmitter.FlattenChain(c).Select(p => p.Prop).ToList());
+                    AppendMethods(sb, "client", c.ClientMethods);
+                    AppendMethods(sb, "cell", c.CellMethods);
+                    AppendMethods(sb, "base", c.BaseMethods);
+                }
             }
         }
 
         sb.Append("COMPONENTS\n");
         foreach (var c in standaloneComponents.OrderBy(c => c.TypeName, StringComparer.Ordinal))
         {
-            sb.Append("K|").Append(c.TypeName).Append('|').Append(c.Locality).Append('\n');
+            sb.Append("K|").Append(c.TypeName).Append('|').Append(c.ComponentTypeId).Append('|')
+              .Append(c.BaseTypeName).Append('|').Append(c.PropIdxBase).Append('|')
+              .Append(c.Locality).Append('\n');
             AppendProperties(sb, c.Properties);
             AppendMethods(sb, "client", c.ClientMethods);
             AppendMethods(sb, "cell", c.CellMethods);
@@ -119,7 +127,8 @@ internal static class DigestEmitter
             sb.Append("P|").Append(i).Append('|').Append(p.Name).Append('|')
               .Append(p.Scope).Append('|')
               .Append(p.Persistent ? '1' : '0').Append('|')
-              .Append(p.Reliable ? '1' : '0').Append('|');
+              .Append(p.Reliable ? '1' : '0').Append('|')
+              .Append(p.TypeRef?.IsContainer == true ? p.MaxSize : 0).Append('|');
             if (p.TypeRef != null)
                 AppendTypeRef(sb, p.TypeRef);
             else

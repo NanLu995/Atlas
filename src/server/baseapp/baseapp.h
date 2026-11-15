@@ -125,6 +125,10 @@ class BaseApp : public EntityApp {
   void SetSpaceMasterType(SpaceID space_id, std::string type_name);
 
  protected:
+  void BeginShutdown() override;
+  void OnShutdownTick() override;
+  [[nodiscard]] auto PendingShutdownOperations() const -> std::size_t override;
+  void LogShutdownPending() const override;
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
 
@@ -136,6 +140,10 @@ class BaseApp : public EntityApp {
   [[nodiscard]] auto CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> override;
 
  private:
+  void ScheduleShutdownSaves();
+  void FinishShutdownSave(EntityID entity_id, bool success, std::string_view error);
+  std::unordered_set<EntityID> shutdown_save_started_;
+  std::unordered_set<EntityID> shutdown_saves_;
   friend class BaseAppRollbackTest;
   friend class BaseAppMovementInputTest;
   friend class BaseAppInflightRpcTest;
@@ -201,7 +209,8 @@ class BaseApp : public EntityApp {
   void OnMovementCorrectionReport(Channel& ch, const baseapp::MovementCorrectionReport& msg);
 
   friend class BaseAppNativeProvider;
-  void DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len);
+  auto DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len,
+                   uint64_t reply_request_id = 0) -> RpcSendResult;
   auto DoGiveClientToLocal(EntityID src_id, EntityID dest_id) -> Result<void>;
   auto NotifyClientCellReady(EntityID entity_id) -> Result<void>;
 
@@ -250,6 +259,8 @@ class BaseApp : public EntityApp {
   [[nodiscard]] auto SendPendingLogoffWriteToDb(uint32_t request_id, PendingLogoffWrite& pending)
       -> bool;
   [[nodiscard]] auto SendPendingWriteToDb(uint32_t request_id, PendingWriteToDb& pending) -> bool;
+  void CompletePersistenceWait(uint64_t request_id, DatabaseID dbid, int32_t error_code,
+                               std::string_view error);
   [[nodiscard]] auto ResolveDbAppChannel(DatabaseID dbid) -> Channel*;
   [[nodiscard]] auto ConnectDbAppChannel(const Address& addr) -> Channel*;
   [[nodiscard]] auto FindDbAppShard(DatabaseID dbid) const -> const dbappmgr::ShardEntry*;
@@ -384,6 +395,7 @@ class BaseApp : public EntityApp {
   uint32_t app_id_{0};
 
   struct PendingLogin {
+    std::array<uint8_t, 32> entity_def_digest{};
     uint32_t login_request_id{0};
     Address loginapp_addr;
     uint16_t type_id{0};
@@ -426,6 +438,7 @@ class BaseApp : public EntityApp {
   struct PendingWriteToDb {
     EntityID entity_id{kInvalidEntityID};
     DatabaseID dbid{kInvalidDBID};
+    uint64_t reply_request_id{0};
     dbapp::WriteEntity message;
     Address target_addr;
     TimePoint created_at{};

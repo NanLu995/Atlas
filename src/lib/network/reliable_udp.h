@@ -12,6 +12,7 @@
 #include "foundation/timer_queue.h"
 #include "network/bundle.h"
 #include "network/channel.h"
+#include "network/protocol_version.h"
 #include "network/rtt_estimator.h"
 #include "network/seq_num.h"
 #include "network/socket.h"
@@ -24,8 +25,8 @@ inline constexpr uint8_t kFlagHasSeq = 0x02;
 inline constexpr uint8_t kFlagHasAck = 0x04;
 inline constexpr uint8_t kFlagFragment = 0x08;
 
-// flags + seq + ack + ack_bits + una + fragment header.
-inline constexpr std::size_t kMaxHeaderSize = 21;
+// Connection version, flags, seq, ack, ack_bits, una and fragment header.
+inline constexpr std::size_t kMaxHeaderSize = kConnectionProtocolHeader.size() + 21;
 inline constexpr std::size_t kMinMtu = kMaxHeaderSize + 1;
 
 // Both endpoints must agree; reassembly assumes uniform chunk size.

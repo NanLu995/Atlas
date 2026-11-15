@@ -73,6 +73,7 @@ auto ReliableUdpChannel::OnDeferredAppend(const MessageDesc& desc, std::size_t t
   if (total_size >= deferred_flush_threshold_) {
     auto& bundle = desc.IsUnreliable() ? deferred_unreliable_bundle_ : deferred_reliable_bundle_;
     auto r = desc.IsUnreliable() ? SendBundleUnreliable(bundle) : SendBundleReliable(bundle);
+    if (!r && r.Error().Code() == ErrorCode::kWouldBlock) return {};
     if (!r) return r.Error();
   }
   return Result<void>{};
@@ -209,6 +210,8 @@ auto ReliableUdpChannel::DoSend(std::span<const std::byte> data) -> Result<size_
     if (!result) return result.Error();
     return data.size();
   }
+  if (unacked_.size() >= EffectiveWindow())
+    return Error{ErrorCode::kWouldBlock, "Send window full"};
 
   auto seq = next_send_seq_++;
 
@@ -260,7 +263,8 @@ void ReliableUdpChannel::OnCondemned() {
 auto ReliableUdpChannel::BuildPacket(uint8_t flags, SeqNum seq, std::span<const std::byte> payload,
                                      const FragmentHeader* frag) -> std::vector<std::byte> {
   std::array<std::byte, rudp::kMaxHeaderSize> hdr_buf{};
-  std::size_t hdr_len = 0;
+  std::copy(kConnectionProtocolHeader.begin(), kConnectionProtocolHeader.end(), hdr_buf.begin());
+  std::size_t hdr_len = kConnectionProtocolHeader.size();
 
   hdr_buf[hdr_len++] = static_cast<std::byte>(flags);
 
@@ -299,9 +303,9 @@ auto ReliableUdpChannel::BuildPacket(uint8_t flags, SeqNum seq, std::span<const 
 
 void ReliableUdpChannel::OnDatagramReceived(std::span<const std::byte> data,
                                             TimePoint flush_deadline) {
-  if (data.empty()) {
-    return;
-  }
+  if (!HasConnectionProtocolHeader(data)) return;
+  data = data.subspan(kConnectionProtocolHeader.size());
+  if (data.empty()) return;
 
   if (drop_duration_ms_ > 0) {
     const auto elapsed_ms =
@@ -861,11 +865,12 @@ void ReliableUdpChannel::CancelDelayedAck() {
 
 auto ReliableUdpChannel::RebuildPacketHeader(const std::vector<std::byte>& original_packet)
     -> std::vector<std::byte> {
-  if (original_packet.empty()) {
+  if (!HasConnectionProtocolHeader(original_packet)) {
     return original_packet;
   }
 
-  BinaryReader reader(std::span<const std::byte>(original_packet.data(), original_packet.size()));
+  BinaryReader reader(
+      std::span<const std::byte>(original_packet).subspan(kConnectionProtocolHeader.size()));
   auto flags_result = reader.Read<uint8_t>();
   if (!flags_result) {
     return original_packet;

@@ -92,11 +92,12 @@ void Channel::ResetInactivityTimer() {
 }
 
 void Channel::StartInactivityTimer() {
-  if (inactivity_timeout_ <= Duration::zero()) {
-    return;
-  }
   if (inactivity_timer_.IsValid()) {
     dispatcher_.CancelTimer(inactivity_timer_);
+    inactivity_timer_ = TimerHandle{};
+  }
+  if (inactivity_timeout_ <= Duration::zero()) {
+    return;
   }
   inactivity_timer_ = dispatcher_.AddRepeatingTimer(inactivity_timeout_,
                                                     [this](TimerHandle) { CheckInactivity(); });

@@ -1,6 +1,6 @@
 #include "db/db_export.h"
 #include "db_mysql/mysql_database.h"
 
-ATLAS_DB_BACKEND_API atlas::IDatabase* AtlasCreateDatabaseV2() {
+ATLAS_DB_BACKEND_API atlas::IDatabase* AtlasCreateDatabaseV3() {
   return new atlas::MysqlDatabase();
 }

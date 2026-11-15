@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "baseapp_messages.h"
@@ -18,6 +19,7 @@
 #include "cellapp/cellapp_messages.h"
 #include "cellappmgr/cellappmgr_messages.h"
 #include "coro/entity_rpc_reply.h"
+#include "db/entity_blob.h"
 #include "db/idatabase.h"
 #include "dbapp/dbapp_messages.h"
 #include "entitydef/entity_def_registry.h"
@@ -49,57 +51,6 @@ inline constexpr uint8_t kDbappLogoffWriteRetryLimit = 3;
 inline constexpr uint8_t kDbappWriteRetryLimit = 3;
 inline constexpr uint32_t kMovementLargeCorrectionSuspiciousStreak = 3;
 inline constexpr float kMovementCorrectionReportMaxDistanceM = 1000.0f;
-
-// DB-blob framing keeps DATA_BASE plus CELL_DATA through save/load.
-// Legacy pre-magic blobs are treated as base-only.
-constexpr std::byte kDbBlobMagic{0xA7};
-constexpr std::byte kDbBlobVersion{0x01};
-
-auto EncodeDbBlob(std::span<const std::byte> base_bytes, std::span<const std::byte> cell_bytes)
-    -> std::vector<std::byte> {
-  std::vector<std::byte> out;
-  out.reserve(2 + 4 + base_bytes.size() + 4 + cell_bytes.size());
-  out.push_back(kDbBlobMagic);
-  out.push_back(kDbBlobVersion);
-  auto push_u32 = [&](uint32_t v) {
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
-  };
-  push_u32(static_cast<uint32_t>(base_bytes.size()));
-  out.insert(out.end(), base_bytes.begin(), base_bytes.end());
-  push_u32(static_cast<uint32_t>(cell_bytes.size()));
-  out.insert(out.end(), cell_bytes.begin(), cell_bytes.end());
-  return out;
-}
-
-// Returns spans into `blob`. False only on structural corruption; legacy
-// pre-magic blobs return true as base-only.
-auto DecodeDbBlob(std::span<const std::byte> blob, std::span<const std::byte>& base_out,
-                  std::span<const std::byte>& cell_out) -> bool {
-  if (blob.empty() || blob[0] != kDbBlobMagic) {
-    base_out = blob;
-    cell_out = {};
-    return true;
-  }
-  if (blob.size() < 2 + 4) return false;
-  // Reject unknown versions so a future layout bump cannot be misread as v1.
-  if (blob[1] != kDbBlobVersion) return false;
-  auto read_u32 = [&](std::size_t off) -> uint32_t {
-    return static_cast<uint32_t>(blob[off]) | (static_cast<uint32_t>(blob[off + 1]) << 8) |
-           (static_cast<uint32_t>(blob[off + 2]) << 16) |
-           (static_cast<uint32_t>(blob[off + 3]) << 24);
-  };
-  std::size_t off = 2;
-  const uint32_t kBaseLen = read_u32(off);
-  off += 4;
-  if (off + kBaseLen + 4 > blob.size()) return false;
-  base_out = blob.subspan(off, kBaseLen);
-  off += kBaseLen;
-  const uint32_t kCellLen = read_u32(off);
-  off += 4;
-  if (off + kCellLen > blob.size()) return false;
-  cell_out = blob.subspan(off, kCellLen);
-  return true;
-}
 
 // Deterministic peer fallback when no manager is connected: sort peers
 // by address and pick (space_id - 1) modulo peer count.
@@ -410,9 +361,6 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
 
 void BaseApp::Fini() {
   rpc_registry_.Shutdown();
-  entity_mgr_.ForEach([this](const BaseEntity& ent) {
-    if (ent.Dbid() != kInvalidDBID) ReleaseCheckout(ent.Dbid(), ent.TypeId(), ent.CheckoutOwner());
-  });
   entity_mgr_.FlushDestroyed();
   SweepMovementAckRelayState();
   EntityApp::Fini();
@@ -456,6 +404,7 @@ void BaseApp::RegisterWatchers() {
   auto& wr = GetWatcherRegistry();
   wr.Add<std::size_t>("baseapp/pending_checkin_count",
                       std::function<std::size_t()>([this] { return pending_checkins_.size(); }));
+  wr.Add<std::size_t>("baseapp/rpc_reply_count", [this] { return rpc_registry_.ReplyCount(); });
   wr.Add<float>("baseapp/load",
                 std::function<float()>([this] { return load_tracker_.CurrentLoad(); }));
   wr.Add<std::size_t>("baseapp/entity_count",
@@ -788,11 +737,17 @@ void BaseApp::RegisterInternalHandlers() {
           write_it->second.outcome_unknown |= msg.error_kind == DatabaseErrorKind::kCommitUnknown;
           write_it->second.awaiting_ack = false;
           write_it->second.next_retry_at = Clock::now() + std::chrono::seconds(1);
+          if (write_it->second.outcome_unknown) {
+            CompletePersistenceWait(std::exchange(write_it->second.reply_request_id, 0),
+                                    kInvalidDBID, -8, "Persistence outcome is unknown");
+          }
           RetryDisconnectedDbappWriteRequests();
           return;
         }
         const PendingWriteToDb kPendingWrite = write_it->second;
         pending_write_to_db_.erase(write_it);
+        const bool saved = msg.success && msg.dbid != kInvalidDBID;
+        if (!saved) FinishShutdownSave(kPendingWrite.entity_id, false, msg.error);
 
         auto* ent = entity_mgr_.Find(kPendingWrite.entity_id);
         if (ent) {
@@ -803,11 +758,14 @@ void BaseApp::RegisterInternalHandlers() {
               ent->SetCheckoutOwner(msg.owner);
             }
           }
-          ent->OnWriteAck(msg.dbid, msg.success);
-          if (msg.success && kPendingWrite.logoff_after_write) {
+          ent->OnWriteAck(msg.dbid, saved);
+          if (saved && kPendingWrite.logoff_after_write) {
             StartDisconnectLogoff(ent->EntityId());
           }
         }
+        CompletePersistenceWait(
+            kPendingWrite.reply_request_id, msg.dbid, saved ? 0 : (msg.success ? -7 : -3),
+            msg.success && !saved ? "Invalid confirmed database ID" : msg.error);
       });
 
   (void)table.RegisterTypedHandler<dbappmgr::ShardTableResponse>(
@@ -945,6 +903,13 @@ void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntit
                     static_cast<int>(msg.status));
     return;
   }
+  if (!std::ranges::equal(pending.request.entity_def_digest,
+                          EntityDefRegistry::Instance().Digest())) {
+    ATLAS_LOG_ERROR("BaseApp: entity definitions changed during database load, entity={}",
+                    entity_id);
+    cancel_load();
+    return;
+  }
   auto* entity = entity_mgr_.Find(entity_id);
   if (!entity) {
     cancel_load();
@@ -956,12 +921,15 @@ void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntit
     cancel_load();
     return;
   }
-  std::span<const std::byte> base_span, cell_span;
-  if (!DecodeDbBlob(msg.blob, base_span, cell_span)) {
-    ATLAS_LOG_ERROR("BaseApp: corrupt database load, entity={} dbid={}", entity_id, msg.dbid);
+  auto decoded = DecodeDbBlob(msg.blob);
+  if (!decoded) {
+    ATLAS_LOG_ERROR("BaseApp: corrupt database load, entity={} dbid={}: {}", entity_id, msg.dbid,
+                    decoded.Error().Message());
     cancel_load();
     return;
   }
+  const auto base_span = decoded->base;
+  const auto cell_span = decoded->cell;
   entity->SetEntityData({base_span.begin(), base_span.end()});
   entity->SetCellBackupData({cell_span.begin(), cell_span.end()});
   if (!RestoreManagedEntity(entity_id, entity->TypeId(), msg.dbid, base_span)) {
@@ -1053,6 +1021,10 @@ void BaseApp::OnCreateBase(Channel& /*ch*/, const baseapp::CreateBase& msg) {
 }
 
 void BaseApp::OnCreateBaseFromDb(Channel& /*ch*/, const baseapp::CreateBaseFromDB& msg) {
+  if (IsShuttingDown()) {
+    ATLAS_LOG_WARNING("BaseApp: CreateBaseFromDB rejected while stopping");
+    return;
+  }
   auto* db_ch = ResolveDbAppChannel(msg.dbid);
   if (db_ch == nullptr) {
     ATLAS_LOG_ERROR("BaseApp: CreateBaseFromDB: no DBApp connection");
@@ -1074,6 +1046,7 @@ void BaseApp::OnCreateBaseFromDb(Channel& /*ch*/, const baseapp::CreateBaseFromD
 
   PendingDbCheckout pending;
   auto& req = pending.request;
+  std::ranges::copy(EntityDefRegistry::Instance().Digest(), req.entity_def_digest.begin());
   if (auto generated = FillSecureRandom(req.operation_id); !generated) {
     entity_mgr_.Destroy(ent->EntityId());
     ATLAS_LOG_ERROR("BaseApp: cannot generate checkout operation ID");
@@ -1321,6 +1294,10 @@ void BaseApp::OnSpaceBspGeometry(const baseapp::SpaceBspGeometry& msg) {
 }
 
 void BaseApp::OnCellRpcForward(Channel& ch, const baseapp::CellRpcForward& msg) {
+  if (IsShuttingDown()) {
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Server is stopping");
+    return;
+  }
   if (entity_mgr_.Find(msg.entity_id) == nullptr) {
     entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Base entity unavailable");
     ATLAS_LOG_WARNING("BaseApp: CellRpcForward for unknown entity {} (rpc_id=0x{:08X})",
@@ -1605,33 +1582,59 @@ void BaseApp::EmitBaselineSnapshots() {
   (void)baseline_tick_counter_;
 }
 
-void BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len) {
+void BaseApp::CompletePersistenceWait(uint64_t request_id, DatabaseID dbid, int32_t error_code,
+                                      std::string_view error) {
+  if (request_id == 0) return;
+  BinaryWriter body;
+  if (error_code == 0)
+    body.Write(dbid);
+  else
+    body.WriteString(error);
+  BinaryWriter reply;
+  EntityRpcReply{request_id, error_code, body.Data()}.Serialize(reply);
+  (void)rpc_registry_.TryDispatch(msg_id::Id(msg_id::Common::kEntityRpcReply), reply.Data());
+}
+
+auto BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len,
+                          uint64_t reply_request_id) -> RpcSendResult {
+  if (reply_request_id != 0 &&
+      !rpc_registry_.BindChannel(msg_id::Id(msg_id::Common::kEntityRpcReply), reply_request_id,
+                                 nullptr))
+    return RpcSendResult::kInvalidTarget;
+  auto reject = [this, entity_id, reply_request_id](RpcSendResult result, int32_t error_code,
+                                                    std::string_view error) {
+    ATLAS_LOG_WARNING("BaseApp: persistence rejected for entity={}: {}", entity_id, error);
+    CompletePersistenceWait(reply_request_id, kInvalidDBID, error_code, error);
+    return reply_request_id == 0 ? result : RpcSendResult::kQueued;
+  };
   auto* ent = entity_mgr_.Find(entity_id);
-  if (!ent) return;
+  if (!ent) return reject(RpcSendResult::kInvalidTarget, -4, "Entity does not exist");
+  if (IsShuttingDown()) {
+    return reject(RpcSendResult::kStopping, -4, "Server is stopping");
+  }
+  if (len < 0 || (len > 0 && data == nullptr)) {
+    return reject(RpcSendResult::kSendFailed, -7, "Invalid persistence payload");
+  }
   if (std::any_of(
           pending_entity_checkouts_.begin(), pending_entity_checkouts_.end(),
           [entity_id](const auto& entry) { return entry.second.request.entity_id == entity_id; })) {
-    ent->OnWriteAck(ent->Dbid(), false);
-    return;
+    return reject(RpcSendResult::kInvalidTarget, -4, "Entity checkout is pending");
   }
   if (logoff_entities_in_flight_.contains(entity_id) ||
       std::any_of(pending_write_to_db_.begin(), pending_write_to_db_.end(),
                   [entity_id](const auto& entry) { return entry.second.entity_id == entity_id; })) {
-    ATLAS_LOG_WARNING("BaseApp: persistence is already pending for entity={}", entity_id);
-    return;
+    return reject(RpcSendResult::kOverloaded, -5, "Persistence is already pending");
   }
 
   auto* db_ch = ResolveDbAppChannel(ent->Dbid());
   if (db_ch == nullptr) {
-    ATLAS_LOG_ERROR("BaseApp: write_to_db: no DBApp connection (entity={})", entity_id);
-    return;
+    return reject(RpcSendResult::kSendFailed, -5, "No DBApp connection");
   }
 
   dbapp::WriteEntity msg;
+  std::ranges::copy(EntityDefRegistry::Instance().Digest(), msg.entity_def_digest.begin());
   if (auto generated = FillSecureRandom(msg.operation_id); !generated) {
-    ATLAS_LOG_ERROR("BaseApp: cannot generate persistence operation ID");
-    ent->OnWriteAck(ent->Dbid(), false);
-    return;
+    return reject(RpcSendResult::kSendFailed, -5, "Cannot generate persistence operation ID");
   }
   msg.flags = (ent->Dbid() == kInvalidDBID) ? WriteFlags::kCreateNew : WriteFlags::kExplicitDbid;
   msg.type_id = ent->TypeId();
@@ -1644,12 +1647,20 @@ void BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len
   }
   msg.request_id = AllocatePrepareRequestId();
   msg.shard_table_version = dbapp_shard_table_version_;
-  msg.blob.assign(data, data + len);
+  if (msg.request_id == 0)
+    return reject(RpcSendResult::kOverloaded, -5, "Persistence request IDs exhausted");
+  auto encoded =
+      EncodeDbBlob(std::span(data, static_cast<std::size_t>(len)), ent->CellBackupData());
+  if (!encoded) {
+    return reject(RpcSendResult::kSendFailed, -7, encoded.Error().Message());
+  }
+  msg.blob = std::move(*encoded);
   const uint32_t kRequestId = msg.request_id;
 
   PendingWriteToDb pending;
   pending.entity_id = entity_id;
   pending.dbid = ent->Dbid();
+  pending.reply_request_id = reply_request_id;
   pending.message = std::move(msg);
   pending.target_addr = db_ch->RemoteAddress();
   pending.created_at = Clock::now();
@@ -1657,10 +1668,10 @@ void BaseApp::DoWriteToDb(EntityID entity_id, const std::byte* data, int32_t len
   auto [it, inserted] = pending_write_to_db_.emplace(kRequestId, std::move(pending));
   if (!inserted || !SendPendingWriteToDb(kRequestId, it->second)) {
     pending_write_to_db_.erase(kRequestId);
-    ATLAS_LOG_ERROR("BaseApp: write_to_db request_id={} entity_id={} dropped", kRequestId,
-                    entity_id);
     ent->OnWriteAck(ent->Dbid(), false);
+    return reject(RpcSendResult::kSendFailed, -5, "Persistence send failed");
   }
+  return RpcSendResult::kQueued;
 }
 
 auto BaseApp::CaptureEntitySnapshot(EntityID entity_id, std::vector<std::byte>& out) -> bool {
@@ -1710,8 +1721,13 @@ auto BaseApp::CaptureEntitySnapshot(EntityID entity_id, std::vector<std::byte>& 
 
   // Stitch in last cell backup (empty span when no cell side).
   const auto& cell_bytes = ent->CellBackupData();
-  out = EncodeDbBlob(std::span<const std::byte>(base_bytes.data(), base_bytes.size()),
-                     std::span<const std::byte>(cell_bytes.data(), cell_bytes.size()));
+  auto encoded = EncodeDbBlob(base_bytes, cell_bytes);
+  if (!encoded) {
+    ATLAS_LOG_ERROR("BaseApp: cannot encode database snapshot for entity={}: {}", entity_id,
+                    encoded.Error().Message());
+    return false;
+  }
+  out = std::move(*encoded);
   return true;
 }
 
@@ -1841,6 +1857,13 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
   login::PrepareLoginResult reply;
   reply.request_id = pending.login_request_id;
 
+  if (!std::ranges::equal(pending.entity_def_digest, EntityDefRegistry::Instance().Digest())) {
+    ReleaseLoginCheckout(dbid, type_id, pending);
+    FailPendingPrepareLogin(pending, "entity_def_changed_during_checkout");
+    FinishLoginFlow(pending.dbid);
+    return;
+  }
+
   if (pending.reply_sent) {
     ReleaseLoginCheckout(dbid, type_id, pending);
     FinishLoginFlow(pending.dbid);
@@ -1877,9 +1900,10 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
 
   // Same split as CreateBaseFromDB: base -> Base.Deserialize, cell parked
   // for the next CreateCellEntity's script_init_data.
-  std::span<const std::byte> base_span, cell_span;
-  if (!DecodeDbBlob(blob, base_span, cell_span)) {
-    ATLAS_LOG_ERROR("BaseApp: login checkout blob corrupt (dbid={} type={})", dbid, type_id);
+  auto decoded = DecodeDbBlob(blob);
+  if (!decoded) {
+    ATLAS_LOG_ERROR("BaseApp: login checkout blob corrupt (dbid={} type={}): {}", dbid, type_id,
+                    decoded.Error().Message());
     entity_mgr_.Destroy(ent->EntityId());
     ReleaseLoginCheckout(dbid, type_id, pending);
     reply.success = false;
@@ -1888,6 +1912,8 @@ void BaseApp::CompletePrepareLoginFromCheckout(PendingLogin pending, DatabaseID 
     FinishLoginFlow(pending.dbid);
     return;
   }
+  const auto base_span = decoded->base;
+  const auto cell_span = decoded->cell;
   ent->SetEntityData(std::vector<std::byte>(base_span.begin(), base_span.end()));
   ent->SetCellBackupData(std::vector<std::byte>(cell_span.begin(), cell_span.end()));
   if (!entity_mgr_.AssignDbid(ent->EntityId(), dbid)) {
@@ -2509,6 +2535,7 @@ auto BaseApp::NotifyClientCellReady(EntityID entity_id) -> Result<void> {
 
 auto BaseApp::RequestSpawnCellOnly(uint16_t type_id, SpaceID space_id, math::Vector3 position,
                                    math::Vector3 direction, bool on_ground) -> bool {
+  if (IsShuttingDown()) return false;
   if (cellapp_peers_.Size() == 0) {
     ATLAS_LOG_WARNING(
         "BaseApp: RequestSpawnCellOnly: type {} requested but no CellApp peer available", type_id);
@@ -2527,6 +2554,7 @@ auto BaseApp::RequestSpawnCellOnly(uint16_t type_id, SpaceID space_id, math::Vec
 
 auto BaseApp::CreateBaseEntityFromScript(uint16_t type_id, SpaceID space_id, math::Vector3 position,
                                          math::Vector3 direction, bool on_ground) -> EntityID {
+  if (IsShuttingDown()) return kInvalidEntityID;
   const auto& defs = EntityDefs();
   auto* type = defs.FindById(type_id);
   if (!type) {
@@ -2891,6 +2919,8 @@ void BaseApp::MarkDbappWriteRequestsDisconnected(const Address& dbapp_addr) {
       pending.awaiting_ack = false;
       pending.outcome_unknown = true;
       pending.target_addr = Address{};
+      CompletePersistenceWait(std::exchange(pending.reply_request_id, 0), kInvalidDBID, -8,
+                              "DBApp disconnected before persistence confirmation");
     }
   }
 }
@@ -2971,7 +3001,10 @@ void BaseApp::RetryDisconnectedDbappWriteRequests() {
       if (auto* ent = entity_mgr_.Find(pending.entity_id)) {
         ent->OnWriteAck(pending.dbid, false);
       }
+      const auto reply_request_id = pending.reply_request_id;
       it = pending_write_to_db_.erase(it);
+      CompletePersistenceWait(reply_request_id, kInvalidDBID, -5,
+                              "Persistence retry limit exceeded");
       continue;
     }
     if (SendPendingWriteToDb(it->first, pending)) {
@@ -3002,6 +3035,7 @@ auto BaseApp::SendPendingLoginCheckout(uint32_t request_id, PendingLogin& pendin
   }
 
   dbapp::CheckoutEntity co;
+  co.entity_def_digest = pending.entity_def_digest;
   pending.checkout_request_id = request_id;
   co.operation_id = pending.checkout_operation_id;
   co.request_id = request_id;
@@ -3469,6 +3503,8 @@ void BaseApp::CleanupExpiredPendingRequests() {
       if (it->second.awaiting_ack || it->second.outcome_unknown) {
         it->second.outcome_unknown = true;
         it->second.awaiting_ack = false;
+        CompletePersistenceWait(std::exchange(it->second.reply_request_id, 0), kInvalidDBID, -8,
+                                "Persistence outcome is unknown");
         ++it;
         continue;
       }
@@ -3477,7 +3513,9 @@ void BaseApp::CleanupExpiredPendingRequests() {
       if (auto* ent = entity_mgr_.Find(it->second.entity_id)) {
         ent->OnWriteAck(it->second.dbid, false);
       }
+      const auto reply_request_id = it->second.reply_request_id;
       it = pending_write_to_db_.erase(it);
+      CompletePersistenceWait(reply_request_id, kInvalidDBID, -1, "Persistence timed out");
     } else {
       ++it;
     }
@@ -3556,6 +3594,7 @@ void BaseApp::CompletePendingLogoffWrite(uint32_t request_id, PendingLogoffWrite
   logoff_entities_in_flight_.erase(pending.entity_id);
 
   if (!success) {
+    FinishShutdownSave(pending.entity_id, false, error);
     ATLAS_LOG_ERROR(
         "BaseApp: logoff persist failed request_id={} entity_id={} "
         "dbid={} error={}",
@@ -3578,6 +3617,7 @@ void BaseApp::CompletePendingLogoffWrite(uint32_t request_id, PendingLogoffWrite
   }
 
   if (!FinalizeForceLogoff(pending.entity_id)) {
+    FinishShutdownSave(pending.entity_id, false, "entity teardown failed");
     if (pending.continuation_request_id != 0) {
       FailPendingForceLogoff(pending.continuation_request_id, "force_logoff_destroy_failed");
     }
@@ -3595,6 +3635,7 @@ void BaseApp::CompletePendingLogoffWrite(uint32_t request_id, PendingLogoffWrite
   }
 
   const bool kResumedDeferred = ResumeDeferredPrepareLogins(pending.entity_id);
+  FinishShutdownSave(pending.entity_id, true, {});
 
   if (auto waiter_it = pending_local_force_logoff_waiters_.find(pending.entity_id);
       waiter_it != pending_local_force_logoff_waiters_.end()) {
@@ -3689,13 +3730,16 @@ void BaseApp::FailAllDbappPendingRequests(std::string_view reason, bool fail_wri
     it = pending_force_logoffs_.erase(it);
   }
   if (fail_write_to_db) {
-    for (auto& [request_id, pending] : pending_write_to_db_) {
+    auto writes = std::move(pending_write_to_db_);
+    pending_write_to_db_.clear();
+    for (auto& [request_id, pending] : writes) {
       (void)request_id;
       if (auto* ent = entity_mgr_.Find(pending.entity_id)) {
         ent->OnWriteAck(pending.dbid, false);
       }
+      CompletePersistenceWait(pending.reply_request_id, kInvalidDBID,
+                              pending.awaiting_ack || pending.outcome_unknown ? -8 : -4, reason);
     }
-    pending_write_to_db_.clear();
   }
   if (fail_write_to_db) {
     canceled_checkouts_.clear();
@@ -4276,6 +4320,10 @@ void BaseApp::FinishClientAuthenticate(Channel& ch, const baseapp::Authenticate&
 }
 
 void BaseApp::OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg) {
+  if (IsShuttingDown()) {
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Server is stopping");
+    return;
+  }
   if (msg.payload.size() > kMaxRpcPayloadBytes) {
     ++client_rpc_dropped_oversize_total_;
     const auto& addr = ch.RemoteAddress();
@@ -4341,6 +4389,10 @@ void BaseApp::OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg) {
 
 // Validate then forward; CellApp re-checks (defence in depth).
 void BaseApp::OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg) {
+  if (IsShuttingDown()) {
+    entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Server is stopping");
+    return;
+  }
   if (msg.payload.size() > kMaxRpcPayloadBytes) {
     ++client_rpc_dropped_oversize_total_;
     const auto& addr = ch.RemoteAddress();
@@ -4675,7 +4727,7 @@ auto BaseApp::ResolveCellChannelForEntity(EntityID target_entity_id) const -> Ch
 
 auto BaseApp::RequestCreateSpace(SpaceID space_id, SpaceCreatedCallback callback,
                                  uint16_t initial_cell_count, bool reuse_existing) -> uint32_t {
-  if (cellappmgr_channel_ == nullptr || cellappmgr_channel_->IsCondemned() ||
+  if (IsShuttingDown() || cellappmgr_channel_ == nullptr || cellappmgr_channel_->IsCondemned() ||
       rpc_registry_.IsStopping() || pending_space_creates_.size() >= 1024 ||
       next_space_request_id_ == 0) {
     ATLAS_LOG_WARNING("BaseApp: RequestCreateSpace({}) unavailable", space_id);

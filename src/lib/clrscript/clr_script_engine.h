@@ -35,6 +35,7 @@ class ClrScriptEngine final : public ScriptEngine {
   void Finalize() override;
   [[nodiscard]] auto LoadModule(const std::filesystem::path& path) -> Result<void> override;
   void OnTick(float dt) override;
+  [[nodiscard]] auto Drain() -> Result<void> override;
   void OnInit(bool is_reload) override;
   void OnShutdown() override;
   [[nodiscard]] auto CallFunction(std::string_view module_name, std::string_view function_name,
@@ -62,6 +63,7 @@ class ClrScriptEngine final : public ScriptEngine {
   ClrFallibleMethod<uint8_t> on_init_;   // Lifecycle.OnInit(byte isReload)
   ClrFallibleMethod<float> on_tick_;     // Lifecycle.OnTick(float dt)
   ClrFallibleMethod<> on_shutdown_;      // Lifecycle.OnShutdown()
+  ClrFallibleMethod<> on_drain_;
 
   ClrFallibleMethod<const uint8_t*, int32_t> load_scripts_;      // LoadScripts
   ClrFallibleMethod<> serialize_and_unload_;                     // SerializeAndUnload

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <vector>
 
+#include "foundation/error.h"
 #include "network/event_dispatcher.h"
 #include "network/frequent_task.h"
 
@@ -20,23 +21,28 @@ class BackgroundTask {
   virtual ~BackgroundTask() = default;
 
   // Must not access dispatcher-owned network objects.
-  virtual void DoBackgroundTask() = 0;
+  virtual auto DoBackgroundTask() -> Result<void> = 0;
 
-  virtual void DoMainThreadTask() = 0;
+  virtual void DoMainThreadTask(Result<void> result) = 0;
 };
 
 // AddTask is thread-safe; main callbacks run on the dispatcher thread.
 class BgTaskManager : public FrequentTask {
  public:
+  static constexpr uint32_t kMaxInFlightTasks = 4096;
+
   explicit BgTaskManager(EventDispatcher& dispatcher, uint32_t num_threads = 4);
   ~BgTaskManager() override;
 
   BgTaskManager(const BgTaskManager&) = delete;
   BgTaskManager& operator=(const BgTaskManager&) = delete;
 
-  void AddTask(std::unique_ptr<BackgroundTask> task);
+  [[nodiscard]] auto AddTask(std::unique_ptr<BackgroundTask> task) -> Result<void>;
 
-  void AddTask(std::function<void()> bg_work, std::function<void()> main_callback);
+  [[nodiscard]] auto AddTask(std::function<Result<void>()> bg_work,
+                             std::function<void(Result<void>)> main_callback) -> Result<void>;
+  void StopAccepting();
+  void CancelPending();
 
   [[nodiscard]] auto PendingCount() const -> uint32_t;
   [[nodiscard]] auto InFlightCount() const -> uint32_t;

@@ -8,6 +8,14 @@ namespace Atlas.RpcFixture.Base;
 [Entity("Account")]
 public partial class Account : BaseServerEntity
 {
+    public partial AtlasTask<RpcReply<long>> Save(bool cancelled)
+    {
+        if (!cancelled) return PersistToDbAsync();
+        using var cancellation = new AtlasCancellationSource();
+        cancellation.Cancel();
+        return PersistToDbAsync(cancellation.Token);
+    }
+
     public partial AtlasTask<RpcReply<int>> Throw() =>
         throw new System.InvalidOperationException("fixture exception");
 
@@ -16,8 +24,6 @@ public partial class Account : BaseServerEntity
         await AtlasTask.Delay(1, LifecycleCancellation);
         return RpcReply<System.Collections.Generic.List<int>>.Ok(null!);
     }
-
-    private int _notification;
 
     private static AtlasTask<RpcReply<List<ulong>>> Describe(BaseServerEntity? entity)
     {
@@ -36,7 +42,9 @@ public partial class Account : BaseServerEntity
         return result.IsOk ? RpcReply<int>.Ok(1) : RpcReply<int>.Fail(result.Error, result.ErrorMessage);
     }
 
-    public partial AtlasTask<RpcReply<int>> Echo(int value) => RpcReply<int>.Ok(value);
+    public partial AtlasTask<RpcReply<int>> Echo(int value) => Atlas.Time.DeltaTime > 0
+        ? RpcReply<int>.Ok(value)
+        : RpcReply<int>.Fail(76, "native BaseApp frame delta unavailable");
 
     public async partial AtlasTask<RpcReply<int>> DelayedEcho(int value, int delayMs)
     {
@@ -46,9 +54,9 @@ public partial class Account : BaseServerEntity
 
     public partial AtlasTask<RpcReply<int>> Reject() => RpcReply<int>.Fail(71, "fixture rejected");
 
-    public partial void Notify(int value) => _notification = value;
+    public partial void Notify(int value) => Notification = value;
 
-    public partial AtlasTask<RpcReply<int>> ReadNotification() => RpcReply<int>.Ok(_notification);
+    public partial AtlasTask<RpcReply<int>> ReadNotification() => RpcReply<int>.Ok(Notification);
 
     public async partial AtlasTask<RpcReply<uint>> AttachProbe()
     {

@@ -29,6 +29,11 @@ public static unsafe class DesktopBootstrap
     {
         try
         {
+            var nativeAbi = ClientNativeApi.GetAbiVersion();
+            if (nativeAbi != Bootstrap.NativeAbiVersion)
+                throw new InvalidOperationException(
+                    $"Native ABI mismatch: expected {Bootstrap.NativeAbiVersion}, received {nativeAbi}");
+
             // Redirected stdout otherwise keeps a small managed buffer that
             // hides early harness output when child clients exit abruptly.
             Console.SetOut(new System.IO.StreamWriter(Console.OpenStandardOutput())

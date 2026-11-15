@@ -38,6 +38,7 @@ enum class ChannelState : uint8_t {
 // so entity holders survive NI's dead-link condemnation.
 class Channel : public RefCounted {
  public:
+  static constexpr std::size_t kMaxDeferredBytes = 256 * 1024;
   Channel(EventDispatcher& dispatcher, InterfaceTable& table, const Address& remote);
   ~Channel() override;
 
@@ -56,7 +57,8 @@ class Channel : public RefCounted {
     const auto& desc = Msg::Descriptor();
     if (desc.IsBatched()) {
       if (auto* deferred = DeferredBundleFor(desc)) {
-        deferred->AddMessage(msg);
+        if (auto admitted = deferred->TryAddMessage(msg, kMaxDeferredBytes); !admitted)
+          return admitted.Error();
         return OnDeferredAppend(desc, deferred->TotalSize());
       }
     }

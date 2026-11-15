@@ -98,6 +98,8 @@ class NetworkInterface : public FrequentTask {
   void MarkChannelDirty(Channel& channel) { dirty_channels_.insert(&channel); }
   void FlushDirtySendChannels();
 
+  void StopAccepting() { accepting_connections_ = false; }
+  [[nodiscard]] auto PendingSendCount() const -> std::size_t;
   void PrepareForShutdown();
 
   // Channel::Condemn() alone leaves the channels_ map intact, so the next
@@ -189,6 +191,7 @@ class NetworkInterface : public FrequentTask {
   StreamBuffer datagram_recv_scratch_;
 
   bool shutting_down_{false};
+  bool accepting_connections_{true};
   AcceptCallback accept_callback_;
   DisconnectCallback disconnect_callback_;
 };

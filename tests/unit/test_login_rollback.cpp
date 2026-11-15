@@ -1,5 +1,6 @@
 #include <array>
 #include <format>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <span>
@@ -14,6 +15,7 @@
 #include "coro/cancellation.h"
 #include "coro/fire_and_forget.h"
 #include "coro/rpc_call.h"
+#include "db/entity_blob.h"
 #include "db/idatabase.h"
 #include "dbapp/dbapp.h"
 #include "dbappmgr/dbappmgr_messages.h"
@@ -23,10 +25,19 @@
 #include "serialization/binary_stream.h"
 #include "server/db_shard_routing.h"
 #include "test_null_channel.h"
+#include "test_shutdown_access.h"
 
 namespace atlas {
 
 namespace {
+
+auto DatabaseBlob(std::initializer_list<std::byte> base = {},
+                  std::initializer_list<std::byte> cell = {}) -> std::vector<std::byte> {
+  auto encoded =
+      EncodeDbBlob(std::span(base.begin(), base.size()), std::span(cell.begin(), cell.size()));
+  EXPECT_TRUE(encoded.HasValue());
+  return encoded ? std::move(*encoded) : std::vector<std::byte>{};
+}
 
 class CapturingChannel final : public Channel {
  public:
@@ -142,6 +153,24 @@ class LoginRollbackTest : public ::testing::Test {
     app_.HandleLoginCoro(client_channel_id, Address(0x7F000001u, 26001), std::move(request));
     return request_id;
   }
+  auto connect_login_client(const Address& address) -> Result<ReliableUdpChannel*> {
+    external_network_.SetDisconnectCallback(
+        [this](Channel& channel) { app_.OnClientDisconnect(channel); });
+    auto result = external_network_.ConnectRudp(address);
+    if (result) (*result)->SetInactivityTimeout(login_idle_timeout());
+    return result;
+  }
+  static auto login_idle_timeout() -> Duration {
+    return std::chrono::seconds(LoginApp::kClientChannelInactivitySec);
+  }
+  void disconnect_login_client(Channel& channel) {
+    external_network_.DisconnectChannel(channel.RemoteAddress());
+    app_.OnClientDisconnect(channel);
+  }
+  auto login_channel_exists(uint64_t id) -> bool {
+    return external_network_.FindChannel(id) != nullptr;
+  }
+  auto pending_rpc_count() const -> std::size_t { return app_.rpc_registry_.PendingCount(); }
   auto handle_auth_result(Channel* channel, const login::AuthLoginResult& result) -> bool {
     BinaryWriter writer;
     result.Serialize(writer);
@@ -177,6 +206,73 @@ TEST_F(LoginRollbackTest, ClientDisconnectCancelsActiveLogin) {
   cancel_for_channel(100);
 
   EXPECT_TRUE(token.IsCancelled());
+}
+
+TEST_F(LoginRollbackTest, PendingLoginSurvivesIdleGraceWhileBackendReplyIsPending) {
+  NetworkInterface client(dispatcher_);
+  ASSERT_TRUE(client.StartRudpServer(Address("127.0.0.1", 0)));
+  bool received = false;
+  login::LoginStatus status = login::LoginStatus::kSuccess;
+  ASSERT_TRUE(client.InterfaceTable().RegisterTypedHandler<login::LoginResult>(
+      [&](const Address&, Channel*, const login::LoginResult& reply) {
+        status = reply.status;
+        received = true;
+      }));
+  auto connected = connect_login_client(Address("127.0.0.1", client.RudpAddress().Port()));
+  ASSERT_TRUE(connected);
+  IntrusivePtr<Channel> channel{*connected};
+  InterfaceTable table;
+  CapturingChannel database(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&database);
+  const auto request = start_login(channel->ChannelId(), "slow-auth");
+  const auto after_idle = Clock::now() + login_idle_timeout() + Milliseconds(100);
+  ASSERT_TRUE(drive_until([&] { return Clock::now() >= after_idle; },
+                          login_idle_timeout() + Milliseconds(500)));
+  ASSERT_EQ(active_login_count(), 1u);
+  ASSERT_TRUE(channel->IsConnected());
+  login::AuthLoginResult reply;
+  reply.request_id = request;
+  reply.status = login::LoginStatus::kInvalidCredentials;
+  EXPECT_TRUE(handle_auth_result(&database, reply));
+  EXPECT_TRUE(drive_until([&] { return received; }, Milliseconds(500)));
+  EXPECT_EQ(status, login::LoginStatus::kInvalidCredentials);
+  EXPECT_EQ(active_login_count(), 0u);
+  EXPECT_TRUE(pending_by_username_empty());
+  EXPECT_TRUE(drive_until([&] { return !channel->IsConnected(); },
+                          login_idle_timeout() * 2 + Milliseconds(500)));
+}
+
+TEST_F(LoginRollbackTest, IdleClientWithoutPendingLoginStillExpires) {
+  NetworkInterface client(dispatcher_);
+  ASSERT_TRUE(client.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = connect_login_client(Address("127.0.0.1", client.RudpAddress().Port()));
+  ASSERT_TRUE(connected);
+  IntrusivePtr<Channel> channel{*connected};
+  EXPECT_TRUE(drive_until([&] { return !channel->IsConnected(); },
+                          login_idle_timeout() + Milliseconds(500)));
+}
+
+TEST_F(LoginRollbackTest, DisconnectDuringPendingLoginCancelsWithoutRestoringDeadChannel) {
+  NetworkInterface client(dispatcher_);
+  ASSERT_TRUE(client.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = connect_login_client(Address("127.0.0.1", client.RudpAddress().Port()));
+  ASSERT_TRUE(connected);
+  IntrusivePtr<Channel> channel{*connected};
+  InterfaceTable table;
+  CapturingChannel database(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&database);
+  const auto request = start_login(channel->ChannelId(), "disconnect-pending");
+  ASSERT_EQ(active_login_count(), 1u);
+  ASSERT_EQ(pending_rpc_count(), 1u);
+  disconnect_login_client(*channel);
+  EXPECT_EQ(active_login_count(), 0u);
+  EXPECT_EQ(pending_rpc_count(), 0u);
+  EXPECT_TRUE(pending_by_username_empty());
+  EXPECT_FALSE(login_channel_exists(channel->ChannelId()));
+  EXPECT_TRUE(channel->IsCondemned());
+  login::AuthLoginResult late;
+  late.request_id = request;
+  EXPECT_FALSE(handle_auth_result(&database, late));
 }
 
 TEST_F(LoginRollbackTest, DedupTrackingAndMetrics) {
@@ -993,6 +1089,18 @@ class BaseAppRollbackTest : public ::testing::Test {
   void write_to_db(EntityID entity_id, std::span<const std::byte> data) {
     app_.DoWriteToDb(entity_id, data.data(), static_cast<int32_t>(data.size()));
   }
+  auto write_to_db_async(EntityID entity_id, uint64_t request_id) -> RpcSendResult {
+    return app_.DoWriteToDb(entity_id, nullptr, 0, request_id);
+  }
+  auto persistence_wait(uint64_t request_id, PendingRpcRegistry::ReplyCallback callback)
+      -> PendingRpcRegistry::PendingHandle {
+    return app_.rpc_registry_.RegisterPending(
+        msg_id::Id(msg_id::Common::kEntityRpcReply), request_id, std::move(callback), [](Error) {},
+        std::chrono::seconds(10));
+  }
+  void cancel_persistence_wait(PendingRpcRegistry::PendingHandle handle) {
+    app_.rpc_registry_.Cancel(handle);
+  }
   void expire_write(uint32_t request_id) {
     app_.pending_write_to_db_.at(request_id).created_at =
         Clock::now() - BaseApp::kPendingTimeout - std::chrono::seconds(1);
@@ -1004,6 +1112,10 @@ class BaseAppRollbackTest : public ::testing::Test {
     app_.RetryDisconnectedDbappLogoffWrites();
   }
   void start_disconnect_logoff(EntityID entity_id) { app_.StartDisconnectLogoff(entity_id); }
+  void begin_shutdown() { app_.Shutdown(); }
+  void shutdown_tick() { app_.OnShutdownTick(); }
+  auto shutdown_saves() const -> std::size_t { return app_.shutdown_saves_.size(); }
+  auto shutdown_failed() const -> bool { return ServerAppShutdownTestAccess::Failed(app_); }
   void fail_deferred_login(EntityID entity_id, DatabaseID dbid, const CheckoutInfo& owner) {
     BaseApp::DeferredLoginCheckout entry;
     entry.dbid = dbid;
@@ -1073,6 +1185,22 @@ class BaseAppRollbackTest : public ::testing::Test {
   bool checkout_type_registered_{false};
 };
 
+TEST_F(BaseAppRollbackTest, NativeDeltaTimeUsesTheAppGameClock) {
+  BaseAppNativeProvider provider(app_);
+  auto& clock = app_.GetGameClock();
+  EXPECT_FLOAT_EQ(provider.DeltaTime(), 0.f);
+  clock.Tick(std::chrono::milliseconds(25));
+  EXPECT_FLOAT_EQ(provider.DeltaTime(), 0.025f);
+  clock.SetTimeScale(0.5);
+  clock.Tick(std::chrono::milliseconds(40));
+  EXPECT_FLOAT_EQ(provider.DeltaTime(), 0.02f);
+  clock.SetTimeScale(0.0);
+  clock.Tick(std::chrono::milliseconds(40));
+  EXPECT_FLOAT_EQ(provider.DeltaTime(), 0.f);
+  clock.Reset();
+  EXPECT_FLOAT_EQ(provider.DeltaTime(), 0.f);
+}
+
 TEST_F(BaseAppRollbackTest, SpaceReplyMustMatchManagerChannelAndSpaceAndCompletesOnce) {
   InterfaceTable table;
   auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 26001));
@@ -1097,6 +1225,23 @@ TEST_F(BaseAppRollbackTest, SpaceReplyMustMatchManagerChannelAndSpaceAndComplete
   answer_space(*manager, reply);
   EXPECT_EQ(completed, 1);
   EXPECT_EQ(pending_spaces(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, ShutdownRejectsNewSpaceRequestsBeforeSending) {
+  InterfaceTable table;
+  auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 26001));
+  set_space_manager(manager.get());
+  begin_shutdown();
+  int completed = 0;
+  EXPECT_EQ(request_space(99,
+                          [&](bool success, SpaceID, const Address&) {
+                            EXPECT_FALSE(success);
+                            ++completed;
+                          }),
+            0u);
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(pending_spaces(), 0u);
+  EXPECT_EQ(manager->send_count(), 0u);
 }
 
 TEST_F(BaseAppRollbackTest, SpaceTimeoutDisconnectSendFailureAndExhaustionReportOriginalSpace) {
@@ -2444,6 +2589,142 @@ TEST_F(BaseAppRollbackTest, DbAppShardTableRoutesDbidAndKeepsLegacyFallback) {
   EXPECT_EQ(watcher("baseapp/dbapp_shard_count").value_or(""), "1");
 }
 
+TEST_F(BaseAppRollbackTest, AsyncPersistenceCompletesOnlyOnAMatchingConfirmedAck) {
+  InterfaceTable table;
+  CapturingChannel db(dispatcher_, table, Address(0x7F000001, 24002));
+  set_legacy_dbapp_channel(&db);
+  auto* entity = create_db_entity(kInvalidDBID);
+  ASSERT_NE(entity, nullptr);
+  int completed = 0;
+  auto wait = persistence_wait(123, [&](std::span<const std::byte> payload) {
+    ++completed;
+    BinaryReader reader(payload);
+    EXPECT_EQ(reader.Read<uint64_t>().Value(), 123u);
+    EXPECT_EQ(reader.Read<int32_t>().Value(), 0);
+    EXPECT_EQ(reader.Read<DatabaseID>().Value(), 42);
+    EXPECT_EQ(entity->Dbid(), 42);
+  });
+  ASSERT_TRUE(wait.IsValid());
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 123), RpcSendResult::kQueued);
+  EXPECT_EQ(completed, 0);
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(db);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.request_id = writes[0].request_id;
+  ack.success = true;
+  ack.dbid = 42;
+  handle_write_ack(ack);
+  EXPECT_EQ(completed, 0);
+  ack.operation_id = writes[0].operation_id;
+  handle_write_ack(ack);
+  handle_write_ack(ack);
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, AsyncPersistenceReportsMissingRouteAndTargetImmediately) {
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  std::vector<int32_t> errors;
+  auto callback = [&](std::span<const std::byte> payload) {
+    BinaryReader reader(payload);
+    EXPECT_TRUE(reader.Read<uint64_t>().HasValue());
+    errors.push_back(reader.Read<int32_t>().Value());
+  };
+  ASSERT_TRUE(persistence_wait(123, callback).IsValid());
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 123), RpcSendResult::kQueued);
+  ASSERT_TRUE(persistence_wait(124, callback).IsValid());
+  EXPECT_EQ(write_to_db_async(kInvalidEntityID, 124), RpcSendResult::kQueued);
+  EXPECT_EQ(errors, (std::vector<int32_t>{-5, -4}));
+  EXPECT_EQ(session_pending_count(), 0u);
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 999), RpcSendResult::kInvalidTarget);
+}
+
+TEST_F(BaseAppRollbackTest, AsyncPersistenceUnknownOutcomeCompletesWaitButKeepsTheWriteFenced) {
+  InterfaceTable table;
+  CapturingChannel db(dispatcher_, table, Address(0x7F000001, 24002));
+  set_legacy_dbapp_channel(&db);
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  int completed = 0;
+  ASSERT_TRUE(persistence_wait(123, [&](std::span<const std::byte> payload) {
+                ++completed;
+                BinaryReader reader(payload);
+                EXPECT_TRUE(reader.Read<uint64_t>().HasValue());
+                EXPECT_EQ(reader.Read<int32_t>().Value(), -8);
+              }).IsValid());
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 123), RpcSendResult::kQueued);
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(db);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.request_id = writes[0].request_id;
+  ack.operation_id = writes[0].operation_id;
+  ack.error_kind = DatabaseErrorKind::kCommitUnknown;
+  handle_write_ack(ack);
+  EXPECT_EQ(completed, 1);
+  EXPECT_TRUE(pending_write_to_db_contains(ack.request_id));
+  EXPECT_EQ(session_pending_count(), 0u);
+  ack.success = true;
+  ack.error_kind = DatabaseErrorKind::kNone;
+  ack.dbid = 42;
+  handle_write_ack(ack);
+  EXPECT_EQ(completed, 1);
+  EXPECT_FALSE(pending_write_to_db_contains(ack.request_id));
+}
+
+TEST_F(BaseAppRollbackTest, AsyncPersistenceDatabaseFailureIsNotReportedAsSuccess) {
+  InterfaceTable table;
+  CapturingChannel db(dispatcher_, table, Address(0x7F000001, 24002));
+  set_legacy_dbapp_channel(&db);
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  int completed = 0;
+  ASSERT_TRUE(persistence_wait(123, [&](std::span<const std::byte> payload) {
+                ++completed;
+                BinaryReader reader(payload);
+                EXPECT_TRUE(reader.Read<uint64_t>().HasValue());
+                EXPECT_EQ(reader.Read<int32_t>().Value(), -3);
+                EXPECT_EQ(reader.ReadString().Value(), "injected database failure");
+              }).IsValid());
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 123), RpcSendResult::kQueued);
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(db);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.request_id = writes[0].request_id;
+  ack.operation_id = writes[0].operation_id;
+  ack.error_kind = DatabaseErrorKind::kOwnershipConflict;
+  ack.error = "injected database failure";
+  handle_write_ack(ack);
+  EXPECT_EQ(completed, 1);
+  EXPECT_FALSE(pending_write_to_db_contains(ack.request_id));
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, AsyncPersistenceCancellationDoesNotUndoAnIssuedWrite) {
+  InterfaceTable table;
+  CapturingChannel db(dispatcher_, table, Address(0x7F000001, 24002));
+  set_legacy_dbapp_channel(&db);
+  auto* entity = create_db_entity(kInvalidDBID);
+  ASSERT_NE(entity, nullptr);
+  int completed = 0;
+  auto wait = persistence_wait(123, [&](auto) { ++completed; });
+  ASSERT_TRUE(wait.IsValid());
+  EXPECT_EQ(write_to_db_async(entity->EntityId(), 123), RpcSendResult::kQueued);
+  cancel_persistence_wait(wait);
+  EXPECT_EQ(session_pending_count(), 0u);
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(db);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.request_id = writes[0].request_id;
+  ack.operation_id = writes[0].operation_id;
+  ack.success = true;
+  ack.dbid = 42;
+  handle_write_ack(ack);
+  EXPECT_EQ(entity->Dbid(), 42);
+  EXPECT_EQ(completed, 0);
+  EXPECT_FALSE(pending_write_to_db_contains(ack.request_id));
+}
+
 TEST_F(BaseAppRollbackTest, WriteToDbUsesShardChannelForKnownDbid) {
   InterfaceTable channel_table;
   CapturingChannel legacy(dispatcher_, channel_table, Address(0x7F000001u, 24001));
@@ -2467,6 +2748,9 @@ TEST_F(BaseAppRollbackTest, WriteToDbUsesShardChannelForKnownDbid) {
   EXPECT_EQ(writes[0].shard_table_version, 7u);
   EXPECT_EQ(writes[0].owner.ownership_version, 123u);
   EXPECT_EQ(writes[0].owner.entity_id, 9u);
+  auto snapshot = DecodeDbBlob(writes[0].blob);
+  ASSERT_TRUE(snapshot.HasValue());
+  EXPECT_TRUE(std::ranges::equal(snapshot->base, blob));
   EXPECT_NE(writes[0].request_id, ent->EntityId());
   EXPECT_EQ(pending_write_to_db_count(), 1u);
   EXPECT_TRUE(pending_write_to_db_contains(writes[0].request_id));
@@ -2512,6 +2796,83 @@ TEST_F(BaseAppRollbackTest, FirstSaveKeepsDatabaseOwnerForSubsequentWrite) {
   ASSERT_EQ(writes.size(), 2u);
   EXPECT_EQ(writes[1].dbid, 42);
   EXPECT_EQ(writes[1].owner.ownership_version, 123u);
+}
+
+TEST_F(BaseAppRollbackTest, ShutdownConfirmsPersistenceBeforeDestroyingAndReleasingOwner) {
+  InterfaceTable table;
+  CapturingChannel database(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&database);
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  const auto id = entity->EntityId();
+  const CheckoutInfo owner{Address("127.0.0.1", 25001), 7, id, 9, 111};
+  entity->SetCheckoutOwner(owner);
+  entity->SetEntityData(std::vector<std::byte>{std::byte{17}});
+  begin_shutdown();
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(database);
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_TRUE(HasFlag(writes[0].flags, WriteFlags::kLogOff));
+  EXPECT_EQ(writes[0].owner, owner);
+  EXPECT_EQ(shutdown_saves(), 1u);
+  EXPECT_FALSE(entity->IsPendingDestroy());
+  dbapp::WriteEntityAck ack;
+  ack.operation_id = writes[0].operation_id;
+  ack.request_id = writes[0].request_id;
+  ack.dbid = 42;
+  ack.success = true;
+  handle_write_ack(ack);
+  EXPECT_EQ(shutdown_saves(), 0u);
+  EXPECT_FALSE(shutdown_failed());
+  EXPECT_EQ(find_db_entity(42), nullptr);
+  EXPECT_TRUE(entity->IsPendingDestroy());
+}
+
+TEST_F(BaseAppRollbackTest, ShutdownRetainsUnconfirmedSaveAndOwnerAfterUnknownCommit) {
+  InterfaceTable table;
+  CapturingChannel database(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&database);
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  const CheckoutInfo owner{Address("127.0.0.1", 25001), 7, entity->EntityId(), 9, 111};
+  entity->SetCheckoutOwner(owner);
+  begin_shutdown();
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(database);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.operation_id = writes[0].operation_id;
+  ack.request_id = writes[0].request_id;
+  ack.error_kind = DatabaseErrorKind::kCommitUnknown;
+  ack.error = "test commit outcome unknown";
+  handle_write_ack(ack);
+  EXPECT_EQ(shutdown_saves(), 1u);
+  EXPECT_EQ(entity->CheckoutOwner(), owner);
+  EXPECT_FALSE(entity->IsPendingDestroy());
+}
+
+TEST_F(BaseAppRollbackTest, ShutdownReportsKnownSaveFailureWithoutRetryingOrReleasingOwner) {
+  InterfaceTable table;
+  CapturingChannel database(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&database);
+  auto* entity = create_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  const CheckoutInfo owner{Address("127.0.0.1", 25001), 7, entity->EntityId(), 9, 111};
+  entity->SetCheckoutOwner(owner);
+  begin_shutdown();
+  const auto writes = DecodeSentMessages<dbapp::WriteEntity>(database);
+  ASSERT_EQ(writes.size(), 1u);
+  dbapp::WriteEntityAck ack;
+  ack.operation_id = writes[0].operation_id;
+  ack.request_id = writes[0].request_id;
+  ack.error = "test write rejected";
+  handle_write_ack(ack);
+  EXPECT_TRUE(shutdown_failed());
+  EXPECT_EQ(shutdown_saves(), 0u);
+  EXPECT_EQ(entity->CheckoutOwner(), owner);
+  EXPECT_FALSE(entity->IsPendingDestroy());
+  shutdown_tick();
+  const std::array<std::byte, 1> blob{std::byte{1}};
+  write_to_db(entity->EntityId(), blob);
+  EXPECT_EQ(DecodeSentMessages<dbapp::WriteEntity>(database).size(), 1u);
 }
 
 TEST_F(BaseAppRollbackTest, TimedOutFirstSaveRetainsOperationAndAcceptsLateConfirmation) {
@@ -2689,7 +3050,10 @@ TEST_F(BaseAppRollbackTest, WriteToDbRetriesPendingWriteAfterDbAppDeathAndShardU
   EXPECT_EQ(retried_writes[0].operation_id, first_writes[0].operation_id);
   EXPECT_EQ(retried_writes[0].shard_table_version, 8u);
   EXPECT_EQ(retried_writes[0].dbid, 42);
-  EXPECT_EQ(retried_writes[0].blob, std::vector<std::byte>(blob.begin(), blob.end()));
+  EXPECT_EQ(retried_writes[0].blob, first_writes[0].blob);
+  auto decoded = DecodeDbBlob(retried_writes[0].blob);
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_TRUE(std::ranges::equal(decoded->base, blob));
 
   dbapp::WriteEntityAck ack;
   ack.operation_id = first_writes[0].operation_id;
@@ -2892,6 +3256,7 @@ TEST_F(BaseAppRollbackTest, NamedDatabaseLoadIndexesConfirmedIdentityAndIgnoresD
   ASSERT_EQ(requests.size(), 1u);
   const auto& checkout = requests[0];
   dbapp::CheckoutEntityAck reply;
+  reply.blob = DatabaseBlob();
   reply.request_id = checkout.request_id;
   reply.operation_id = checkout.operation_id;
   reply.dbid = 42;
@@ -2900,9 +3265,7 @@ TEST_F(BaseAppRollbackTest, NamedDatabaseLoadIndexesConfirmedIdentityAndIgnoresD
   reply.holder_process_instance = 111;
   reply.holder_entity_id = checkout.entity_id;
   reply.holder_process_instance = 111;
-  reply.blob = {std::byte{0xA7}, std::byte{1}, std::byte{1},    std::byte{0},
-                std::byte{0},    std::byte{0}, std::byte{0x11}, std::byte{1},
-                std::byte{0},    std::byte{0}, std::byte{0},    std::byte{0x22}};
+  reply.blob = DatabaseBlob({std::byte{0x11}}, {std::byte{0x22}});
   handle_checkout_ack(source, reply);
   ASSERT_FALSE(native_checkout_contains(checkout.request_id));
   auto* entity = find_db_entity(42);
@@ -2925,6 +3288,37 @@ TEST_F(BaseAppRollbackTest, NamedDatabaseLoadIndexesConfirmedIdentityAndIgnoresD
   EXPECT_EQ(writes[0].owner.ownership_version, 11u);
 }
 
+TEST_F(BaseAppRollbackTest, UnversionedDatabaseLoadIsRejectedAndCheckoutIsAborted) {
+  InterfaceTable table;
+  const Address source("127.0.0.1", 24001);
+  CapturingChannel channel(dispatcher_, table, source);
+  set_legacy_dbapp_channel(&channel);
+  set_app_id(7);
+  ASSERT_NE(create_db_entity(1), nullptr);
+  baseapp::CreateBaseFromDB request;
+  request.type_id = 7;
+  request.identifier = "named";
+  load_from_db(channel, request);
+  const auto requests = DecodeSentMessages<dbapp::CheckoutEntity>(channel);
+  ASSERT_EQ(requests.size(), 1u);
+  const auto& checkout = requests[0];
+  dbapp::CheckoutEntityAck reply;
+  reply.blob = DatabaseBlob();
+  reply.request_id = checkout.request_id;
+  reply.operation_id = checkout.operation_id;
+  reply.dbid = 42;
+  reply.checkout_version = 11;
+  reply.holder_app_id = checkout.owner_app_id;
+  reply.holder_process_instance = 111;
+  reply.holder_entity_id = checkout.entity_id;
+  reply.blob = {std::byte{0x11}};
+  handle_checkout_ack(source, reply);
+  EXPECT_EQ(find_db_entity(42), nullptr);
+  const auto aborted = DecodeSentMessages<dbapp::AbortCheckout>(channel);
+  ASSERT_EQ(aborted.size(), 1u);
+  EXPECT_EQ(aborted[0].operation_id, checkout.operation_id);
+}
+
 TEST_F(BaseAppRollbackTest, UncertainCheckoutRetriesSameOperationAndKeepsAccountFenced) {
   InterfaceTable table;
   const Address source("127.0.0.1", 24001);
@@ -2935,6 +3329,7 @@ TEST_F(BaseAppRollbackTest, UncertainCheckoutRetriesSameOperationAndKeepsAccount
   const auto initial = DecodeSentMessages<dbapp::CheckoutEntity>(channel);
   ASSERT_EQ(initial.size(), 1u);
   dbapp::CheckoutEntityAck reply;
+  reply.blob = DatabaseBlob();
   reply.operation_id = initial[0].operation_id;
   reply.request_id = request_id;
   reply.status = dbapp::CheckoutStatus::kDbError;
@@ -3017,6 +3412,7 @@ TEST_F(BaseAppRollbackTest, ConfirmedCheckoutRollbackWaitsForReleaseConfirmation
   const auto requests = DecodeSentMessages<dbapp::CheckoutEntity>(channel);
   ASSERT_EQ(requests.size(), 1u);
   dbapp::CheckoutEntityAck reply;
+  reply.blob = DatabaseBlob();
   reply.operation_id = requests[0].operation_id;
   reply.request_id = request_id;
   reply.status = dbapp::CheckoutStatus::kSuccess;
@@ -3060,6 +3456,7 @@ TEST_F(BaseAppRollbackTest, NativeCheckoutUncertaintyDoesNotDestroyOrReleaseOthe
   write_to_db(outgoing[0].entity_id, premature_data);
   EXPECT_TRUE(DecodeSentMessages<dbapp::WriteEntity>(channel).empty());
   dbapp::CheckoutEntityAck reply;
+  reply.blob = DatabaseBlob();
   reply.operation_id[0] = std::byte{1};
   reply.request_id = unrelated_id;
   reply.status = dbapp::CheckoutStatus::kDbError;
@@ -3092,6 +3489,8 @@ class FakeDatabase final : public IDatabase {
  public:
   Result<void> Startup(const DatabaseConfig&, const EntityDefRegistry&) override { return {}; }
   void Shutdown() override {}
+  void BeginDrain() override {}
+  auto PendingOperations() const -> std::size_t override { return 0; }
 
   void ReadAccountSession(DatabaseID, uint16_t,
                           std::function<void(Result<AccountSession>)> callback) override {
@@ -3259,13 +3658,14 @@ class FakeDatabase final : public IDatabase {
   CheckoutInfo last_release_owner{};
 
   void ClearCheckout(DatabaseID dbid, uint16_t type_id,
-                     std::function<void(bool)> callback) override {
+                     std::function<void(Result<bool>)> callback) override {
     ++clear_checkout_calls;
     last_cleared = std::make_pair(dbid, type_id);
     callback(true);
   }
 
-  void ClearCheckoutsForAddress(const Address&, std::function<void(int)> callback) override {
+  void ClearCheckoutsForAddress(const Address&,
+                                std::function<void(Result<int>)> callback) override {
     callback(0);
   }
 
@@ -3281,16 +3681,21 @@ class FakeDatabase final : public IDatabase {
   uint64_t retired_instance{0};
   std::function<void(Result<int>)> retire_callback;
 
-  void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id) override {
+  void MarkCheckoutCleared(DatabaseID dbid, uint16_t type_id,
+                           std::function<void(Result<void>)> callback) override {
     ++mark_checkout_cleared_calls;
     last_cleared = std::make_pair(dbid, type_id);
-  }
-
-  void GetAutoLoadEntities(std::function<void(std::vector<EntityData>)> callback) override {
     callback({});
   }
 
-  void SetAutoLoad(DatabaseID, uint16_t, bool) override {}
+  void GetAutoLoadEntities(std::function<void(Result<std::vector<EntityData>>)> callback) override {
+    callback(std::vector<EntityData>{});
+  }
+
+  void SetAutoLoad(DatabaseID, uint16_t, bool,
+                   std::function<void(Result<void>)> callback) override {
+    callback({});
+  }
   void GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                          std::function<void(DbidRangeResult)> callback) override {
     max_dbid_range_requests.push_back({low, high});
@@ -3347,6 +3752,7 @@ class DBAppRollbackTest : public ::testing::Test {
  protected:
   DBAppRollbackTest()
       : dispatcher_("dbapp_rollback"), network_(dispatcher_), app_(dispatcher_, network_) {
+    app_.entity_defs_.emplace();
     app_.database_ = std::make_unique<FakeDatabase>();
   }
 
@@ -3679,6 +4085,7 @@ TEST_F(DBAppRollbackTest, SharedWriteRejectsOwnerFromDifferentChannel) {
   InterfaceTable table;
   CapturingChannel reply(dispatcher_, table, Address(0x7F000001, 30001));
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.dbid = 42;
@@ -3692,6 +4099,7 @@ TEST_F(DBAppRollbackTest, SingleDbappWriteRejectsOwnerFromDifferentChannel) {
   InterfaceTable table;
   CapturingChannel reply(dispatcher_, table, Address(0x7F000001, 30001));
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.dbid = 42;
@@ -3706,16 +4114,17 @@ TEST_F(DBAppRollbackTest, ChangedInflightWriteIsRejectedWithoutRemovingOriginalW
   InterfaceTable table;
   CapturingChannel reply(dispatcher_, table, Address("127.0.0.1", 30001));
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.request_id = 1001;
   write.dbid = 42;
   write.type_id = 9;
-  write.blob = {std::byte{1}};
+  write.blob = DatabaseBlob({std::byte{1}});
   write_entity(&reply, write);
   ASSERT_TRUE(write_pending(write));
   auto changed = write;
-  changed.blob[0] = std::byte{2};
+  changed.blob = DatabaseBlob({std::byte{2}});
   write_entity(&reply, changed);
   ASSERT_TRUE(write_pending(write));
   EXPECT_EQ(db().put_entity_calls, 1);
@@ -3730,11 +4139,60 @@ TEST_F(DBAppRollbackTest, ChangedInflightWriteIsRejectedWithoutRemovingOriginalW
   EXPECT_FALSE(write_pending(write));
 }
 
+TEST_F(DBAppRollbackTest, MismatchedEntityDefinitionsRejectWriteAndCheckoutBeforeDatabaseAccess) {
+  InterfaceTable table;
+  CapturingChannel reply(dispatcher_, table, Address("127.0.0.1", 30001));
+  dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
+  write.operation_id[0] = std::byte{1};
+  write.owner.process_instance = 111;
+  write.dbid = 42;
+  write.type_id = 9;
+  write.entity_def_digest[0] = 1;
+  write_entity(&reply, write);
+  EXPECT_EQ(db().put_entity_calls, 0);
+  auto writes = DecodeSentMessages<dbapp::WriteEntityAck>(reply);
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_FALSE(writes[0].success);
+  EXPECT_EQ(writes[0].error, "entity_def_mismatch");
+
+  dbapp::CheckoutEntity checkout;
+  checkout.operation_id[0] = std::byte{1};
+  checkout.owner_process_instance = 111;
+  checkout.owner_app_id = 7;
+  checkout.dbid = 42;
+  checkout.type_id = 9;
+  checkout.entity_def_digest[0] = 1;
+  checkout_from(reply.RemoteAddress(), &reply, checkout);
+  EXPECT_FALSE(db().checkout_callback);
+  auto checkouts = DecodeSentMessages<dbapp::CheckoutEntityAck>(reply);
+  ASSERT_EQ(checkouts.size(), 1u);
+  EXPECT_EQ(checkouts[0].status, dbapp::CheckoutStatus::kDbError);
+  EXPECT_EQ(checkouts[0].error, "entity_def_mismatch");
+}
+
+TEST_F(DBAppRollbackTest, MismatchedLoginDefinitionsDoNotQueryOrCreateAccounts) {
+  InterfaceTable table;
+  CapturingChannel reply(dispatcher_, table, Address("127.0.0.1", 30001));
+  login::AuthLogin request;
+  request.username = "schema-test";
+  request.password_hash = "test-only-placeholder";
+  request.auto_create = true;
+  request.entity_def_digest[0] = 1;
+  auth_login(&reply, request);
+  EXPECT_EQ(db().lookup_by_name_calls, 0);
+  EXPECT_EQ(db().put_entity_with_password_calls, 0);
+  auto replies = DecodeSentMessages<login::AuthLoginResult>(reply);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].status, login::LoginStatus::kDefMismatch);
+}
+
 TEST_F(DBAppRollbackTest, SingleDbappLogoffForwardsLeaseAndKeepsNewOwnerOnLateCompletion) {
   start_checkout(1001, 555, 9);
   complete_checkout_success(555, 42);
   db().complete_put_immediately = false;
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.request_id = 1002;
@@ -4171,6 +4629,7 @@ TEST_F(DBAppRollbackTest, WriteEntityCreateAllocatesExplicitDbidFromOwnedShard) 
   handle_register_dbapp_ack(ack);
 
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.request_id = 77;
@@ -4205,6 +4664,7 @@ TEST_F(DBAppRollbackTest, WriteEntityCreateResumesAfterStoredShardMaxDbid) {
   EXPECT_EQ(db().max_dbid_range_requests[0].second, 2000);
 
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.request_id = 78;
@@ -4231,6 +4691,7 @@ TEST_F(DBAppRollbackTest, WriteEntityCreateRetriesDuplicateDbidInsideOwnedShard)
   handle_register_dbapp_ack(ack);
 
   dbapp::WriteEntity write;
+  write.blob = DatabaseBlob();
   write.owner.process_instance = 111;
   write.operation_id[0] = std::byte{1};
   write.request_id = 79;
@@ -4386,6 +4847,7 @@ TEST_F(DBAppRollbackTest, WriteEntityRejectsStaleShardTableVersion) {
   CapturingChannel reply(dispatcher_, channel_table, Address(0x7F000001u, 30001));
 
   dbapp::WriteEntity msg;
+  msg.blob = DatabaseBlob();
   msg.owner.process_instance = 111;
   msg.operation_id[0] = std::byte{1};
   msg.request_id = 44;

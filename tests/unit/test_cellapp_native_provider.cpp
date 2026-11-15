@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -342,11 +343,39 @@ TEST_F(CellAppNativeProviderTest, AddTimerControllerRegistersRepeating) {
   EXPECT_TRUE(e->GetControllers().Contains(static_cast<ControllerID>(id)));
 }
 
+TEST_F(CellAppNativeProviderTest, TimerIntervalsMustBeFiniteAndPositive) {
+  auto* entity = AddEntity(10);
+  for (float interval : {0.f, -1.f, std::numeric_limits<float>::infinity(),
+                         std::numeric_limits<float>::quiet_NaN()}) {
+    EXPECT_EQ(provider_.AddTimerController(10, interval, true, 0), 0);
+  }
+  EXPECT_EQ(entity->GetControllers().Count(), 0u);
+}
+
 TEST_F(CellAppNativeProviderTest, AddProximityControllerIsFunctional) {
   auto* e = AddEntity(10);
   auto id = provider_.AddProximityController(10, /*range=*/5.f, /*user_arg=*/0);
   EXPECT_GT(id, 0);
   EXPECT_TRUE(e->GetControllers().Contains(static_cast<ControllerID>(id)));
+}
+
+TEST_F(CellAppNativeProviderTest, InfiniteProximityRangeIsRejected) {
+  auto* entity = AddEntity(10);
+  EXPECT_EQ(provider_.AddProximityController(10, std::numeric_limits<float>::infinity(), 1), 0);
+  EXPECT_EQ(entity->GetControllers().Count(), 0u);
+}
+
+TEST_F(CellAppNativeProviderTest, ProximityRangeRejectsNegativeAndNanButAcceptsZero) {
+  auto* entity = AddEntity(10);
+  for (const auto range :
+       {-1.f, -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+    EXPECT_EQ(provider_.AddProximityController(10, range, 1), 0);
+  }
+  EXPECT_EQ(entity->GetControllers().Count(), 0u);
+  const auto controller = provider_.AddProximityController(10, 0.f, 1);
+  EXPECT_GT(controller, 0);
+  provider_.CancelController(10, controller);
+  EXPECT_EQ(entity->GetControllers().Count(), 0u);
 }
 
 // Proximity callbacks need a plain function pointer, so the recorder is

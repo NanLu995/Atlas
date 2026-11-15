@@ -6,13 +6,15 @@
 #include "foundation/containers/byte_ring_buffer.h"
 #include "network/bundle.h"
 #include "network/channel.h"
+#include "network/protocol_version.h"
 #include "network/socket.h"
 
 namespace atlas {
 
 class TcpChannel : public Channel {
  public:
-  static constexpr std::size_t kFrameHeaderSize = sizeof(uint32_t);
+  static constexpr std::size_t kFrameHeaderSize =
+      kConnectionProtocolHeader.size() + sizeof(uint32_t);
   static constexpr std::size_t kInitialRecvBufferSize = 16 * 1024;
   static constexpr std::size_t kMaxRecvBufferSize = 1024 * 1024;
   static constexpr std::size_t kInitialWriteBufferSize = 16 * 1024;

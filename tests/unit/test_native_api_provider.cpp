@@ -57,7 +57,9 @@ struct MockProvider final : public INativeApiProvider {
 
   void SetEntityDefDigest(const std::byte*, int32_t) override { ++set_digest_count; }
 
-  void WriteToDb(uint32_t, const std::byte*, int32_t) override {}
+  auto WriteToDb(uint32_t, const std::byte*, int32_t, uint64_t) -> RpcSendResult override {
+    return RpcSendResult::kQueued;
+  }
   auto TransferClient(uint32_t, uint32_t, uint32_t, uint16_t, uint64_t, uint64_t)
       -> RpcSendResult override {
     return RpcSendResult::kInvalidTarget;

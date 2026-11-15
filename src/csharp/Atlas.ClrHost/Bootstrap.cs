@@ -57,12 +57,11 @@ public unsafe struct ObjectVTableOut
 
 public static unsafe class Bootstrap
 {
-    /// <summary>
-    /// Entry point called by C++ immediately after loading the CLR.
-    /// </summary>
-    /// <param name="args">Pointer to a <see cref="BootstrapArgs"/> struct.</param>
-    /// <param name="vtableOut">Pointer to a <see cref="ObjectVTableOut"/> struct to fill.</param>
-    /// <returns>0 on success, -1 on failure (error written to C++ stderr).</returns>
+    public const uint NativeAbiVersion = 11;
+
+    [UnmanagedCallersOnly]
+    public static uint GetAbiVersion() => NativeAbiVersion;
+
     [UnmanagedCallersOnly]
     public static int Initialize(BootstrapArgs* args, ObjectVTableOut* vtableOut)
     {

@@ -61,6 +61,7 @@ class BaseAppNativeProvider : public BaseNativeProvider {
   explicit BaseAppNativeProvider(BaseApp& app);
 
   uint8_t GetProcessPrefix() override;
+  float DeltaTime() override;
 
   RpcSendResult SendClientRpc(uint32_t entity_id, uint32_t rpc_id, RpcTarget target,
                               const std::byte* payload, int32_t len, uint64_t trace_id) override;
@@ -72,7 +73,8 @@ class BaseAppNativeProvider : public BaseNativeProvider {
   RpcSendResult SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const std::byte* payload,
                             int32_t len, uint64_t trace_id) override;
 
-  void WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len) override;
+  auto WriteToDb(uint32_t entity_id, const std::byte* entity_data, int32_t len, uint64_t request_id)
+      -> RpcSendResult override;
 
   auto TransferClient(uint32_t src_entity_id, uint32_t dest_entity_id, uint32_t base_ip,
                       uint16_t base_port, uint64_t base_instance, uint64_t request_id)
