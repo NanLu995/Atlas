@@ -334,12 +334,14 @@ tools\bin\test_cluster.bat --base-assembly <你的Base实体程序集>
 ```
 
 `test_cluster` 支持 `--base-assembly <脚本.dll>`，用于为 BaseApp 加载测试脚本。
-默认仍为 `Atlas.Runtime.dll`；显式程序集不存在时，在启动集群进程前报错。
+必须显式提供程序集；缺少或不存在时，在启动集群进程前报错。
 CMake 的 `atlas_rpc_fixture_base_dll_deploy`、`atlas_rpc_fixture_client_dll_deploy`
 目标构建仅用于测试的生成式 RPC 两端。
 `--cell-assembly <脚本.dll>` 增加一个 CellAppMgr 和一个 CellApp；配套的
 `atlas_rpc_fixture_cell_dll_deploy` 目标构建 Cell 测试端。程序集缺失时在启动进程前报错，
 `--baseapps 2` 为移交验证启动第二个 BaseApp；运行清单及 READY 输出记录实际进程数及端点。
+`test_cluster --cellapps 2 --cell-assembly <脚本.dll>` 增加第二个 CellApp，用于恢复验证；
+缺少脚本参数或使用不支持的数量时明确拒绝，数据库运行记录和 READY 输出标明实际 Worker 数量。
 `--log-level debug` 为本次隔离集群启用既有服务端诊断；C# 夹具可通过
 `ATLAS_TEST_CLUSTER_LOG_LEVEL` 传入相同设置，默认仍为 `info`。
 测试启动器的标准输入接受 `kill-baseapp <内部端口>` 注入崩溃，并以 `KILLED` 确认终止；
@@ -348,6 +350,9 @@ CMake 的 `atlas_rpc_fixture_base_dll_deploy`、`atlas_rpc_fixture_client_dll_de
 `SHUTDOWN`；超时或非零退出使测试启动器失败。
 `restart-baseapp <内部端口>` 仅按原参数重启本次启动器已停止的 BaseApp，以 `RESTARTED`
 确认创建进程并保留此前日志；测试须另等注册就绪并检查旧会话不能重新取得控制权。
+`kill-process <名称>`、`restart-process <名称>` 为本次启动器所属的 CellApp、DBApp、machined
+提供相同的崩溃/重启控制；未知名称、重复终止和重启仍存活进程明确拒绝。重启复用原参数并保留日志，
+测试须另等注册就绪并验证恢复结果。
 
 运行独立的生成式 Mailbox 测试时，将 `ATLAS_BIN_DIR` 设为隔离二进制目录的绝对路径，
 通过 `ATLAS_DB_MYSQL_*` 指向空的测试数据库。现有 C# 集群夹具负责进程启动与结束，
@@ -359,6 +364,54 @@ dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedNa
 
 覆盖 Client→Base、Client→Cell 回复，Base→Cell、Cell→Base 调用，Base/Cell→Client
 通知，以及异步乱序、业务错误、单向调用、超时、取消、晚回复及清理；先构建三端测试夹具。
+
+Manager 从存活 Worker 的报告重建状态。CellAppMgr 只接受登记的 CellApp 地址及通道发来的空间几何，
+拒绝已失效通道和含尾随字节的 BSP，并要求报告者拥有其中的叶节点、所有叶节点持有者均已登记。
+被拒绝的报告不会改变当前拓扑。DBAppMgr HA 验证必须确认恢复窗口已关闭，才能判为恢复健康。
+CTest 的 `test_ha_verifiers` 合并运行现有 CellAppMgr、BaseAppMgr 及 DBAppMgr 验证器单测；
+仅这些检查通过不代表进程崩溃和通信中断场景已经验收。
+CellAppMgr 在叶节点持有者重新登记期间保留最高版本的有效几何，满足条件后重新校验来源和持有者再安装。
+每个持有者必须在当前登记通道回报相同 BSP、几何版本和非零冻结 epoch；仅所有预期本地 Cell
+均存在、处于相同且已解冻的 epoch、SpaceData 已初始化时，报告才标记稳定。
+Manager 恢复原版本、epoch 及广播基线，相同拓扑不会凭空增加版本。缺少确认或旧版本确认保持等待，
+不稳定或冲突报告暂停该空间；不自动推进中断的拓扑切换，需先核实 Worker 状态再重启暂停的 Manager。
+每个 Manager 最多保留 1024 条恢复记录、16 MiB 几何及持有者缓冲；重复报告不增加缓存。
+同版本几何冲突、来源或持有者失效、字节预算耗尽时暂停该空间，不降级采用旧报告。
+等待或暂停的空间拒绝空间创建/复用、主机解析和拓扑发布，其他健康空间继续运行。
+记录槽位耗尽时关闭未知空间准入，即使缓冲释放也不自动重开，因为被拒绝报告的版本水位无法保留。
+需先核实 Worker 状态再重启 Manager 清理暂停；单独发送更新报告不会解除冲突。
+暂停范围是 Manager 的拓扑决策；既有 Worker tick 与缓存实体路由继续运行。
+可查询 `cellappmgr/ha/recovery_pending`、`recovery_bytes`、`recovery_blocked`、
+`recovery_admission_closed`；HA 验证器不把待处理、暂停或缺失的恢复状态写为健康。
+BSP 解码最多允许 8191 个节点、深度 64，损坏或超限数据明确拒绝。
+machined 注册表查询使用 64 位请求 ID，明确区分成功与失败。并发查询互不替换，晚到和重复回复忽略；
+每个客户端最多等待 128 项，ID 耗尽后拒绝且不复用。查询超时、断线、发送失败和过载不等于空注册表。
+Reviver 不把这类失败计为进程缺失，也不据此冷启动；目标实例版本更新后，旧审计结果失效。
+`atlas_tool list` 查询失败时非零退出。machined 注册协议为 3，查询布局已改变，须配套重建
+machined、服务器和工具。
+machined 断线引起的 watcher 失败不计为 Manager 健康失败。注册重连后，Reviver 先通过成功查询
+确认目标在本轮注册表中，再启用依赖注册表的健康/缺失判断；本机进程存活与直接心跳检查继续。
+TCP 错误/挂断事件关闭失败连接，
+Worker 随后重新登记；分发期间关闭通道会停止处理该 bundle 的剩余消息。
+BaseApp 在 BaseAppMgr 出生时携带已有 app_id 重新注册，匹配的死亡通知清理绑定，注册确认只接受
+当前通道，避免 Manager 重启后保留失效通道或使用旧确认。
+CellApp 在 Manager 死亡或断线后也保留已有 app_id，重注册时回报，避免返回顺序改变 Worker 身份。
+Reviver 只有确认旧本机进程退出后才重新拉起已观察的目标；终止前固定进程身份，启动前再次检查退出。
+存活状态读取失败保守视为仍存活。远端或无法确认的目标在 `reviver/<manager>/status` 与
+`/restart_blocked` 报告暂停，需运维隔离后恢复。自动监督要求目标位于同机回环地址；
+不支持在多台主机为同名 Manager 配置冷启动，不提供跨主机 fencing 或自动搬迁。
+Linux 使用稳定 pidfd 终止进程，避免“先检查 PID、再发信号”的复用竞争；不可用时不自动终止。
+Windows 使用保留的进程句柄。
+
+重复执行框架恢复验收时，通过 `ATLAS_DB_MYSQL_*` 或 `--database-config` 指定隔离 MySQL 库，
+先构建 RPC Base/Cell 夹具，再运行 Windows 的
+`tools\bin\verify_framework_ha.bat --build framework-verify --scenario all`，或 Linux 的
+`bash tools/bin/verify_framework_ha.sh --build framework-verify --scenario all`。
+`managers` 验证三个 Manager 重启及重叠故障；`workers` 验证 DBApp、两台 CellApp、machined 崩溃重启。
+工具复用既有 HA verifier 和启动器，检查一个双叶空间、两个 Real Probe，逐故障日志保存在
+`.tmp/framework-ha-*`。SQLite 或缺少 MySQL 设置时明确拒绝。工具不创建数据库、不删除数据；
+DBApp 会初始化表结构，须使用空测试库。BaseApp 会话/崩溃验收保留在既有
+`ClientHandoffRealTests` 中；本机拓扑不验证跨主机 fencing。
 
 ## 数据库
 

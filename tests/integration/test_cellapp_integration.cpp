@@ -640,7 +640,8 @@ auto WaitForRegistrationInteg(MachinedClient& client, EventDispatcher& disp, Pro
                               uint16_t advertised_port) -> bool {
   return PollUntilInteg(disp, [&]() {
     auto infos = client.QuerySync(type, std::chrono::milliseconds(200));
-    for (const auto& p : infos) {
+    if (!infos) return false;
+    for (const auto& p : *infos) {
       if (p.internal_addr.Port() == advertised_port) return true;
     }
     return false;

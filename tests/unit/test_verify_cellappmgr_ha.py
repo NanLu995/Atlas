@@ -700,7 +700,8 @@ class RecoveryHealthTest(unittest.TestCase):
         defaults = {
             "cellappmgr/ha/recovery_window_active": "false",
             "cellappmgr/ha/recovery_window_status":
-                "state=open active=0 remaining_ms=0 pending_geometry=0",
+                "state=open active=0 remaining_ms=0 pending_geometry=0 "
+                "pending_reports=0 blocked_reports=0 admission_closed=0",
             "cellappmgr/lb/pending_geometry_broadcasts": "0",
             "cellappmgr/cellapp_count": "2",
             "cellappmgr/space_count": "1",
@@ -757,6 +758,26 @@ class RecoveryHealthTest(unittest.TestCase):
         }))
         self.assertFalse(report.ok)
         self.assertFalse(report.payload["recovery_window"]["healthy"])
+
+    def test_pending_blocked_or_closed_admission_is_not_recovered(self) -> None:
+        for fields in (
+            "pending_reports=1 blocked_reports=0 admission_closed=0",
+            "pending_reports=0 blocked_reports=1 admission_closed=0",
+            "pending_reports=0 blocked_reports=0 admission_closed=1",
+            "",
+        ):
+            with self.subTest(fields=fields):
+                report = self._read(self._args(), self._watchers(**{
+                    "cellappmgr/ha/recovery_window_status":
+                        "state=open active=0 remaining_ms=0 pending_geometry=0 " + fields,
+                }))
+                self.assertFalse(report.ok)
+
+    def test_unknown_recovery_window_does_not_mean_closed(self) -> None:
+        report = self._read(self._args(), self._watchers(**{
+            "cellappmgr/ha/recovery_window_active": "unknown",
+        }))
+        self.assertFalse(report.ok)
 
     def test_wait_or_capture_recovery_health_keeps_unhealthy_report(self) -> None:
         args = argparse.Namespace(machined="machined", timeout_sec=1.0, poll_sec=0.0)

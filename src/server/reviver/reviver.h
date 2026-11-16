@@ -41,6 +41,7 @@ class Reviver : public ManagerApp {
   void OnTickComplete() override;
 
  private:
+  friend struct ReviverTestAccess;
   // One Reviver process can supervise multiple manager targets; each target
   // keeps its own priority, heartbeat, restart budget, and watchers.
   struct ManagedTarget {
@@ -68,6 +69,7 @@ class Reviver : public ManagerApp {
     Address last_addr;
     uint32_t last_pid{0};
     LaunchedProcess launched;
+    LaunchedProcess observed;
     uint64_t active_generation{0};
     bool active{false};
     // True once the subject has been seen alive; gates cold-start vs restart.
@@ -101,6 +103,7 @@ class Reviver : public ManagerApp {
     uint64_t launch_failures{0};
     uint64_t launch_timeout_count{0};
     bool restart_limit_reached{false};
+    bool restart_blocked{false};
     uint64_t restart_limit_hit_count{0};
     uint64_t liveness_failures{0};
     uint64_t health_check_count{0};
@@ -117,6 +120,7 @@ class Reviver : public ManagerApp {
     bool is_active_reviver{false};
     uint64_t forced_termination_count{0};
     uint64_t registry_audit_count{0};
+    uint64_t confirmed_registry_generation{0};
     uint64_t registry_missing_count{0};
     std::string last_error;
   };
@@ -149,6 +153,8 @@ class Reviver : public ManagerApp {
   void ResetTargetManagerHealth(ManagedTarget& t);
   void ResetTargetLaunch(ManagedTarget& t);
   void TerminateTargetIfLocal(ManagedTarget& t, std::string_view reason);
+  auto TargetProcess(ManagedTarget& t) -> LaunchedProcess*;
+  auto CanRestartTarget(ManagedTarget& t) -> bool;
   void TerminateLaunchedTarget(ManagedTarget& t, std::string_view reason);
   void ScheduleTargetRestart(ManagedTarget& t, Duration delay);
   void LaunchTarget(ManagedTarget& t);
@@ -168,7 +174,6 @@ class Reviver : public ManagerApp {
   [[nodiscard]] auto ShouldSupervise(const ManagedTarget& t) const -> bool;
   [[nodiscard]] static auto PriorityTakeoverGrace(uint8_t priority) -> Duration;
   [[nodiscard]] auto MatchesTargetName(const ManagedTarget& t, std::string_view name) const -> bool;
-  [[nodiscard]] auto CanCheckLocalPid() const -> bool;
   [[nodiscard]] auto TargetStatus(const ManagedTarget& t) const -> std::string;
   [[nodiscard]] auto HeartbeatLastAckAgeMsForWatcher(const ManagedTarget& t) const -> int64_t;
 

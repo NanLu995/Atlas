@@ -270,7 +270,7 @@ auto Socket::Send(std::span<const std::byte> data) -> Result<size_t> {
     return MapSocketError();
   }
 #else
-  auto sent = ::send(fd_, data.data(), data.size(), 0);
+  auto sent = ::send(fd_, data.data(), data.size(), MSG_NOSIGNAL);
   if (sent == -1) {
     return MapSocketError();
   }

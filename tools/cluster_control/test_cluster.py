@@ -31,7 +31,8 @@ def parse_args() -> argparse.Namespace:
         "loginapp + baseapp) on 127.0.0.1 for integration testing. Outputs a "
         "READY line to stdout once every process has registered, then blocks "
         "until stdin is closed before tearing the cluster down. Stdin accepts "
-        "kill-baseapp, shutdown-baseapp or restart-baseapp <internal-port> for owned BaseApps.",
+        "kill-baseapp, shutdown-baseapp or restart-baseapp <internal-port> for owned BaseApps; "
+        "kill-process or restart-process <name> for other owned processes.",
     )
     parser.add_argument("--build-dir", default="debug",
                         help="Subdirectory of bin/ where binaries live (default: debug).")
@@ -41,7 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-assembly", type=Path,
                         help="Required BaseApp entity assembly, built with the current .def generator.")
     parser.add_argument("--cell-assembly", type=Path,
-                        help="Also start CellAppMgr and one CellApp with this script assembly.")
+                        help="Also start CellAppMgr and CellApp workers with this script assembly.")
+    parser.add_argument("--cellapps", type=int, choices=(1, 2), default=1,
+                        help="Number of CellApps when --cell-assembly is supplied (default: 1).")
     parser.add_argument("--baseapps", type=int, choices=(1, 2), default=1,
                         help="Number of BaseApps; use 2 for client handoff verification (default: 1).")
     parser.add_argument("--port-base", type=int, default=0,
@@ -52,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtls-private-key", type=Path, help="Public DTLS private key PEM.")
     add_database_options(parser)
     args = parser.parse_args()
+    if args.cellapps > 1 and args.cell_assembly is None:
+        parser.error("--cellapps 2 requires --cell-assembly <script.dll>")
     if bool(args.dtls_certificate) != bool(args.dtls_private_key):
         parser.error("--dtls-certificate and --dtls-private-key must be supplied together")
     for path in (args.dtls_certificate, args.dtls_private_key):
@@ -122,7 +127,17 @@ def _baseapp_index(processes: list[LoggedProcess], ports: list[tuple[int, int]],
 
 
 def _kill_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int) -> None:
-    entry = processes[_baseapp_index(processes, ports, port)]
+    _kill_process(processes[_baseapp_index(processes, ports, port)])
+
+
+def _process_index(processes: list[LoggedProcess], name: str) -> int:
+    for index, entry in enumerate(processes):
+        if entry.name == name:
+            return index
+    raise RuntimeError(f"Process {name} is not in this test cluster")
+
+
+def _kill_process(entry: LoggedProcess) -> None:
     process = entry.process
     if process.poll() is not None:
         raise RuntimeError(f"{entry.name} already exited; inspect its test cluster log")
@@ -132,11 +147,19 @@ def _kill_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], 
 
 def _restart_baseapp(processes: list[LoggedProcess], ports: list[tuple[int, int]], port: int,
                      repo_root: Path, log_dir: Path) -> None:
-    entry_index = _baseapp_index(processes, ports, port)
+    _restart_process(processes, _baseapp_index(processes, ports, port), repo_root, log_dir)
+
+
+def _restart_process(processes: list[LoggedProcess], entry_index: int,
+                     repo_root: Path, log_dir: Path) -> None:
     previous = processes[entry_index]
     name = previous.name
     if previous.process.poll() is None:
         raise RuntimeError(f"{name} is still running; stop it before restart")
+    if previous.stdout_handle:
+        previous.stdout_handle.close()
+    if previous.stderr_handle:
+        previous.stderr_handle.close()
     arguments = previous.process.args
     restart_logs = log_dir / 'restarts' / f'{name}-{time.monotonic_ns()}'
     restart_logs.mkdir(parents=True)
@@ -218,7 +241,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
 
     database = database_config(args, db_dir / 'test_cluster.sqlite3')
     record_database_run(run_root, database, baseapps=args.baseapps,
-                        cellapps=1 if args.cell_assembly else 0)
+                        cellapps=args.cellapps if args.cell_assembly else 0)
 
     machined_address = f"127.0.0.1:{machined_port}"
     db_config_path.write_text(
@@ -272,16 +295,19 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--internal-port", str(port_base + 8),
                            "--update-hertz", "50", "--log-level", args.log_level]))
             processes[-1].start_order = 3
-            processes.append(start_logged_process(
-                name="cellapp", file_path=cellapp,
-                working_directory=repo_root, log_directory=log_dir,
-                arguments=["--type", "cellapp", "--name", "cellapp",
-                           "--machined", machined_address,
-                           "--internal-port", str(port_base + 9),
-                           "--assembly", str(args.cell_assembly),
-                           "--runtime-config", str(runtime_config),
-                           "--update-hertz", "50", "--log-level", args.log_level]))
-            processes[-1].start_order = 3
+            for index in range(args.cellapps):
+                name = "cellapp" if index == 0 else "cellapp-2"
+                port = port_base + (9 if index == 0 else 14)
+                processes.append(start_logged_process(
+                    name=name, file_path=cellapp,
+                    working_directory=repo_root, log_directory=log_dir,
+                    arguments=["--type", "cellapp", "--name", name,
+                               "--machined", machined_address,
+                               "--internal-port", str(port),
+                               "--assembly", str(args.cell_assembly),
+                               "--runtime-config", str(runtime_config),
+                               "--update-hertz", "50", "--log-level", args.log_level]))
+                processes[-1].start_order = 3
 
         public_transport = []
         if args.dtls_certificate:
@@ -342,6 +368,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         ]
         if args.cell_assembly:
             ready_targets.extend([("cellappmgr", "cellappmgr"), ("cellapp", "cellapp")])
+            if args.cellapps == 2:
+                ready_targets.append(("cellapp", "cellapp-2"))
         if args.baseapps == 2:
             ready_targets.append(("baseapp", "baseapp-2"))
         for proc_type, name in ready_targets:
@@ -357,7 +385,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         print(
             f"READY loginapp_port={loginapp_port} baseapp_external_port={baseapp_external_port} "
             f"machined_port={machined_port} log_dir={log_dir} db_backend={args.db_backend} "
-            f"dbapps=1 baseapps={args.baseapps} cellapps={1 if args.cell_assembly else 0} "
+            f"dbapps=1 baseapps={args.baseapps} cellapps={args.cellapps if args.cell_assembly else 0} "
             f"baseapp_internal_ports={','.join(str(p[0]) for p in baseapp_ports)} "
             f"baseapp_external_ports={','.join(str(p[1]) for p in baseapp_ports)}",
             flush=True,
@@ -365,6 +393,15 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
 
         for line in iter(sys.stdin.readline, ""):
             command = line.split()
+            if len(command) == 2 and command[0] in ('kill-process', 'restart-process'):
+                index = _process_index(processes, command[1])
+                if command[0] == 'kill-process':
+                    _kill_process(processes[index])
+                    print(f"KILLED process={command[1]}", flush=True)
+                else:
+                    _restart_process(processes, index, repo_root, log_dir)
+                    print(f"RESTARTED process={command[1]}", flush=True)
+                continue
             if (len(command) != 2 or command[0] not in
                     ('kill-baseapp', 'shutdown-baseapp', 'restart-baseapp')
                     or not command[1].isdigit()):

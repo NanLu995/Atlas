@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 #include "foundation/log.h"
 #include "network/event_dispatcher.h"
@@ -150,11 +151,13 @@ void TcpChannel::ProcessRecvBuffer() {
       rspan = recv_buffer_.ReadableSpan();
     }
 
-    const std::byte* frame_start = rspan.data() + kFrameHeaderSize;
+    const auto payload = rspan.subspan(kFrameHeaderSize, static_cast<std::size_t>(*frame_length));
+    // A handler can close the channel and release its receive buffer.
+    const std::vector<std::byte> frame(payload.begin(), payload.end());
+    recv_buffer_.Consume(total);
 
     if (packet_filter_) {
-      auto filtered = packet_filter_->RecvFilter(
-          std::span<const std::byte>(frame_start, static_cast<std::size_t>(*frame_length)));
+      auto filtered = packet_filter_->RecvFilter(frame);
       if (filtered) {
         DispatchMessages(std::span<const std::byte>(filtered->data(), filtered->size()));
       } else {
@@ -162,11 +165,10 @@ void TcpChannel::ProcessRecvBuffer() {
                           filtered.Error().Message());
       }
     } else {
-      DispatchMessages(
-          std::span<const std::byte>(frame_start, static_cast<std::size_t>(*frame_length)));
+      DispatchMessages(frame);
     }
 
-    recv_buffer_.Consume(total);
+    if (IsCondemned()) return;
   }
 
   if (recv_buffer_.ReadableSize() == 0) {
@@ -250,6 +252,7 @@ void TcpChannel::OnCondemned() {
 
   if (socket_.IsValid()) {
     (void)dispatcher_.Deregister(socket_.Fd());
+    socket_.Close();
   }
 
   recv_buffer_.Clear();

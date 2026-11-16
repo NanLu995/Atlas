@@ -209,7 +209,8 @@ auto WaitForRegistration(MachinedClient& client, EventDispatcher& disp, ProcessT
                          uint16_t advertised_port) -> bool {
   return PollUntil(disp, [&]() {
     auto infos = client.QuerySync(type, std::chrono::milliseconds(200));
-    for (const auto& p : infos) {
+    if (!infos) return false;
+    for (const auto& p : *infos) {
       if (p.internal_addr.Port() == advertised_port) return true;
     }
     return false;
@@ -221,7 +222,8 @@ auto WaitForNamedRegistration(MachinedClient& client, EventDispatcher& disp, Pro
                               machined::ProcessInfo* out = nullptr) -> bool {
   return PollUntil(disp, [&]() {
     auto infos = client.QuerySync(type, std::chrono::milliseconds(200));
-    for (const auto& p : infos) {
+    if (!infos) return false;
+    for (const auto& p : *infos) {
       if (p.name != name) continue;
       if (out != nullptr) *out = p;
       return true;
@@ -236,7 +238,8 @@ auto WaitForNamedRegistrationWithDifferentPid(MachinedClient& client, EventDispa
                                               machined::ProcessInfo* out) -> bool {
   return PollUntil(disp, [&]() {
     auto infos = client.QuerySync(type, std::chrono::milliseconds(200));
-    for (const auto& p : infos) {
+    if (!infos) return false;
+    for (const auto& p : *infos) {
       if (p.name != name || p.pid == previous_pid) continue;
       *out = p;
       return true;
@@ -432,8 +435,8 @@ TEST(MachinedClient, AsyncQueryTimesOutOnSilentConnection) {
   ASSERT_TRUE(client.Connect(server_net.TcpAddress()));
 
   bool called = false;
-  std::vector<machined::ProcessInfo> result{{}};
-  client.QueryAsync(ProcessType::kCellAppMgr, [&](std::vector<machined::ProcessInfo> infos) {
+  MachinedClient::QueryResult result{std::vector<machined::ProcessInfo>{{}}};
+  client.QueryAsync(ProcessType::kCellAppMgr, [&](MachinedClient::QueryResult infos) {
     result = std::move(infos);
     called = true;
   });
@@ -444,7 +447,8 @@ TEST(MachinedClient, AsyncQueryTimesOutOnSilentConnection) {
     server_net.FlushDirtySendChannels();
     return called;
   }, std::chrono::milliseconds(1500)));
-  EXPECT_TRUE(result.empty());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kTimeout);
 #endif
 }
 
@@ -958,8 +962,9 @@ TEST(CellAppMgrProcess, ReviverAttachesToExistingCellAppMgrWithoutColdStart) {
   EXPECT_EQ(*heartbeat_timeouts, "0");
 
   auto managers = client.QuerySync(ProcessType::kCellAppMgr, std::chrono::milliseconds(200));
+  ASSERT_TRUE(managers);
   int target_count = 0;
-  for (const auto& info : managers) {
+  for (const auto& info : *managers) {
     if (info.name != "cellappmgr_revived") continue;
     ++target_count;
     EXPECT_EQ(info.pid, existing_info.pid);
@@ -1252,7 +1257,8 @@ TEST(CellAppMgrProcess, ReviverTimesOutPendingManagerHealthWatcher) {
   ASSERT_TRUE(PollUntil(registry_disp, fake_disp, [&] {
     fake_net.FlushDirtySendChannels();
     auto infos = client.QuerySync(ProcessType::kCellAppMgr, std::chrono::milliseconds(200));
-    for (const auto& info : infos) {
+    if (!infos) return false;
+    for (const auto& info : *infos) {
       if (info.name == "cellappmgr_revived" && info.pid == reg.pid) return true;
     }
     return false;
@@ -1388,8 +1394,9 @@ TEST(CellAppMgrProcess, ReviverStopsAfterRestartLimitWithoutHeartbeatAck) {
   EXPECT_EQ(*launch_pending, "false");
 
   reviver = Child{};
-  for (const auto& info : client.QuerySync(ProcessType::kCellAppMgr,
-                                           std::chrono::milliseconds(200))) {
+  auto remaining = client.QuerySync(ProcessType::kCellAppMgr, std::chrono::milliseconds(200));
+  ASSERT_TRUE(remaining);
+  for (const auto& info : *remaining) {
     if (info.name == "cellappmgr_revived" && info.pid != 0) {
       (void)TerminatePid(info.pid);
     }
@@ -1601,8 +1608,9 @@ TEST(CellAppMgrProcess, ReviverPriorityArbitrationPicksOneActiveMonitor) {
   EXPECT_EQ(*heartbeat_timeouts, "0");
 
   auto mgr_infos = client.QuerySync(ProcessType::kCellAppMgr, std::chrono::milliseconds(200));
+  ASSERT_TRUE(mgr_infos);
   int target_mgr_count = 0;
-  for (const auto& info : mgr_infos) {
+  for (const auto& info : *mgr_infos) {
     if (info.name != "cellappmgr_revived") continue;
     ++target_mgr_count;
     EXPECT_EQ(info.pid, mgr.pid);

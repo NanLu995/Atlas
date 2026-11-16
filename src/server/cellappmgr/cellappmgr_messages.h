@@ -635,15 +635,14 @@ struct SpaceCreatedResult {
 };
 static_assert(NetworkMessage<SpaceCreatedResult>);
 
-// CellApp -> CellAppMgr: a surviving CellApp reports the full BSP geometry it
-// holds for every space it participates in, so a freshly (re)started mgr can
-// rebuild its authoritative partitions purely from workers (BigWorld-style
-// recovery) instead of a snapshot file. The mgr keeps the highest
-// geometry_version reported per space.
+// Surviving CellApps report held geometry for worker-driven manager recovery.
+// The manager retains the highest validated geometry version for each space.
 struct RecoverCellAppState {
   struct SpaceGeometry {
     SpaceID space_id{kInvalidSpaceID};
     uint64_t geometry_version{0};
+    uint64_t freeze_epoch{0};
+    bool stable{false};
     std::vector<std::byte> bsp_blob;
   };
   std::vector<SpaceGeometry> spaces;
@@ -663,6 +662,8 @@ struct RecoverCellAppState {
     for (const auto& s : spaces) {
       w.Write(s.space_id);
       w.Write(s.geometry_version);
+      w.Write(s.freeze_epoch);
+      w.Write<uint8_t>(s.stable ? 1 : 0);
       w.WritePackedInt(static_cast<uint32_t>(s.bsp_blob.size()));
       if (!s.bsp_blob.empty()) w.WriteBytes(std::span<const std::byte>(s.bsp_blob));
     }
@@ -671,17 +672,25 @@ struct RecoverCellAppState {
   static auto Deserialize(BinaryReader& r) -> Result<RecoverCellAppState> {
     auto count = r.ReadPackedInt();
     if (!count) return Error{ErrorCode::kInvalidArgument, "RecoverCellAppState: truncated"};
+    constexpr auto kMinSpaceBytes = sizeof(uint32_t) + 2 * sizeof(uint64_t) + 2;
+    if (*count > r.Remaining() / kMinSpaceBytes) {
+      return Error{ErrorCode::kInvalidArgument, "RecoverCellAppState: count exceeds payload"};
+    }
     RecoverCellAppState msg;
     msg.spaces.reserve(*count);
     for (uint32_t i = 0; i < *count; ++i) {
       auto sid = r.Read<uint32_t>();
       auto version = r.Read<uint64_t>();
+      auto epoch = r.Read<uint64_t>();
+      auto stable = r.Read<uint8_t>();
       auto blen = r.ReadPackedInt();
-      if (!sid || !version || !blen)
+      if (!sid || !version || !epoch || !stable || *stable > 1 || !blen)
         return Error{ErrorCode::kInvalidArgument, "RecoverCellAppState: space truncated"};
       SpaceGeometry s;
       s.space_id = *sid;
       s.geometry_version = *version;
+      s.freeze_epoch = *epoch;
+      s.stable = *stable != 0;
       if (*blen > 0) {
         auto data = r.ReadBytes(*blen);
         if (!data) return Error{ErrorCode::kInvalidArgument, "RecoverCellAppState: bsp truncated"};

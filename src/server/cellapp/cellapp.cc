@@ -454,7 +454,6 @@ auto CellApp::ShouldReconnectCellAppMgrForBirth(const machined::BirthNotificatio
 
 void CellApp::ClearCellAppMgrSession() {
   cellappmgr_channel_ = nullptr;
-  app_id_ = 0;
   cellappmgr_pid_ = 0;
 }
 
@@ -3038,6 +3037,7 @@ void CellApp::OnRegisterCellAppAck(const Address& /*src*/, Channel* ch,
 void CellApp::SendRecoverCellAppState() {
   if (cellappmgr_channel_ == nullptr) return;
   cellappmgr::RecoverCellAppState msg;
+  const auto self = ResolveSelfAddr();
   for (auto& [space_id, space] : spaces_) {
     const auto* bsp = space->GetBspTree();
     if (bsp == nullptr) continue;
@@ -3047,6 +3047,20 @@ void CellApp::SendRecoverCellAppState() {
     cellappmgr::RecoverCellAppState::SpaceGeometry geom;
     geom.space_id = space_id;
     geom.geometry_version = space->GeometryVersion();
+    geom.stable =
+        geom.geometry_version != 0 && space->IsDataInitialized() && !space->LocalCells().empty();
+    for (const auto& [cell_id, cell] : space->LocalCells()) {
+      const auto* info = bsp->FindCellById(cell_id);
+      const auto epoch = cell->ShouldOffloadEpoch();
+      if (info == nullptr || info->cellapp_addr != self || !cell->ShouldOffload() || epoch == 0 ||
+          (geom.freeze_epoch != 0 && epoch != geom.freeze_epoch))
+        geom.stable = false;
+      geom.freeze_epoch = std::max(geom.freeze_epoch, epoch);
+    }
+    const auto leaves = bsp->Leaves();
+    const auto owned_leaves = std::count_if(
+        leaves.begin(), leaves.end(), [&](const auto* leaf) { return leaf->cellapp_addr == self; });
+    if (static_cast<std::size_t>(owned_leaves) != space->LocalCells().size()) geom.stable = false;
     geom.bsp_blob.assign(blob.begin(), blob.end());
     msg.spaces.push_back(std::move(geom));
   }

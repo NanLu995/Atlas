@@ -168,7 +168,7 @@ def read_manager_health(
     recovery_window = watcher_value(exe, machined, mgr_target, "dbappmgr/ha/recovery_window_active")
     has_expected_workers = dbapp_count >= expected_dbapps
     has_shards = expected_dbapps == 0 or (shard_count > 0 and version > 0 and bool(table))
-    healthy = has_expected_workers and has_shards
+    healthy = has_expected_workers and has_shards and recovery_window == "false"
     return OrderedDict(
         dbapp_count=dbapp_count,
         expected_dbapps=expected_dbapps,

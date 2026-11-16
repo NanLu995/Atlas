@@ -1,6 +1,7 @@
 #ifndef ATLAS_LIB_SERVER_MACHINED_CLIENT_H_
 #define ATLAS_LIB_SERVER_MACHINED_CLIENT_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "foundation/clock.h"
+#include "foundation/error.h"
 #include "network/address.h"
 #include "network/machined_types.h"
 #include "server/server_config.h"
@@ -30,6 +32,7 @@ class MachinedClient {
   static constexpr Duration kRequestTimeout = std::chrono::seconds(5);
   static constexpr Duration kInitialReconnectBackoff = std::chrono::seconds(1);
   static constexpr Duration kMaxReconnectBackoff = std::chrono::seconds(30);
+  static constexpr size_t kMaxPendingQueries = 128;
 
   MachinedClient(EventDispatcher& dispatcher, NetworkInterface& network,
                  Duration request_timeout = kRequestTimeout);
@@ -43,6 +46,9 @@ class MachinedClient {
   [[nodiscard]] auto Connect(const Address& machined_addr) -> bool;
 
   [[nodiscard]] auto IsConnected() const -> bool;
+  [[nodiscard]] auto RegistrationGeneration() const -> uint64_t {
+    return registered_ && IsConnected() ? registration_generation_ : 0;
+  }
   [[nodiscard]] auto IsMachinedChannel(const Channel* channel) const -> bool;
 
   // Caches the registration so we can replay it after a reconnect.
@@ -51,11 +57,12 @@ class MachinedClient {
 
   void SendHeartbeat(float load = 0.0f, uint32_t entity_count = 0);
 
+  using QueryResult = Result<std::vector<machined::ProcessInfo>>;
   [[nodiscard]] auto QuerySync(ProcessType type, Duration timeout = std::chrono::seconds(5))
-      -> std::vector<machined::ProcessInfo>;
+      -> QueryResult;
 
-  using QueryCallback = std::function<void(std::vector<machined::ProcessInfo>)>;
-  void QueryAsync(ProcessType type, QueryCallback cb);
+  using QueryCallback = std::function<void(QueryResult)>;
+  auto QueryAsync(ProcessType type, QueryCallback cb) -> uint64_t;
 
   void Subscribe(machined::ListenerType listener_type, ProcessType target_type,
                  BirthCallback on_birth, DeathCallback on_death);
@@ -76,6 +83,8 @@ class MachinedClient {
   void Tick(float load = 0.0f, uint32_t entity_count = 0);
 
  private:
+  friend struct MachinedClientTestAccess;
+
   void RegisterHandlers();
   void DetectStaleChannel();
   void HandleDisconnect();
@@ -98,17 +107,12 @@ class MachinedClient {
   Channel* channel_{nullptr};
   Address machined_addr_{};
 
-  struct SyncQuery {
-    bool done{false};
-    std::vector<machined::ProcessInfo> result;
-  };
-  std::optional<SyncQuery> sync_query_;
-
-  struct AsyncQuery {
+  struct PendingQuery {
     QueryCallback cb;
     TimePoint issued_at;
   };
-  std::optional<AsyncQuery> async_query_;
+  uint64_t next_query_request_id_{1};
+  std::unordered_map<uint64_t, PendingQuery> pending_queries_;
 
   struct Subscription {
     machined::ListenerType listener_type;
@@ -146,6 +150,7 @@ class MachinedClient {
   Duration request_timeout_{kRequestTimeout};
   TimePoint last_heartbeat_{};
   bool registered_{false};
+  uint64_t registration_generation_{0};
 
   // When machined advertises a UDP heartbeat port, we send heartbeats there
   // via a plain UdpChannel instead of the TCP control channel.

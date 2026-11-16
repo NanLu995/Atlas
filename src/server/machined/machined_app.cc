@@ -412,6 +412,7 @@ void MachinedApp::OnQuery(const Address& /*src*/, Channel* ch, const QueryMessag
   auto entries = process_registry_.FindByType(msg.process_type);
 
   QueryResponse resp;
+  resp.request_id = msg.request_id;
   resp.processes.reserve(entries.size());
   std::set<std::pair<int, std::string>> seen;
   for (const auto& e : entries) {

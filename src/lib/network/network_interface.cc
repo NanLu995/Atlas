@@ -121,18 +121,18 @@ auto NetworkInterface::ConnectTcp(const Address& addr) -> Result<TcpChannel*> {
       make_intrusive<TcpChannel>(dispatcher_, interface_table_, std::move(*sock), addr);
   channel->SetChannelId(next_channel_id_++);
 
-  auto reg = dispatcher_.RegisterReader(channel->Fd(),
-                                        [this, ch = channel.get()](FdHandle, IOEvent events) {
-                                          if ((events & IOEvent::kReadable) != IOEvent::kNone) {
-                                            ATLAS_PROFILE_ZONE_N("TcpChannel::OnReadable");
-                                            ch->OnReadable();
-                                          }
-                                          if ((events & IOEvent::kWritable) != IOEvent::kNone) {
-                                            ATLAS_PROFILE_ZONE_N("TcpChannel::OnWritable");
-                                            ch->OnWritable();
-                                          }
-                                          FlushDirtySendChannels();
-                                        });
+  auto reg = dispatcher_.RegisterReader(channel->Fd(), [this, ch = channel.get()](FdHandle,
+                                                                                  IOEvent events) {
+    if ((events & (IOEvent::kReadable | IOEvent::kError | IOEvent::kHangUp)) != IOEvent::kNone) {
+      ATLAS_PROFILE_ZONE_N("TcpChannel::OnReadable");
+      ch->OnReadable();
+    }
+    if (!ch->IsCondemned() && (events & IOEvent::kWritable) != IOEvent::kNone) {
+      ATLAS_PROFILE_ZONE_N("TcpChannel::OnWritable");
+      ch->OnWritable();
+    }
+    FlushDirtySendChannels();
+  });
   if (!reg) {
     return reg.Error();
   }
@@ -614,18 +614,18 @@ void NetworkInterface::OnTcpAccept() {
                                               peer_addr);
     channel->SetChannelId(next_channel_id_++);
 
-    auto reg = dispatcher_.RegisterReader(channel->Fd(),
-                                          [this, ch = channel.get()](FdHandle, IOEvent events) {
-                                            if ((events & IOEvent::kReadable) != IOEvent::kNone) {
-                                              ATLAS_PROFILE_ZONE_N("TcpChannel::OnReadable");
-                                              ch->OnReadable();
-                                            }
-                                            if ((events & IOEvent::kWritable) != IOEvent::kNone) {
-                                              ATLAS_PROFILE_ZONE_N("TcpChannel::OnWritable");
-                                              ch->OnWritable();
-                                            }
-                                            FlushDirtySendChannels();
-                                          });
+    auto reg = dispatcher_.RegisterReader(channel->Fd(), [this, ch = channel.get()](
+                                                             FdHandle, IOEvent events) {
+      if ((events & (IOEvent::kReadable | IOEvent::kError | IOEvent::kHangUp)) != IOEvent::kNone) {
+        ATLAS_PROFILE_ZONE_N("TcpChannel::OnReadable");
+        ch->OnReadable();
+      }
+      if (!ch->IsCondemned() && (events & IOEvent::kWritable) != IOEvent::kNone) {
+        ATLAS_PROFILE_ZONE_N("TcpChannel::OnWritable");
+        ch->OnWritable();
+      }
+      FlushDirtySendChannels();
+    });
     if (!reg) {
       ATLAS_LOG_ERROR("Failed to register channel fd: {}", reg.Error().Message());
       continue;

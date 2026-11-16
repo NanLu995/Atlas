@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +28,8 @@ struct ProcessInfo;
 
 class CellAppMgr : public ManagerApp {
  public:
+  static constexpr std::size_t kMaxPendingRecoveryReports = 1024;
+  static constexpr std::size_t kMaxPendingRecoveryBytes = 16 * 1024 * 1024;
   static auto Run(int argc, char* argv[]) -> int;
 
   CellAppMgr(EventDispatcher& dispatcher, NetworkInterface& network);
@@ -61,6 +64,7 @@ class CellAppMgr : public ManagerApp {
     BSPTree bsp;
     uint64_t geometry_version{0};
     uint64_t freeze_epoch{0};
+    bool recovery_paused{false};
     // Last fan-out bytes; stable trees skip redundant broadcasts.
     std::vector<std::byte> last_broadcast_blob;
     std::vector<std::byte> last_debug_geometry_blob;
@@ -116,6 +120,10 @@ class CellAppMgr : public ManagerApp {
   [[nodiscard]] auto BuildPendingSpaceCreateSummary() const -> std::string;
   [[nodiscard]] auto BuildRetireStatusSummary() const -> std::string;
   [[nodiscard]] auto RecoveryWindowActive() const -> bool;
+  [[nodiscard]] auto SpaceRecoveryPaused(SpaceID space_id) const -> bool;
+  [[nodiscard]] auto BlockedRecoveryCount() const -> std::size_t;
+  void PauseSpaceRecovery(SpaceID space_id, std::string_view reason);
+  void ReconsiderSpaceRecoveries();
   [[nodiscard]] auto BuildLbDecisionSummary() const -> std::string;
   [[nodiscard]] auto BuildLbDecisionHistorySummary() const -> std::string;
   [[nodiscard]] auto FormatLbDecision(const LbDecision& decision) const -> std::string;
@@ -219,6 +227,21 @@ class CellAppMgr : public ManagerApp {
 
   std::unordered_map<Address, CellAppInfo> cellapps_;
   std::unordered_map<SpaceID, SpacePartition> spaces_;
+  struct RecoveryOwner {
+    Address address;
+    uint32_t app_id{0};
+    IntrusivePtr<Channel> channel;
+  };
+  struct PendingSpaceRecovery {
+    uint64_t geometry_version{0};
+    uint64_t freeze_epoch{0};
+    std::vector<std::byte> blob;
+    std::vector<RecoveryOwner> owners;
+    bool blocked{false};
+  };
+  std::unordered_map<SpaceID, PendingSpaceRecovery> pending_space_recoveries_;
+  std::size_t pending_recovery_bytes_{0};
+  bool recovery_admission_closed_{false};
   uint32_t last_retire_app_id_{0};
   struct RetireDrain {
     SpaceID space_id{kInvalidSpaceID};

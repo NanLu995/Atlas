@@ -2252,6 +2252,60 @@ auto MakeGhostSpace(CellApp& app, SpaceID space_id, cellappmgr::CellID primary_c
 
 }  // namespace
 
+TEST_F(CellAppHandlersTest, RecoveryReportsEpochOnlyAsStableForCompleteUnfrozenLocalCells) {
+  InterfaceTable table;
+  RecordingChannel mgr_ch(dispatcher_, table, Address(0x7F000001u, 20001));
+  for (int variant = 0; variant != 8; ++variant) {
+    SCOPED_TRACE(variant);
+    auto* space = MakeOwnerSpace(app_, static_cast<SpaceID>(100 + variant), 1, 0, 12);
+    space->GetBspTree()->FindCellByIdMutable(1)->cellapp_addr = app_.ResolveSelfAddrForTest();
+    auto* cell = space->FindLocalCell(1);
+    ASSERT_NE(cell, nullptr);
+    ASSERT_TRUE(cell->ApplyShouldOffload(true, 7));
+    if (variant == 1) {
+      ASSERT_TRUE(cell->ApplyShouldOffload(false, 7));
+    }
+    if (variant == 2) {
+      (void)space->RemoveLocalCell(1);
+      space->AddLocalCell(std::make_unique<Cell>(*space, 1, CellBounds{}));
+    }
+    if (variant == 3) (void)space->RemoveLocalCell(1);
+    if (variant == 4) space->SetBspTree(BSPTree{}, 0);
+    if (variant == 5) space->AddLocalCell(std::make_unique<Cell>(*space, 2, CellBounds{}));
+    if (variant == 6) {
+      CellInfo right;
+      right.cell_id = 2;
+      right.cellapp_addr = app_.ResolveSelfAddrForTest();
+      ASSERT_TRUE(space->GetBspTree()->Split(1, BSPAxis::kX, 0, right));
+      auto* other = space->AddLocalCell(std::make_unique<Cell>(*space, 2, CellBounds{}));
+      ASSERT_TRUE(other->ApplyShouldOffload(true, 8));
+    }
+    if (variant == 7) space->BeginPrimaryHandoffSnapshot(Address(0x7F000001u, 30001));
+  }
+  cellappmgr::RegisterCellAppAck ack;
+  ack.success = true;
+  ack.app_id = 7;
+  app_.OnRegisterCellAppAck({}, &mgr_ch, ack);
+  ASSERT_EQ(mgr_ch.Sends().size(), 1u);
+  BinaryReader reader(mgr_ch.Sends().front());
+  auto id = reader.ReadPackedInt();
+  ASSERT_TRUE(id);
+  ASSERT_EQ(*id, cellappmgr::RecoverCellAppState::Descriptor().id);
+  ASSERT_TRUE(reader.ReadPackedInt());
+  auto report = cellappmgr::RecoverCellAppState::Deserialize(reader);
+  ASSERT_TRUE(report);
+  ASSERT_EQ(report->spaces.size(), 8u);
+  for (const auto& snapshot : report->spaces) {
+    EXPECT_EQ(snapshot.stable, snapshot.space_id == 100);
+    if (snapshot.space_id == 100) {
+      EXPECT_EQ(snapshot.freeze_epoch, 7u);
+    }
+    if (snapshot.space_id == 106) {
+      EXPECT_EQ(snapshot.freeze_epoch, 8u);
+    }
+  }
+}
+
 TEST_F(CellAppHandlersTest, FlushLoadReportSendsImmediateReport) {
   InterfaceTable table;
   RecordingChannel mgr_ch(dispatcher_, table, Address(0x7F000001u, 20001));
@@ -2369,9 +2423,18 @@ TEST_F(CellAppHandlersTest, CellAppMgrBirthReconnectsOnlyForNewManager) {
   EXPECT_EQ(app_.CellAppMgrPidForTest(), 101u);
 
   app_.OnOutboundChannelDeath(mgr_ch);
-  EXPECT_EQ(app_.AppId(), 0u);
+  EXPECT_EQ(app_.AppId(), 7u);
   EXPECT_EQ(app_.CellAppMgrPidForTest(), 0u);
   EXPECT_TRUE(app_.ShouldReconnectCellAppMgrForBirthForTest(birth));
+
+  app_.SeedCellAppMgrSessionForTest(&mgr_ch, 7, 102);
+  machined::DeathNotification current_death;
+  current_death.process_type = ProcessType::kCellAppMgr;
+  current_death.internal_addr = mgr_ch.RemoteAddress();
+  current_death.reason = 1;
+  app_.OnCellAppMgrDeathForTest(current_death);
+  EXPECT_EQ(app_.AppId(), 7u);
+  EXPECT_EQ(app_.CellAppMgrPidForTest(), 0u);
 }
 
 TEST_F(CellAppHandlersTest, OnSpaceDataUpdate_AppliesValueLocally) {

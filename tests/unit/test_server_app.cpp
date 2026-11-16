@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -11,6 +12,22 @@
 #include "test_shutdown_access.h"
 
 using namespace atlas;
+
+namespace atlas {
+struct MachinedClientTestAccess {
+  static void SetNextQueryId(MachinedClient& client, uint64_t id) {
+    client.next_query_request_id_ = id;
+  }
+  static void ExpireQueries(MachinedClient& client) {
+    for (auto& [_, query] : client.pending_queries_) {
+      query.issued_at = Clock::now() - client.request_timeout_;
+    }
+  }
+  static auto PendingQueries(const MachinedClient& client) -> size_t {
+    return client.pending_queries_.size();
+  }
+};
+}  // namespace atlas
 
 // Minimal concrete ServerApp — no network binding needed for unit tests.
 // Overrides Init() to skip port binding and shorten the tick interval.
@@ -427,10 +444,11 @@ class MachinedSourceTest : public ::testing::Test {
 
 TEST_F(MachinedSourceTest, QueryResponseRequiresCurrentMachinedChannel) {
   uint32_t calls = 0;
-  client_.QueryAsync(ProcessType::kBaseApp, [&](auto) { ++calls; });
+  const auto id = client_.QueryAsync(ProcessType::kBaseApp, [&](auto) { ++calls; });
   test_support::TestNullChannel impostor(dispatcher_, network_.InterfaceTable(),
                                          controller_.TcpAddress());
   machined::QueryResponse response;
+  response.request_id = id;
   Dispatch(nullptr, response);
   Dispatch(&impostor, response);
   EXPECT_EQ(calls, 0u);
@@ -438,6 +456,154 @@ TEST_F(MachinedSourceTest, QueryResponseRequiresCurrentMachinedChannel) {
   EXPECT_EQ(calls, 1u);
   Dispatch(channel_, response);
   EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(MachinedSourceTest, ConcurrentRegistryQueriesDoNotCompleteEachOther) {
+  std::array<uint32_t, 3> calls{};
+  std::array<uint64_t, 3> ids{};
+  const std::array roles{ProcessType::kCellAppMgr, ProcessType::kBaseAppMgr,
+                         ProcessType::kDbAppMgr};
+  for (size_t i = 0; i < roles.size(); ++i) {
+    ids[i] = client_.QueryAsync(roles[i], [&, i](MachinedClient::QueryResult result) {
+      ASSERT_TRUE(result);
+      ASSERT_EQ(result->size(), 1u);
+      EXPECT_EQ(result->front().process_type, roles[i]);
+      ++calls[i];
+    });
+    ASSERT_NE(ids[i], 0u);
+    if (i != 0) {
+      EXPECT_GT(ids[i], ids[i - 1]);
+    }
+    EXPECT_EQ(calls[i], 0u);
+  }
+  for (size_t i = roles.size(); i-- > 0;) {
+    machined::QueryResponse response;
+    response.request_id = ids[i];
+    response.processes.emplace_back().process_type = roles[i];
+    Dispatch(channel_, response);
+    Dispatch(channel_, response);
+    EXPECT_EQ(calls[i], 1u);
+  }
+  EXPECT_EQ(calls, (std::array<uint32_t, 3>{1, 1, 1}));
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+}
+
+TEST_F(MachinedSourceTest, RegistryTimeoutAndLateReplyCannotCompleteNextQuery) {
+  uint32_t expired_calls = 0;
+  const auto expired_id =
+      client_.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.Error().Code(), ErrorCode::kTimeout);
+        ++expired_calls;
+      });
+  MachinedClientTestAccess::ExpireQueries(client_);
+  client_.Tick();
+  EXPECT_EQ(expired_calls, 1u);
+  uint32_t calls = 0;
+  const auto id =
+      client_.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+        ASSERT_TRUE(result);
+        EXPECT_TRUE(result->empty());
+        ++calls;
+      });
+  EXPECT_GT(id, expired_id);
+  machined::QueryResponse response;
+  response.request_id = expired_id;
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 0u);
+  response.request_id = 0;
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 0u);
+  response.request_id = id;
+  Dispatch(channel_, response);
+  client_.Tick();
+  EXPECT_EQ(expired_calls, 1u);
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(MachinedSourceTest, RegistryQueryLimitRejectsAndExpiredQueriesReleaseCapacity) {
+  uint32_t expired = 0;
+  for (size_t i = 0; i < MachinedClient::kMaxPendingQueries; ++i) {
+    ASSERT_NE(client_.QueryAsync(ProcessType::kBaseApp,
+                                 [&](MachinedClient::QueryResult result) {
+                                   ASSERT_FALSE(result);
+                                   EXPECT_EQ(result.Error().Code(), ErrorCode::kTimeout);
+                                   ++expired;
+                                 }),
+              0u);
+  }
+  uint32_t rejected = 0;
+  EXPECT_EQ(client_.QueryAsync(ProcessType::kBaseApp,
+                               [&](MachinedClient::QueryResult result) {
+                                 ASSERT_FALSE(result);
+                                 EXPECT_EQ(result.Error().Code(), ErrorCode::kRateLimited);
+                                 ++rejected;
+                               }),
+            0u);
+  EXPECT_EQ(rejected, 1u);
+  MachinedClientTestAccess::ExpireQueries(client_);
+  client_.Tick();
+  EXPECT_EQ(expired, MachinedClient::kMaxPendingQueries);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+  EXPECT_NE(client_.QueryAsync(ProcessType::kBaseApp, [](auto) {}), 0u);
+}
+
+TEST_F(MachinedSourceTest, RegistryIdsExhaustWithoutReusingOutstandingIds) {
+  MachinedClientTestAccess::SetNextQueryId(client_, UINT64_MAX);
+  uint32_t calls = 0;
+  const auto id =
+      client_.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+        EXPECT_TRUE(result);
+        ++calls;
+      });
+  ASSERT_EQ(id, UINT64_MAX);
+  uint32_t rejected = 0;
+  EXPECT_EQ(client_.QueryAsync(ProcessType::kBaseApp,
+                               [&](MachinedClient::QueryResult result) {
+                                 ASSERT_FALSE(result);
+                                 EXPECT_EQ(result.Error().Code(), ErrorCode::kOutOfRange);
+                                 ++rejected;
+                               }),
+            0u);
+  EXPECT_EQ(rejected, 1u);
+  EXPECT_EQ(calls, 0u);
+  machined::QueryResponse response;
+  response.request_id = id;
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(MachinedSourceTest, SynchronousRegistryQueryHasIndependentCompletion) {
+  ASSERT_TRUE(controller_.InterfaceTable().RegisterTypedHandler<machined::QueryMessage>(
+      [&](const Address&, Channel* channel, const machined::QueryMessage& message) {
+        machined::QueryResponse response;
+        response.request_id = message.request_id;
+        response.processes.emplace_back().process_type = message.process_type;
+        ASSERT_TRUE(channel->SendMessage(response));
+      }));
+  uint32_t calls = 0;
+  client_.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front().process_type, ProcessType::kBaseApp);
+    ++calls;
+  });
+  auto result = client_.QuerySync(ProcessType::kCellApp, Milliseconds(500));
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_EQ(result->front().process_type, ProcessType::kCellApp);
+  EXPECT_EQ(calls, 1u);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+}
+
+TEST_F(MachinedSourceTest, SynchronousRegistryTimeoutRemovesStackCallback) {
+  const auto result = client_.QuerySync(ProcessType::kBaseApp, Duration::zero());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kTimeout);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+  machined::QueryResponse response;
+  response.request_id = 1;
+  Dispatch(channel_, response);
 }
 
 TEST_F(MachinedSourceTest, WatcherResponseRequiresCurrentMachinedChannel) {
@@ -461,10 +627,17 @@ TEST_F(MachinedSourceTest, WatcherResponseRequiresCurrentMachinedChannel) {
 
 TEST_F(MachinedSourceTest, DisconnectedMachinedCannotCompletePendingQuery) {
   uint32_t calls = 0;
-  client_.QueryAsync(ProcessType::kBaseApp, [&](auto) { ++calls; });
+  const auto id =
+      client_.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.Error().Code(), ErrorCode::kConnectionReset);
+        ++calls;
+      });
   IntrusivePtr<Channel> old_channel{channel_};
   network_.DisconnectChannel(controller_.TcpAddress());
-  Dispatch(old_channel.get(), machined::QueryResponse{});
+  machined::QueryResponse response;
+  response.request_id = id;
+  Dispatch(old_channel.get(), response);
   EXPECT_EQ(calls, 0u);
   client_.Tick();
   EXPECT_EQ(calls, 1u);

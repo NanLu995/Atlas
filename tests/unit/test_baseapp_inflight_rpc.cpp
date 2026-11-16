@@ -9,6 +9,7 @@
 #include "baseapp/baseapp.h"
 #include "baseapp/baseapp_messages.h"
 #include "baseapp/baseapp_native_provider.h"
+#include "baseappmgr/baseappmgr_messages.h"
 #include "cellapp/cellapp_messages.h"
 #include "coro/entity_rpc_reply.h"
 #include "entitydef/entity_def_registry.h"
@@ -104,6 +105,17 @@ class BaseAppInflightRpcTest : public ::testing::Test {
   void TearDown() override {
     dispatched_rpcs = 0;
     EntityDefRegistry::Instance().clear();
+  }
+
+  void BindManager(Channel& channel) {
+    app_.baseappmgr_channel_ = &channel;
+    app_.app_id_ = 17;
+  }
+
+  auto AssignedAppId() const -> uint32_t { return app_.app_id_; }
+
+  void RegisterAck(Channel& channel, const baseappmgr::RegisterBaseAppAck& ack) {
+    app_.OnRegisterBaseappAck(channel, ack);
   }
 
   void EnableRpcDispatch() {
@@ -531,6 +543,22 @@ TEST_F(BaseAppInflightRpcTest, RelayPropagatesMalformedReplyCellDisconnectAndSen
     EXPECT_EQ(registry.PendingCount(), 0u);
     EXPECT_EQ(registry.ReplyCount(), 0u);
   }
+}
+
+TEST_F(BaseAppInflightRpcTest, RegisterAckRequiresCurrentManagerChannel) {
+  BindManager(*cell_ch_);
+  RecordingChannel impostor(dispatcher_, table_, cell_addr_);
+  baseappmgr::RegisterBaseAppAck ack;
+  ack.success = true;
+  ack.app_id = 31;
+  RegisterAck(impostor, ack);
+  EXPECT_EQ(AssignedAppId(), 17u);
+  RegisterAck(*cell_ch_, ack);
+  EXPECT_EQ(AssignedAppId(), 31u);
+  cell_ch_->Condemn();
+  ack.app_id = 41;
+  RegisterAck(*cell_ch_, ack);
+  EXPECT_EQ(AssignedAppId(), 31u);
 }
 
 TEST_F(BaseAppInflightRpcTest, RelayTimeoutRestoresClientIdAndRemovesBothRecords) {

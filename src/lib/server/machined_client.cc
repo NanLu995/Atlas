@@ -178,10 +178,17 @@ void MachinedClient::HandleDisconnect() {
 
 void MachinedClient::ExpirePendingRequests() {
   const auto now = Clock::now();
-  if (async_query_ && now - async_query_->issued_at >= request_timeout_) {
-    auto cb = std::move(async_query_->cb);
-    async_query_.reset();
-    if (cb) cb({});
+  std::vector<QueryCallback> expired_queries;
+  for (auto it = pending_queries_.begin(); it != pending_queries_.end();) {
+    if (now - it->second.issued_at < request_timeout_) {
+      ++it;
+      continue;
+    }
+    expired_queries.push_back(std::move(it->second.cb));
+    it = pending_queries_.erase(it);
+  }
+  for (auto& cb : expired_queries) {
+    cb(Error{ErrorCode::kTimeout, "machined registry query timed out"});
   }
 
   std::vector<PendingWatcher> expired;
@@ -201,10 +208,10 @@ void MachinedClient::ExpirePendingRequests() {
 }
 
 void MachinedClient::FailPendingRequests() {
-  if (async_query_) {
-    auto cb = std::move(async_query_->cb);
-    async_query_.reset();
-    if (cb) cb({});
+  auto queries = std::move(pending_queries_);
+  pending_queries_.clear();
+  for (auto& [_, query] : queries) {
+    query.cb(Error{ErrorCode::kConnectionReset, "machined disconnected"});
   }
 
   std::vector<PendingWatcher> pending_watchers;
@@ -239,53 +246,48 @@ void MachinedClient::MaybeReconnect() {
   SendCachedRegister();
 }
 
-auto MachinedClient::QuerySync(ProcessType type, Duration timeout)
-    -> std::vector<machined::ProcessInfo> {
-  if (!IsConnected()) return {};
-
-  machined::QueryMessage msg;
-  msg.process_type = type;
-
-  if (auto r = channel_->SendMessage(msg); !r) {
-    ATLAS_LOG_ERROR("MachinedClient: query_sync failed to send: {}", r.Error().Message());
-    return {};
-  }
-
-  sync_query_.emplace();
-  auto deadline = Clock::now() + timeout;
-
-  while (!sync_query_->done && Clock::now() < deadline) {
+auto MachinedClient::QuerySync(ProcessType type, Duration timeout) -> QueryResult {
+  std::optional<QueryResult> result;
+  const auto id = QueryAsync(type, [&](QueryResult reply) { result = std::move(reply); });
+  const auto deadline = Clock::now() + timeout;
+  while (!result && Clock::now() < deadline) {
     dispatcher_.ProcessOnce();
   }
-
-  auto result = std::move(sync_query_->result);
-  sync_query_.reset();
-  return result;
+  if (result) return std::move(*result);
+  pending_queries_.erase(id);
+  return Error{ErrorCode::kTimeout, "machined registry query timed out"};
 }
 
-void MachinedClient::QueryAsync(ProcessType type, QueryCallback cb) {
+auto MachinedClient::QueryAsync(ProcessType type, QueryCallback cb) -> uint64_t {
+  if (!cb) return 0;
   if (!IsConnected()) {
-    cb({});
-    return;
+    cb(Error{ErrorCode::kConnectionReset, "machined is not connected"});
+    return 0;
   }
-
-  if (async_query_) {
-    auto previous_cb = std::move(async_query_->cb);
-    async_query_.reset();
-    if (previous_cb) previous_cb({});
+  if (pending_queries_.size() >= kMaxPendingQueries) {
+    cb(Error{ErrorCode::kRateLimited, "machined registry query limit reached"});
+    return 0;
   }
-  async_query_ = AsyncQuery{std::move(cb), Clock::now()};
+  if (next_query_request_id_ == 0) {
+    cb(Error{ErrorCode::kOutOfRange, "machined registry query IDs exhausted"});
+    return 0;
+  }
+  const uint64_t id = next_query_request_id_++;
+  pending_queries_.emplace(id, PendingQuery{std::move(cb), Clock::now()});
 
   machined::QueryMessage msg;
+  msg.request_id = id;
   msg.process_type = type;
 
   if (auto r = channel_->SendMessage(msg); !r) {
-    ATLAS_LOG_ERROR("MachinedClient: query_async failed to send: {}", r.Error().Message());
-    if (!async_query_) return;
-    auto cb_local = std::move(async_query_->cb);
-    async_query_.reset();
-    if (cb_local) cb_local({});
+    auto it = pending_queries_.find(id);
+    if (it != pending_queries_.end()) {
+      auto failed = std::move(it->second.cb);
+      pending_queries_.erase(it);
+      failed(r.Error());
+    }
   }
+  return id;
 }
 
 void MachinedClient::Subscribe(machined::ListenerType listener_type, ProcessType target_type,
@@ -427,6 +429,7 @@ void MachinedClient::OnRegisterAck(const Address& src, Channel* ch,
   if (!IsMachinedChannel(ch)) return;
   if (msg.success) {
     registered_ = true;
+    ++registration_generation_;
 
     for (const auto& sub : subscriptions_) {
       machined::ListenerRegister listener_msg;
@@ -455,16 +458,11 @@ void MachinedClient::OnHeartbeatAck(const Address& /*src*/, Channel* /*ch*/,
 void MachinedClient::OnQueryResponse(const Address& /*src*/, Channel* ch,
                                      const machined::QueryResponse& msg) {
   if (!IsMachinedChannel(ch)) return;
-  if (sync_query_.has_value()) {
-    sync_query_->result = msg.processes;
-    sync_query_->done = true;
-    return;
-  }
-  if (async_query_) {
-    auto cb = std::move(async_query_->cb);
-    async_query_.reset();
-    if (cb) cb(msg.processes);
-  }
+  auto it = pending_queries_.find(msg.request_id);
+  if (it == pending_queries_.end()) return;
+  auto cb = std::move(it->second.cb);
+  pending_queries_.erase(it);
+  cb(msg.processes);
 }
 
 void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* ch,

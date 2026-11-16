@@ -379,6 +379,15 @@ void CellAppMgr::RegisterWatchers() {
                          [this](uint32_t app_id) { return SetRetiringAppId(app_id); }));
   wr.Add<bool>("cellappmgr/ha/recovery_window_active",
                std::function<bool()>([this] { return RecoveryWindowActive(); }));
+  wr.Add<std::size_t>("cellappmgr/ha/recovery_pending", std::function<std::size_t()>([this] {
+                        return pending_space_recoveries_.size();
+                      }));
+  wr.Add<std::size_t>("cellappmgr/ha/recovery_bytes",
+                      std::function<std::size_t()>([this] { return pending_recovery_bytes_; }));
+  wr.Add<std::size_t>("cellappmgr/ha/recovery_blocked",
+                      std::function<std::size_t()>([this] { return BlockedRecoveryCount(); }));
+  wr.Add<bool>("cellappmgr/ha/recovery_admission_closed",
+               std::function<bool()>([this] { return recovery_admission_closed_; }));
   wr.Add<std::string>("cellappmgr/ha/recovery_window_status",
                       std::function<std::string()>([this] {
                         const bool active = RecoveryWindowActive();
@@ -387,14 +396,17 @@ void CellAppMgr::RegisterWatchers() {
                                          0, DurationMs(recovery_deadline_ - Clock::now()))
                                    : 0;
                         return std::format(
-                            "state={} active={} remaining_ms={} pending_geometry={}",
+                            "state={} active={} remaining_ms={} pending_geometry={} "
+                            "pending_reports={} blocked_reports={} admission_closed={}",
                             active ? "closed" : "open", active ? 1 : 0, remaining_ms,
-                            pending_geometry_broadcasts_.size());
+                            pending_geometry_broadcasts_.size(), pending_space_recoveries_.size(),
+                            BlockedRecoveryCount(), recovery_admission_closed_ ? 1 : 0);
                       }));
 }
 
 void CellAppMgr::OnTickComplete() {
   ManagerApp::OnTickComplete();
+  ReconsiderSpaceRecoveries();
   DrainPendingGeometryBroadcasts();
   AuditRetireDrainWatchdog();
   DrainExpiredCreateSpaceRequests();
@@ -444,6 +456,7 @@ void CellAppMgr::OnRegisterCellApp(const Address& src, Channel* ch,
     // Idempotent re-register: the worker re-reports its held BSP via
     // RecoverCellAppState right after this ack, so the mgr needs no replay.
     SendRegisterCellAppAck(ch, kInternalAddr, existing.app_id, /*success=*/true, "re-register");
+    ReconsiderSpaceRecoveries();
     ATLAS_LOG_INFO("CellAppMgr: CellApp re-registered app_id={} internal={}:{}",
                    existing.app_id, kInternalAddr.Ip(), kInternalAddr.Port());
     return;
@@ -480,6 +493,7 @@ void CellAppMgr::OnRegisterCellApp(const Address& src, Channel* ch,
   cellapps_.emplace(kInternalAddr, std::move(info));
 
   SendRegisterCellAppAck(ch, kInternalAddr, app_id, /*success=*/true, register_reason);
+  ReconsiderSpaceRecoveries();
 
   ATLAS_LOG_INFO("CellAppMgr: CellApp registered app_id={} internal={}:{} ({})", app_id,
                  kInternalAddr.Ip(), kInternalAddr.Port(), register_reason);
@@ -522,19 +536,29 @@ void CellAppMgr::OnHealthProbe(const Address& src, Channel* ch,
   (void)ch->SendMessage(ack);
 }
 
-void CellAppMgr::OnRecoverCellAppState(const Address& /*src*/, Channel* /*ch*/,
+void CellAppMgr::OnRecoverCellAppState(const Address& src, Channel* ch,
                                        const cellappmgr::RecoverCellAppState& msg) {
-  // BigWorld-style recovery: a surviving CellApp reports the BSP it holds so a
-  // mgr that lacks the topology (fresh start / revive) rebuilds from workers
-  // instead of a snapshot file. Highest reported geometry_version wins; a
-  // space is only rebuilt once every leaf owner is registered, so cell->app
-  // routing resolves (typically the report from the last owner to rejoin).
+  ReconsiderSpaceRecoveries();
+  const auto sender = cellapps_.find(src);
+  if (sender == cellapps_.end() || sender->second.channel != ch ||
+      (ch != nullptr && ch->IsCondemned())) {
+    ATLAS_LOG_WARNING("CellAppMgr: ignoring recovery report from unregistered source {}",
+                      src.ToString());
+    return;
+  }
   for (const auto& sg : msg.spaces) {
     if (sg.space_id == kInvalidSpaceID) continue;
-    if (auto it = spaces_.find(sg.space_id);
-        it != spaces_.end() && it->second.geometry_version >= sg.geometry_version) {
+    auto pending = pending_space_recoveries_.find(sg.space_id);
+    if (pending != pending_space_recoveries_.end() &&
+        (pending->second.blocked || pending->second.geometry_version > sg.geometry_version))
       continue;
-    }
+    const auto installed = spaces_.find(sg.space_id);
+    if (installed != spaces_.end() && (installed->second.recovery_paused ||
+                                       installed->second.geometry_version > sg.geometry_version))
+      continue;
+    if (recovery_admission_closed_ && installed == spaces_.end() &&
+        pending == pending_space_recoveries_.end())
+      continue;
     BinaryReader r(std::span<const std::byte>(sg.bsp_blob.data(), sg.bsp_blob.size()));
     auto bsp = BSPTree::Deserialize(r);
     if (!bsp) {
@@ -542,26 +566,190 @@ void CellAppMgr::OnRecoverCellAppState(const Address& /*src*/, Channel* /*ch*/,
                         bsp.Error().Message());
       continue;
     }
+    if (r.Remaining() != 0) {
+      ATLAS_LOG_WARNING("CellAppMgr: recover bsp has trailing bytes space={}", sg.space_id);
+      continue;
+    }
     const auto leaves = bsp->Leaves();
     if (leaves.empty() || bsp->FindCellById(bsp->PrimaryCellId()) == nullptr) continue;
-    cellappmgr::CellID max_cell = 0;
-    bool all_owners_known = true;
+    bool sender_participates = false;
+    std::set<Address> owners;
+    std::set<cellappmgr::CellID> cell_ids;
+    bool valid_cells = true;
     for (const auto* leaf : leaves) {
-      if (!cellapps_.contains(leaf->cellapp_addr)) {
-        all_owners_known = false;
-        break;
-      }
-      max_cell = std::max(max_cell, leaf->cell_id);
+      if (leaf->cell_id == 0 || !cell_ids.insert(leaf->cell_id).second) valid_cells = false;
+      sender_participates |= leaf->cellapp_addr == src;
+      owners.insert(leaf->cellapp_addr);
     }
-    if (!all_owners_known) continue;
+    if (!sender_participates || !valid_cells) {
+      ATLAS_LOG_WARNING("CellAppMgr: invalid recovery ownership or cell IDs space={} source={}",
+                        sg.space_id, src.ToString());
+      continue;
+    }
+    BinaryWriter canonical;
+    bsp->Serialize(canonical);
+    auto blob = canonical.Detach();
+    if (pending != pending_space_recoveries_.end() &&
+        pending->second.geometry_version == sg.geometry_version) {
+      auto& retained = pending->second;
+      if (retained.blob != blob || retained.freeze_epoch != sg.freeze_epoch || !sg.stable) {
+        PauseSpaceRecovery(sg.space_id, "conflicting or unstable reports");
+      } else {
+        for (auto& owner : retained.owners) {
+          if (owner.address != src) continue;
+          owner.app_id = sender->second.app_id;
+          owner.channel = IntrusivePtr<Channel>{ch};
+        }
+      }
+      continue;
+    }
+    if (installed != spaces_.end() && installed->second.geometry_version == sg.geometry_version) {
+      BinaryWriter current;
+      installed->second.bsp.Serialize(current);
+      if (current.Detach() != blob || installed->second.freeze_epoch != sg.freeze_epoch ||
+          !sg.stable)
+        PauseSpaceRecovery(sg.space_id, "conflicting or unstable reports");
+      continue;
+    }
+    if (pending == pending_space_recoveries_.end()) {
+      if (pending_space_recoveries_.size() >= kMaxPendingRecoveryReports) {
+        PauseSpaceRecovery(sg.space_id, "recovery slots exhausted");
+        continue;
+      }
+      pending = pending_space_recoveries_.try_emplace(sg.space_id).first;
+    }
+    auto& retained = pending->second;
+    const auto previous_bytes =
+        retained.blob.capacity() + retained.owners.capacity() * sizeof(RecoveryOwner);
+    pending_recovery_bytes_ -= previous_bytes;
+    retained.geometry_version = sg.geometry_version;
+    retained.freeze_epoch = sg.freeze_epoch;
+    if (!sg.stable || sg.geometry_version == 0 || sg.freeze_epoch == 0) {
+      pending_recovery_bytes_ += previous_bytes;
+      PauseSpaceRecovery(sg.space_id, "unstable worker snapshot");
+      continue;
+    }
+    std::vector<RecoveryOwner> owner_list;
+    owner_list.reserve(owners.size());
+    for (const auto& address : owners) {
+      owner_list.push_back({address, address == src ? sender->second.app_id : 0,
+                            address == src ? IntrusivePtr<Channel>{ch} : nullptr});
+    }
+    const auto bytes = blob.capacity() + owner_list.capacity() * sizeof(RecoveryOwner);
+    if (bytes > kMaxPendingRecoveryBytes - pending_recovery_bytes_) {
+      pending_recovery_bytes_ += previous_bytes;
+      PauseSpaceRecovery(sg.space_id, "recovery bytes exhausted");
+      continue;
+    }
+    pending_recovery_bytes_ += bytes;
+    retained.blob = std::move(blob);
+    retained.owners = std::move(owner_list);
+  }
+  ReconsiderSpaceRecoveries();
+}
+
+auto CellAppMgr::SpaceRecoveryPaused(SpaceID space_id) const -> bool {
+  if (pending_space_recoveries_.contains(space_id)) return true;
+  const auto installed = spaces_.find(space_id);
+  return installed != spaces_.end() ? installed->second.recovery_paused
+                                    : recovery_admission_closed_;
+}
+
+auto CellAppMgr::BlockedRecoveryCount() const -> std::size_t {
+  const auto pending =
+      std::count_if(pending_space_recoveries_.begin(), pending_space_recoveries_.end(),
+                    [](const auto& entry) { return entry.second.blocked; });
+  const auto installed = std::count_if(spaces_.begin(), spaces_.end(), [](const auto& entry) {
+    return entry.second.recovery_paused;
+  });
+  return static_cast<std::size_t>(pending + installed);
+}
+
+void CellAppMgr::PauseSpaceRecovery(SpaceID space_id, std::string_view reason) {
+  if (auto pending = pending_space_recoveries_.find(space_id);
+      pending != pending_space_recoveries_.end()) {
+    auto& retained = pending->second;
+    if (retained.blocked) return;
+    pending_recovery_bytes_ -=
+        retained.blob.capacity() + retained.owners.capacity() * sizeof(RecoveryOwner);
+    std::vector<std::byte>{}.swap(retained.blob);
+    std::vector<RecoveryOwner>{}.swap(retained.owners);
+    retained.blocked = true;
+  } else if (auto installed = spaces_.find(space_id); installed != spaces_.end()) {
+    if (installed->second.recovery_paused) return;
+    installed->second.recovery_paused = true;
+  } else {
+    recovery_admission_closed_ = true;
+  }
+  ATLAS_LOG_ERROR("CellAppMgr: space recovery paused space={} reason={}", space_id, reason);
+}
+
+void CellAppMgr::ReconsiderSpaceRecoveries() {
+  for (auto it = pending_space_recoveries_.begin(); it != pending_space_recoveries_.end();) {
+    auto& retained = it->second;
+    const auto space_id = it->first;
+    if (retained.blocked) {
+      ++it;
+      continue;
+    }
+    bool all_owners_confirmed = true;
+    bool owner_lost = false;
+    for (const auto& expected : retained.owners) {
+      const auto owner = cellapps_.find(expected.address);
+      if (expected.app_id != 0) {
+        if (owner == cellapps_.end() || owner->second.app_id != expected.app_id ||
+            owner->second.channel != expected.channel.get() ||
+            (expected.channel && expected.channel->IsCondemned())) {
+          owner_lost = true;
+          break;
+        }
+      } else {
+        all_owners_confirmed = false;
+        if (owner == cellapps_.end() || owner->second.channel == nullptr) continue;
+        auto* current = Network().FindChannel(expected.address);
+        if (current != owner->second.channel || current->IsCondemned()) {
+          owner_lost = true;
+          break;
+        }
+      }
+    }
+    if (owner_lost) {
+      PauseSpaceRecovery(space_id, "recovery owner channel lost");
+      ++it;
+      continue;
+    }
+    if (!all_owners_confirmed) {
+      ++it;
+      continue;
+    }
+    BinaryReader reader(retained.blob);
+    auto bsp = BSPTree::Deserialize(reader);
+    if (!bsp || reader.Remaining() != 0) {
+      PauseSpaceRecovery(space_id, "retained geometry invalid");
+      ++it;
+      continue;
+    }
+    cellappmgr::CellID max_cell = 0;
+    for (const auto* leaf : bsp->Leaves()) max_cell = std::max(max_cell, leaf->cell_id);
+    if (max_cell == std::numeric_limits<cellappmgr::CellID>::max() ||
+        retained.geometry_version == UINT64_MAX || retained.freeze_epoch == UINT64_MAX) {
+      PauseSpaceRecovery(space_id, "recovery counters exhausted");
+      ++it;
+      continue;
+    }
     SpacePartition partition;
-    partition.space_id = sg.space_id;
+    partition.space_id = space_id;
+    partition.geometry_version = retained.geometry_version;
+    partition.freeze_epoch = retained.freeze_epoch;
     partition.bsp = std::move(*bsp);
-    partition.geometry_version = sg.geometry_version;
-    spaces_[sg.space_id] = std::move(partition);
+    pending_recovery_bytes_ -=
+        retained.blob.capacity() + retained.owners.capacity() * sizeof(RecoveryOwner);
+    partition.last_broadcast_blob = std::move(retained.blob);
+    spaces_[space_id] = std::move(partition);
     next_cell_id_ = std::max(next_cell_id_, static_cast<cellappmgr::CellID>(max_cell + 1));
-    ATLAS_LOG_INFO("CellAppMgr: rebuilt space={} from worker report (version={}, leaves={})",
-                   sg.space_id, sg.geometry_version, leaves.size());
+    ATLAS_LOG_INFO("CellAppMgr: rebuilt space={} from retained worker report (version={})",
+                   space_id, retained.geometry_version);
+    it = pending_space_recoveries_.erase(it);
   }
 }
 
@@ -573,9 +761,8 @@ void CellAppMgr::OnInformCellLoad(const Address& src, Channel* ch,
     const bool has_sender_identity = ch != nullptr || src != Address{};
     const bool sender_matches = src == addr || (info.channel != nullptr && info.channel == ch);
     if (has_sender_identity && !sender_matches) {
-      ATLAS_LOG_WARNING(
-          "CellAppMgr: ignoring InformCellLoad from {} for app_id={} expected={}",
-          src.ToString(), msg.app_id, addr.ToString());
+      ATLAS_LOG_WARNING("CellAppMgr: ignoring InformCellLoad from {} for app_id={} expected={}",
+                        src.ToString(), msg.app_id, addr.ToString());
       return;
     }
     info.load = std::clamp(msg.load, 0.f, 1.f);
@@ -696,7 +883,8 @@ void CellAppMgr::OnResolveSpaceHostRequest(const Address& src, Channel* ch,
   reply.request_id = msg.request_id;
   reply.entity_id = msg.entity_id;
   reply.space_id = msg.space_id;
-  if (auto it = spaces_.find(msg.space_id); it != spaces_.end()) {
+  if (auto it = spaces_.find(msg.space_id);
+      it != spaces_.end() && !SpaceRecoveryPaused(msg.space_id)) {
     const auto& partition = it->second;
     if (const auto* leaf = partition.bsp.FindCell(msg.position.x, msg.position.z)) {
       reply.found = true;
@@ -706,8 +894,11 @@ void CellAppMgr::OnResolveSpaceHostRequest(const Address& src, Channel* ch,
     }
   }
   if (!reply.found) {
-    ATLAS_LOG_INFO("CellAppMgr: ResolveSpaceHost miss space_id={} pos=({:.1f},{:.1f}) entity={}",
-                   msg.space_id, msg.position.x, msg.position.z, msg.entity_id);
+    ATLAS_LOG_INFO(
+        "CellAppMgr: ResolveSpaceHost miss space_id={} pos=({:.1f},{:.1f}) entity={} "
+        "recovery_paused={}",
+        msg.space_id, msg.position.x, msg.position.z, msg.entity_id,
+        SpaceRecoveryPaused(msg.space_id));
   }
   if (ch != nullptr) {
     if (auto r = ch->SendMessage(reply); !r) {
@@ -719,6 +910,10 @@ void CellAppMgr::OnResolveSpaceHostRequest(const Address& src, Channel* ch,
 
 void CellAppMgr::OnCreateSpaceRequest(const Address& src, Channel* ch,
                                       const cellappmgr::CreateSpaceRequest& msg) {
+  if (SpaceRecoveryPaused(msg.space_id)) {
+    SendCreateSpaceReply(msg, src, ch, false, 0, Address{});
+    return;
+  }
   if (msg.space_id == kInvalidSpaceID) {
     ATLAS_LOG_WARNING("CellAppMgr: CreateSpaceRequest with invalid space_id=0");
     SendCreateSpaceReply(msg, src, ch, /*ok=*/false, 0, Address{});
@@ -759,6 +954,10 @@ void CellAppMgr::OnCreateSpaceRequest(const Address& src, Channel* ch,
 
 void CellAppMgr::ExecuteCreateSpace(const cellappmgr::CreateSpaceRequest& msg, const Address& src,
                                     Channel* ch) {
+  if (SpaceRecoveryPaused(msg.space_id)) {
+    SendCreateSpaceReply(msg, src, ch, false, 0, Address{});
+    return;
+  }
   if (const auto existing = spaces_.find(msg.space_id); existing != spaces_.end()) {
     const auto& partition = existing->second;
     const auto* primary = partition.bsp.FindCellById(partition.bsp.PrimaryCellId());
@@ -1010,6 +1209,7 @@ void CellAppMgr::GrowSpacesForNewCellApp(const CellAppInfo& new_app) {
   if (!IsAssignableForLb(new_app, Clock::now())) return;
   const auto assignable_count = AssignableCellAppCount();
   for (auto& [_, partition] : spaces_) {
+    if (SpaceRecoveryPaused(partition.space_id)) continue;
     if (partition.bsp.Leaves().size() >= assignable_count) continue;
     const auto* target = PickHeaviestLeaf(partition);
     if (target == nullptr) continue;
@@ -1333,6 +1533,7 @@ auto CellAppMgr::TryRetireHandoffLeaf(SpacePartition& partition) -> bool {
 
 void CellAppMgr::OnAddCellToSpaceAck(const Address& src, Channel* ch,
                                      const cellappmgr::AddCellToSpaceAck& msg) {
+  if (SpaceRecoveryPaused(msg.space_id)) return;
   auto it = std::find_if(pending_geometry_broadcasts_.begin(), pending_geometry_broadcasts_.end(),
                          [&](const PendingGeometryBroadcast& p) {
                            return p.space_id == msg.space_id && p.awaiting_cell_id == msg.cell_id;
@@ -1376,6 +1577,10 @@ void CellAppMgr::DrainPendingGeometryBroadcasts() {
   if (pending_geometry_broadcasts_.empty()) return;
   const auto now = Clock::now();
   for (auto it = pending_geometry_broadcasts_.begin(); it != pending_geometry_broadcasts_.end();) {
+    if (SpaceRecoveryPaused(it->space_id)) {
+      ++it;
+      continue;
+    }
     if (now - it->sent_at < kPendingGeometryTimeout) {
       ++it;
       continue;
@@ -1448,6 +1653,12 @@ void CellAppMgr::AuditRetireDrainWatchdog() {
 }
 
 void CellAppMgr::OnCellAppDeath(const Address& internal_addr, uint8_t reason) {
+  for (const auto& [space_id, retained] : pending_space_recoveries_) {
+    if (std::any_of(retained.owners.begin(), retained.owners.end(),
+                    [&](const auto& owner) { return owner.address == internal_addr; })) {
+      PauseSpaceRecovery(space_id, "recovery owner lost");
+    }
+  }
   auto it = cellapps_.find(internal_addr);
   if (it == cellapps_.end()) return;
   const uint32_t dead_app_id = it->second.app_id;
@@ -1496,6 +1707,7 @@ void CellAppMgr::OnCellAppDeath(const Address& internal_addr, uint8_t reason) {
   std::vector<baseapp::CellAppDeath::RehomeCell> rehome_cells;
 
   for (auto& [space_id, partition] : spaces_) {
+    if (SpaceRecoveryPaused(space_id)) continue;
     // Snapshot first because Unsplit mutates the tree mid-iteration.
     std::vector<cellappmgr::CellID> orphan_ids;
     for (const auto* leaf : partition.bsp.Leaves()) {
@@ -1592,6 +1804,7 @@ void CellAppMgr::TickLoadBalance() {
   if (spaces_.empty()) return;
   if (RecoveryWindowActive()) return;
   for (auto& [space_id, partition] : spaces_) {
+    if (SpaceRecoveryPaused(space_id)) continue;
     if (HasPendingGeometryBroadcast(space_id)) continue;
     const auto before_blob = partition.last_broadcast_blob;
     const auto before_version = partition.geometry_version;
@@ -2015,6 +2228,7 @@ auto CellAppMgr::HandleRetireDrainReport(
                            return drain.source_addr == source_addr && drain.cell_id == rep.cell_id;
                          });
   if (it == retire_drains_.end()) return false;
+  if (SpaceRecoveryPaused(it->space_id)) return true;
 
   if (rep.entity_count != it->last_entity_count) it->last_progress_at = Clock::now();
   it->last_entity_count = rep.entity_count;
@@ -2111,6 +2325,7 @@ void CellAppMgr::SendRemoveCell(const CellAppInfo& target, SpaceID space_id,
 
 void CellAppMgr::BroadcastGeometry(
     SpacePartition& partition, std::span<const ExtraGeometryRecipient> extra_recipients) {
+  if (SpaceRecoveryPaused(partition.space_id)) return;
   BinaryWriter w;
   partition.bsp.Serialize(w);
   auto blob = w.Detach();

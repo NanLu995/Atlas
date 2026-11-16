@@ -178,6 +178,7 @@ auto DispatchFrameImpl(InterfaceTable& interface_table, const Address& remote, C
     }
 
     if (interface_table.TryPreDispatch(channel, id, *payload_span)) {
+      if (channel != nullptr && channel->IsCondemned()) return frame_data.size();
       last_safe_pos = reader.Position();
       if (Clock::now() >= deadline) return last_safe_pos;
       continue;
@@ -205,6 +206,7 @@ auto DispatchFrameImpl(InterfaceTable& interface_table, const Address& remote, C
     }
 
     last_safe_pos = reader.Position();
+    if (channel != nullptr && channel->IsCondemned()) return frame_data.size();
     if (Clock::now() >= deadline) return last_safe_pos;
   }
   return frame_data.size();

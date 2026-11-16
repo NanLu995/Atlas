@@ -364,6 +364,8 @@ class BaseApp : public EntityApp {
   uint32_t dbapp_shard_table_version_{0};
   uint32_t next_dbapp_shard_table_request_id_{1};
   Channel* baseappmgr_channel_{nullptr};
+  Address baseappmgr_addr_;
+  uint64_t baseappmgr_instance_{0};
   // Per-entity routing (which CellApp owns its Real) lives on
   // BaseEntity.cell_addr_; registry handles Birth/Death + self-filter.
   CellAppPeerRegistry cellapp_peers_;

@@ -273,7 +273,12 @@ void BSPInternal::Serialize(BinaryWriter& w) const {
 
 namespace {
 
-auto DeserializeNode(BinaryReader& r) -> Result<std::unique_ptr<BSPNode>> {
+auto DeserializeNode(BinaryReader& r, std::size_t depth, std::size_t& remaining)
+    -> Result<std::unique_ptr<BSPNode>> {
+  if (depth > BSPTree::kMaxDeserializeDepth || remaining == 0) {
+    return Error{ErrorCode::kInvalidArgument, "BSPTree: decode limit exceeded"};
+  }
+  --remaining;
   auto tag = r.Read<uint8_t>();
   if (!tag) return Error{ErrorCode::kInvalidArgument, "BSPNode: truncated tag"};
   if (*tag == 0) {
@@ -293,9 +298,9 @@ auto DeserializeNode(BinaryReader& r) -> Result<std::unique_ptr<BSPNode>> {
     auto pos = r.Read<float>();
     if (!axis || !pos) return Error{ErrorCode::kInvalidArgument, "BSPInternal: truncated"};
     if (*axis > 1) return Error{ErrorCode::kInvalidArgument, "BSPInternal: bad axis"};
-    auto left = DeserializeNode(r);
+    auto left = DeserializeNode(r, depth + 1, remaining);
     if (!left) return left.Error();
-    auto right = DeserializeNode(r);
+    auto right = DeserializeNode(r, depth + 1, remaining);
     if (!right) return right.Error();
     return std::unique_ptr<BSPNode>{std::make_unique<BSPInternal>(
         static_cast<BSPAxis>(*axis), *pos, std::move(*left), std::move(*right))};
@@ -530,7 +535,8 @@ auto BSPTree::Deserialize(BinaryReader& r) -> Result<BSPTree> {
   BSPTree t;
   t.root_bounds_ = *root_bounds;
   if (*has_root != 0) {
-    auto node = DeserializeNode(r);
+    auto remaining = kMaxDeserializeNodes;
+    auto node = DeserializeNode(r, 0, remaining);
     if (!node) return node.Error();
     t.root_ = std::move(*node);
     t.root_->PropagateBounds(t.root_bounds_);

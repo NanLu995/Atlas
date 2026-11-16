@@ -14,6 +14,7 @@
 
 #include "cellappmgr/bsp_tree.h"
 #include "serialization/binary_stream.h"
+#include "test_bsp_wire.h"
 
 using namespace atlas;
 
@@ -571,4 +572,40 @@ TEST(BSPTree, Unsplit_RejectsUnknownCellId) {
   ASSERT_TRUE(t.Split(1, BSPAxis::kX, 0.f, MakeLeafInfo(2, 30002)).HasValue());
   auto r = t.Unsplit(99);
   EXPECT_FALSE(r.HasValue());
+}
+
+TEST(BSPTree, DeserializeBoundsRecursiveDepth) {
+  for (auto depth : {BSPTree::kMaxDeserializeDepth, BSPTree::kMaxDeserializeDepth + 1}) {
+    SCOPED_TRACE(depth);
+    BinaryWriter writer;
+    CellBounds{0.f, 0.f, 1.f, 1.f}.Serialize(writer);
+    writer.Write(uint8_t{1});
+    for (std::size_t i = 0; i < depth; ++i) {
+      writer.Write(uint8_t{1});
+      writer.Write(uint8_t{0});
+      writer.Write(std::ldexp(1.f, -static_cast<int>(i + 1)));
+    }
+    const Address owner("127.0.0.1", 30001);
+    test_support::WriteBspLeaf(writer, 1, owner);
+    for (std::size_t i = 0; i < depth; ++i) {
+      test_support::WriteBspLeaf(writer, static_cast<uint32_t>(i + 2), owner);
+    }
+    BinaryReader reader(writer.Data());
+    auto result = BSPTree::Deserialize(reader);
+    EXPECT_EQ(result.HasValue(), depth == BSPTree::kMaxDeserializeDepth);
+  }
+}
+
+TEST(BSPTree, DeserializeBoundsTotalNodeCount) {
+  const Address owner("127.0.0.1", 30001);
+  auto blob = test_support::BalancedBspBlob(12, owner, owner);
+  BinaryReader reader(blob);
+  auto result = BSPTree::Deserialize(reader);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->Leaves().size() * 2 - 1, BSPTree::kMaxDeserializeNodes);
+  auto oversized = test_support::BalancedBspBlob(13, owner, owner);
+  BinaryReader invalid(oversized);
+  auto rejected = BSPTree::Deserialize(invalid);
+  ASSERT_FALSE(rejected);
+  EXPECT_EQ(rejected.Error().Code(), ErrorCode::kInvalidArgument);
 }

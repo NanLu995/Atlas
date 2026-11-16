@@ -26,9 +26,11 @@
 #include "network/interface_table.h"
 #include "network/machined_types.h"
 #include "network/network_interface.h"
+#include "network/udp_channel.h"
 #include "platform/filesystem.h"
 #include "platform/io_poller.h"
 #include "serialization/binary_stream.h"
+#include "test_bsp_wire.h"
 
 namespace atlas {
 namespace {
@@ -2164,9 +2166,27 @@ auto MakeRecoverReport(CellAppMgrHarness& src, SpaceID space_id)
   cellappmgr::RecoverCellAppState::SpaceGeometry geom;
   geom.space_id = space_id;
   geom.geometry_version = partition.geometry_version;
+  geom.freeze_epoch = partition.freeze_epoch;
+  geom.stable = true;
   geom.bsp_blob.assign(blob.begin(), blob.end());
   report.spaces.push_back(std::move(geom));
   return report;
+}
+
+auto MakeTwoOwnerRecoverReport(SpaceID space_id) -> cellappmgr::RecoverCellAppState {
+  CellAppMgrHarness source;
+  for (auto port : {uint16_t{30001}, uint16_t{30002}}) {
+    cellappmgr::RegisterCellApp reg;
+    reg.internal_addr = MakePeerAddr(port);
+    source.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  }
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = space_id;
+  create.initial_cell_count = 2;
+  source.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  source.mgr.SpacesForTest().at(space_id).geometry_version = 10;
+  source.mgr.SpacesForTest().at(space_id).freeze_epoch = 7;
+  return MakeRecoverReport(source, space_id);
 }
 
 TEST(CellAppMgr, RegisterAdoptsKnownAppIdOnSnapshotlessRecovery) {
@@ -2260,17 +2280,23 @@ TEST(CellAppMgr, RecoverCellAppStateSkipsWhenLeafOwnerUnknown) {
   cellappmgr::RegisterCellApp reg;
   reg.internal_addr = MakePeerAddr(30001);
   src.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  cellappmgr::RegisterCellApp other;
+  other.internal_addr = MakePeerAddr(30002);
+  src.mgr.OnRegisterCellApp(other.internal_addr, nullptr, other);
   cellappmgr::CreateSpaceRequest csr;
   csr.space_id = 51;
+  csr.initial_cell_count = 2;
   src.mgr.OnCreateSpaceRequest(Address{}, nullptr, csr);
+  ASSERT_EQ(src.mgr.Spaces().at(csr.space_id).bsp.Leaves().size(), 2u);
   const auto report = MakeRecoverReport(src, 51);
 
-  // Owner never registered on the fresh mgr → cell->app routing can't resolve,
-  // so the rebuild is deferred (the report from the last owner to rejoin
-  // installs it). Space stays absent.
   CellAppMgrHarness recovered;
+  recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
   recovered.mgr.OnRecoverCellAppState(reg.internal_addr, nullptr, report);
   EXPECT_FALSE(recovered.mgr.Spaces().contains(51));
+  recovered.mgr.OnRegisterCellApp(other.internal_addr, nullptr, other);
+  recovered.mgr.OnRecoverCellAppState(other.internal_addr, nullptr, report);
+  EXPECT_TRUE(recovered.mgr.Spaces().contains(51));
 }
 
 TEST(CellAppMgr, RecoverCellAppStateIgnoresVersionNotNewerThanExisting) {
@@ -2301,6 +2327,483 @@ TEST(CellAppMgr, RecoverCellAppStateIgnoresVersionNotNewerThanExisting) {
   ASSERT_FALSE(leaves.empty());
   EXPECT_EQ(leaves[0]->cellapp_addr, reg_a.internal_addr)
       << "equal-version report overwrote the existing partition";
+}
+
+TEST(CellAppMgr, RecoverCellAppStateRejectsUnregisteredAndMismatchedSources) {
+  CellAppMgrHarness src;
+  cellappmgr::RegisterCellApp reg;
+  reg.internal_addr = MakePeerAddr(30001);
+  src.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 53;
+  src.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  const auto report = MakeRecoverReport(src, create.space_id);
+
+  for (int variant = 0; variant < 4; ++variant) {
+    SCOPED_TRACE(variant);
+    CellAppMgrHarness recovered;
+    InterfaceTable table;
+    auto owner = make_intrusive<RecordingChannel>(recovered.dispatcher, table, reg.internal_addr);
+    RecordingChannel impostor(recovered.dispatcher, table, reg.internal_addr);
+    recovered.mgr.OnRegisterCellApp(reg.internal_addr, owner.get(), reg);
+    const std::vector<std::pair<Address, Channel*>> invalid_sources{
+        {MakePeerAddr(30002), owner.get()},
+        {reg.internal_addr, &impostor},
+        {reg.internal_addr, nullptr},
+        {MakePeerAddr(30002), nullptr}};
+    recovered.mgr.OnRecoverCellAppState(invalid_sources[variant].first,
+                                        invalid_sources[variant].second, report);
+    EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+    recovered.mgr.OnRecoverCellAppState(reg.internal_addr, owner.get(), report);
+    EXPECT_TRUE(recovered.mgr.Spaces().contains(create.space_id));
+  }
+}
+
+TEST(CellAppMgr, RecoverCellAppStateRejectsCondemnedRegisteredChannel) {
+  CellAppMgrHarness src;
+  cellappmgr::RegisterCellApp reg;
+  reg.internal_addr = MakePeerAddr(30001);
+  src.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 54;
+  src.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  const auto report = MakeRecoverReport(src, create.space_id);
+
+  CellAppMgrHarness recovered;
+  InterfaceTable table;
+  auto owner = make_intrusive<RecordingChannel>(recovered.dispatcher, table, reg.internal_addr);
+  recovered.mgr.OnRegisterCellApp(reg.internal_addr, owner.get(), reg);
+  owner->Condemn();
+  recovered.mgr.OnRecoverCellAppState(reg.internal_addr, owner.get(), report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+}
+
+TEST(CellAppMgr, RecoverCellAppStateRejectsReportFromNonParticipant) {
+  CellAppMgrHarness src;
+  cellappmgr::RegisterCellApp owner;
+  owner.internal_addr = MakePeerAddr(30001);
+  src.mgr.OnRegisterCellApp(owner.internal_addr, nullptr, owner);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 55;
+  src.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  const auto report = MakeRecoverReport(src, create.space_id);
+
+  CellAppMgrHarness recovered;
+  recovered.mgr.OnRegisterCellApp(owner.internal_addr, nullptr, owner);
+  cellappmgr::RegisterCellApp other;
+  other.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(other.internal_addr, nullptr, other);
+  recovered.mgr.OnRecoverCellAppState(other.internal_addr, nullptr, report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  recovered.mgr.OnRecoverCellAppState(owner.internal_addr, nullptr, report);
+  EXPECT_TRUE(recovered.mgr.Spaces().contains(create.space_id));
+}
+
+TEST(CellAppMgr, RecoverCellAppStateRejectsTruncatedAndTrailingBsp) {
+  CellAppMgrHarness src;
+  cellappmgr::RegisterCellApp reg;
+  reg.internal_addr = MakePeerAddr(30001);
+  src.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 56;
+  src.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  const auto report = MakeRecoverReport(src, create.space_id);
+
+  CellAppMgrHarness recovered;
+  recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  auto truncated = report;
+  truncated.spaces.front().bsp_blob.pop_back();
+  recovered.mgr.OnRecoverCellAppState(reg.internal_addr, nullptr, truncated);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  auto trailing = report;
+  trailing.spaces.front().bsp_blob.push_back(std::byte{1});
+  recovered.mgr.OnRecoverCellAppState(reg.internal_addr, nullptr, trailing);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  recovered.mgr.OnRecoverCellAppState(reg.internal_addr, nullptr, report);
+  EXPECT_TRUE(recovered.mgr.Spaces().contains(create.space_id));
+}
+
+TEST(CellAppMgr, RecoveryRequiresMatchingReportFromEveryOwner) {
+  CellAppMgrHarness recovered;
+  const auto report = MakeTwoOwnerRecoverReport(66);
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(66));
+  recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, report);
+  ASSERT_TRUE(recovered.mgr.Spaces().contains(66));
+  recovered.mgr.TickLoadBalance();
+  EXPECT_EQ(recovered.mgr.Spaces().at(66).geometry_version, 10u);
+  EXPECT_EQ(recovered.mgr.Spaces().at(66).freeze_epoch, 7u);
+}
+
+TEST(CellAppMgr, RecoveryPausesUnstableConflictingAndExhaustedEpochs) {
+  for (int variant = 0; variant != 6; ++variant) {
+    SCOPED_TRACE(variant);
+    CellAppMgrHarness recovered;
+    recovered.mgr.RegisterWatchersForTest();
+    for (auto port : {uint16_t{30001}, uint16_t{30002}}) {
+      cellappmgr::RegisterCellApp reg;
+      reg.internal_addr = MakePeerAddr(port);
+      recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+    }
+    auto first = MakeTwoOwnerRecoverReport(67);
+    if (variant == 0) first.spaces.front().stable = false;
+    if (variant == 1) first.spaces.front().freeze_epoch = 0;
+    if (variant == 2) first.spaces.front().freeze_epoch = UINT64_MAX;
+    if (variant == 3) first.spaces.front().geometry_version = UINT64_MAX;
+    recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30001), nullptr, first);
+    auto second = first;
+    if (variant == 4) ++second.spaces.front().freeze_epoch;
+    if (variant == 5) second.spaces.front().stable = false;
+    recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30002), nullptr, second);
+    EXPECT_FALSE(recovered.mgr.Spaces().contains(67));
+    EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+    EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_bytes"), "0");
+  }
+}
+
+TEST(CellAppMgr, RecoveryCannotReplaceDeferredNewerGeometryWithAnOlderReport) {
+  CellAppMgrHarness src;
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  src.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  src.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 57;
+  create.initial_cell_count = 2;
+  src.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  ASSERT_EQ(src.mgr.Spaces().at(create.space_id).bsp.Leaves().size(), 2u);
+  src.mgr.SpacesForTest().at(create.space_id).geometry_version = 10;
+  const auto latest = MakeRecoverReport(src, create.space_id);
+  auto older = latest;
+  older.spaces.front().geometry_version = 9;
+
+  CellAppMgrHarness recovered;
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, latest);
+  ASSERT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, older);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(create.space_id));
+  recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, latest);
+  ASSERT_TRUE(recovered.mgr.Spaces().contains(create.space_id));
+  EXPECT_EQ(recovered.mgr.Spaces().at(create.space_id).geometry_version, 10u);
+}
+
+TEST(CellAppMgr, DeferredRecoveryKeepsNewestAndReleasesBudgetAfterInstallation) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  auto& watchers = recovered.mgr.GetWatcherRegistry();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  auto report = MakeTwoOwnerRecoverReport(58);
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_pending"), "1");
+  cellappmgr::CreateSpaceRequest duplicate;
+  duplicate.space_id = 58;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, duplicate);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(58));
+  const auto bytes = watchers.Get("cellappmgr/ha/recovery_bytes");
+  EXPECT_NE(bytes, "0");
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_bytes"), bytes);
+  report.spaces.front().geometry_version = 11;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_bytes"), bytes);
+  report.spaces.front().geometry_version = 9;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(58));
+  report.spaces.front().geometry_version = 11;
+  recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, report);
+  ASSERT_TRUE(recovered.mgr.Spaces().contains(58));
+  EXPECT_EQ(recovered.mgr.Spaces().at(58).geometry_version, 11u);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_pending"), "0");
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_bytes"), "0");
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_blocked"), "0");
+}
+
+TEST(CellAppMgr, DeferredRecoverySourceLossRemainsPausedAfterAddressReuse) {
+  for (bool death : {false, true}) {
+    SCOPED_TRACE(death);
+    CellAppMgrHarness recovered;
+    recovered.mgr.RegisterWatchersForTest();
+    InterfaceTable table;
+    cellappmgr::RegisterCellApp first;
+    first.internal_addr = MakePeerAddr(30001);
+    auto channel =
+        make_intrusive<RecordingChannel>(recovered.dispatcher, table, first.internal_addr);
+    recovered.mgr.OnRegisterCellApp(first.internal_addr, channel.get(), first);
+    const auto report = MakeTwoOwnerRecoverReport(59);
+    recovered.mgr.OnRecoverCellAppState(first.internal_addr, channel.get(), report);
+    if (death)
+      recovered.mgr.OnCellAppDeath(first.internal_addr, 1);
+    else
+      channel->Condemn();
+    recovered.mgr.OnTickCompleteForTest();
+    auto replacement =
+        make_intrusive<RecordingChannel>(recovered.dispatcher, table, first.internal_addr);
+    if (death) recovered.mgr.OnRegisterCellApp(first.internal_addr, replacement.get(), first);
+    cellappmgr::RegisterCellApp second;
+    second.internal_addr = MakePeerAddr(30002);
+    recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+    recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, report);
+    EXPECT_FALSE(recovered.mgr.Spaces().contains(59));
+    EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+    EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_bytes"), "0");
+  }
+}
+
+TEST(CellAppMgr, ConflictingPendingReportsPauseOnlyTheirSpace) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  auto report = MakeTwoOwnerRecoverReport(60);
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  BinaryReader reader(report.spaces.front().bsp_blob);
+  auto other = BSPTree::Deserialize(reader);
+  ASSERT_TRUE(other);
+  auto leaves = other->LeavesMutable();
+  leaves.back()->cellapp_addr = MakePeerAddr(30003);
+  BinaryWriter writer;
+  other->Serialize(writer);
+  report.spaces.front().bsp_blob = writer.Detach();
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_bytes"), "0");
+  for (auto port : {uint16_t{30002}, uint16_t{30003}}) {
+    cellappmgr::RegisterCellApp reg;
+    reg.internal_addr = MakePeerAddr(port);
+    recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  }
+  report.spaces.front().geometry_version = 11;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(60));
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 60;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(60));
+  create.space_id = 61;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  EXPECT_TRUE(recovered.mgr.Spaces().contains(61));
+}
+
+TEST(CellAppMgr, DeferredRecoveryDoesNotTrustAnOwnerReplacementAfterDeath) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  const auto report = MakeTwoOwnerRecoverReport(64);
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  recovered.mgr.OnCellAppDeath(MakePeerAddr(30002), 1);
+  cellappmgr::RegisterCellApp replacement;
+  replacement.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(replacement.internal_addr, nullptr, replacement);
+  recovered.mgr.OnRecoverCellAppState(replacement.internal_addr, nullptr, report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(64));
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_bytes"), "0");
+}
+
+TEST(CellAppMgr, RecoveryPausesWhenAnotherRegisteredOwnerChannelIsCondemned) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  ASSERT_TRUE(recovered.network.StartUdp(Address{}));
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  auto channel = recovered.network.ConnectUdp(second.internal_addr);
+  ASSERT_TRUE(channel);
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, *channel, second);
+  (*channel)->Condemn();
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, MakeTwoOwnerRecoverReport(65));
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(65));
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+}
+
+TEST(CellAppMgr, RecoveryRejectsInvalidCellIdsAndStopsAtIdExhaustion) {
+  for (auto invalid : {uint32_t{0}, uint32_t{1}, UINT32_MAX}) {
+    SCOPED_TRACE(invalid);
+    CellAppMgrHarness recovered;
+    recovered.mgr.RegisterWatchersForTest();
+    for (auto port : {uint16_t{30001}, uint16_t{30002}}) {
+      cellappmgr::RegisterCellApp reg;
+      reg.internal_addr = MakePeerAddr(port);
+      recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+    }
+    auto report = MakeTwoOwnerRecoverReport(65);
+    BinaryReader reader(report.spaces.front().bsp_blob);
+    auto bsp = BSPTree::Deserialize(reader);
+    ASSERT_TRUE(bsp);
+    bsp->LeavesMutable().back()->cell_id = invalid;
+    BinaryWriter writer;
+    bsp->Serialize(writer);
+    report.spaces.front().bsp_blob = writer.Detach();
+    recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30001), nullptr, report);
+    recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30002), nullptr, report);
+    EXPECT_FALSE(recovered.mgr.Spaces().contains(65));
+    EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"),
+              invalid == UINT32_MAX ? "1" : "0");
+  }
+}
+
+TEST(CellAppMgr, RecoverySlotExhaustionClosesOnlyNewSpaceAdmission) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 100;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  auto report = MakeTwoOwnerRecoverReport(101);
+  for (std::size_t i = 0; i < CellAppMgr::kMaxPendingRecoveryReports; ++i) {
+    report.spaces.front().space_id = static_cast<SpaceID>(101 + i);
+    report.spaces.front().bsp_blob = test_support::BalancedBspBlob(
+        1, first.internal_addr, MakePeerAddr(30002), static_cast<uint32_t>(2 + 2 * i));
+    recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  }
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_pending"),
+            std::to_string(CellAppMgr::kMaxPendingRecoveryReports));
+  report.spaces.front().space_id = 5000;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_admission_closed"),
+            "true");
+  create.space_id = 5000;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(5000));
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  for (std::size_t i = 0; i < CellAppMgr::kMaxPendingRecoveryReports; ++i) {
+    report.spaces.front().space_id = static_cast<SpaceID>(101 + i);
+    report.spaces.front().bsp_blob = test_support::BalancedBspBlob(
+        1, first.internal_addr, second.internal_addr, static_cast<uint32_t>(2 + 2 * i));
+    recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, report);
+  }
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_pending"), "0");
+  report.spaces.front().space_id = 5000;
+  report.spaces.front().geometry_version = 9;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(5000));
+  EXPECT_TRUE(recovered.mgr.Spaces().contains(100));
+}
+
+TEST(CellAppMgr, ConflictingInstalledRecoveryStopsRoutingAndTopologyChanges) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  for (auto port : {uint16_t{30001}, uint16_t{30002}}) {
+    cellappmgr::RegisterCellApp reg;
+    reg.internal_addr = MakePeerAddr(port);
+    recovered.mgr.OnRegisterCellApp(reg.internal_addr, nullptr, reg);
+  }
+  auto report = MakeTwoOwnerRecoverReport(62);
+  recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30001), nullptr, report);
+  recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30002), nullptr, report);
+  ASSERT_TRUE(recovered.mgr.Spaces().contains(62));
+  cellappmgr::CreateSpaceRequest create;
+  create.space_id = 63;
+  recovered.mgr.OnCreateSpaceRequest(Address{}, nullptr, create);
+  InterfaceTable table;
+  auto resolves = [&](SpaceID space_id) {
+    RecordingChannel channel(recovered.dispatcher, table, MakePeerAddr(30010));
+    cellappmgr::ResolveSpaceHostRequest request;
+    request.space_id = space_id;
+    recovered.mgr.OnResolveSpaceHostRequest(MakePeerAddr(30010), &channel, request);
+    if (channel.Sends().empty()) {
+      ADD_FAILURE() << "missing resolve reply";
+      return false;
+    }
+    BinaryReader reader(channel.Sends().back());
+    auto id = reader.ReadPackedInt();
+    EXPECT_TRUE(id);
+    if (!id) return false;
+    EXPECT_EQ(*id, cellappmgr::ResolveSpaceHostReply::Descriptor().id);
+    auto reply = cellappmgr::ResolveSpaceHostReply::Deserialize(reader);
+    EXPECT_TRUE(reply);
+    return reply && reply->found;
+  };
+  EXPECT_TRUE(resolves(62));
+  EXPECT_TRUE(resolves(63));
+  BinaryReader reader(report.spaces.front().bsp_blob);
+  auto other = BSPTree::Deserialize(reader);
+  ASSERT_TRUE(other);
+  other->LeavesMutable().back()->cell_id = 99;
+  BinaryWriter writer;
+  other->Serialize(writer);
+  report.spaces.front().bsp_blob = writer.Detach();
+  recovered.mgr.OnRecoverCellAppState(MakePeerAddr(30001), nullptr, report);
+  EXPECT_FALSE(resolves(62));
+  EXPECT_TRUE(resolves(63));
+  EXPECT_EQ(recovered.mgr.GetWatcherRegistry().Get("cellappmgr/ha/recovery_blocked"), "1");
+  recovered.mgr.TickLoadBalance();
+  recovered.mgr.OnCellAppDeath(MakePeerAddr(30002), 1);
+  EXPECT_EQ(recovered.mgr.Spaces().at(62).geometry_version, 10u);
+  create.space_id = 62;
+  create.reuse_existing = true;
+  RecordingChannel channel(recovered.dispatcher, table, MakePeerAddr(30010));
+  recovered.mgr.OnCreateSpaceRequest(MakePeerAddr(30010), &channel, create);
+  EXPECT_FALSE(LastSpaceReply(channel).success);
+}
+
+TEST(CellAppMgr, RecoveryByteBudgetPausesWithoutEvictingHighestReports) {
+  CellAppMgrHarness recovered;
+  recovered.mgr.RegisterWatchersForTest();
+  auto& watchers = recovered.mgr.GetWatcherRegistry();
+  cellappmgr::RegisterCellApp first;
+  first.internal_addr = MakePeerAddr(30001);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, nullptr, first);
+  auto report = MakeTwoOwnerRecoverReport(6000);
+  std::size_t accepted = 0;
+  for (; accepted < CellAppMgr::kMaxPendingRecoveryReports; ++accepted) {
+    report.spaces.front().space_id = static_cast<SpaceID>(6000 + accepted);
+    report.spaces.front().bsp_blob = test_support::BalancedBspBlob(
+        12, first.internal_addr, MakePeerAddr(static_cast<uint16_t>(30002 + accepted)),
+        static_cast<uint32_t>(1 + accepted * 4096));
+    recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+    const auto used = std::stoull(watchers.Get("cellappmgr/ha/recovery_bytes").value());
+    EXPECT_LE(used, CellAppMgr::kMaxPendingRecoveryBytes);
+    if (watchers.Get("cellappmgr/ha/recovery_blocked") == "1") break;
+  }
+  ASSERT_GT(accepted, 0u);
+  ASSERT_LT(accepted, CellAppMgr::kMaxPendingRecoveryReports);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_admission_closed"), "false");
+  cellappmgr::RegisterCellApp second;
+  second.internal_addr = MakePeerAddr(30002);
+  recovered.mgr.OnRegisterCellApp(second.internal_addr, nullptr, second);
+  const auto rejected_space = report.spaces.front().space_id;
+  report.spaces.front().space_id = 6000;
+  report.spaces.front().bsp_blob =
+      test_support::BalancedBspBlob(12, first.internal_addr, second.internal_addr, 1);
+  recovered.mgr.OnRecoverCellAppState(second.internal_addr, nullptr, report);
+  ASSERT_TRUE(recovered.mgr.Spaces().contains(6000));
+  EXPECT_EQ(recovered.mgr.Spaces().at(6000).geometry_version, 10u);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(rejected_space));
+  InterfaceTable table;
+  auto replacement =
+      make_intrusive<RecordingChannel>(recovered.dispatcher, table, first.internal_addr);
+  recovered.mgr.OnRegisterCellApp(first.internal_addr, replacement.get(), first);
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_bytes"), "0");
+  EXPECT_EQ(watchers.Get("cellappmgr/ha/recovery_pending"), std::to_string(accepted));
+  report.spaces.front().geometry_version = 9;
+  recovered.mgr.OnRecoverCellAppState(first.internal_addr, nullptr, report);
+  EXPECT_FALSE(recovered.mgr.Spaces().contains(rejected_space));
 }
 
 }  // namespace

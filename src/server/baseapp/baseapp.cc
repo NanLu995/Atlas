@@ -261,31 +261,39 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
       });
 
   GetMachinedClient().Subscribe(
-      machined::ListenerType::kBirth, ProcessType::kBaseAppMgr,
+      machined::ListenerType::kBoth, ProcessType::kBaseAppMgr,
       [this](const machined::BirthNotification& n) {
-        if (baseappmgr_channel_ == nullptr) {
-          ATLAS_LOG_INFO("BaseApp: BaseAppMgr born at {}:{}, registering via RUDP...",
-                         n.internal_addr.Ip(), n.internal_addr.Port());
-          auto ch = Network().ConnectRudpNocwnd(n.internal_addr);
-          if (!ch) {
-            ATLAS_LOG_ERROR("BaseApp: failed to connect to BaseAppMgr");
-            return;
-          }
-          baseappmgr_channel_ = static_cast<Channel*>(*ch);
-
-          // Advertise the RUDP internal address so peers can connect to us.
-          baseappmgr::RegisterBaseApp reg;
-          reg.internal_addr = Network().RudpAddress();
-          reg.external_addr =
-              Address(Network().RudpAddress().Ip(), external_network_.RudpAddress().Port());
-          reg.known_app_id = app_id_;  // echo our id so a restarted mgr keeps it
-          if (auto r = baseappmgr_channel_->SendMessage(reg); !r) {
-            // No ack: baseapp stays orphaned until reconnect retry.
-            ATLAS_LOG_WARNING("BaseApp: RegisterBaseApp send failed: {}", r.Error().Message());
-          }
+        if (baseappmgr_channel_ != nullptr && baseappmgr_addr_ == n.internal_addr &&
+            baseappmgr_instance_ == n.process_instance &&
+            Network().FindChannel(n.internal_addr) == baseappmgr_channel_) {
+          return;
+        }
+        if (baseappmgr_channel_ != nullptr && baseappmgr_addr_ != n.internal_addr) {
+          Network().DisconnectChannel(baseappmgr_addr_);
+        }
+        baseappmgr_channel_ = nullptr;
+        auto ch = Network().ConnectRudpNocwnd(n.internal_addr);
+        if (!ch) {
+          ATLAS_LOG_ERROR("BaseApp: failed to connect to BaseAppMgr");
+          return;
+        }
+        baseappmgr_channel_ = static_cast<Channel*>(*ch);
+        baseappmgr_addr_ = n.internal_addr;
+        baseappmgr_instance_ = n.process_instance;
+        baseappmgr::RegisterBaseApp reg;
+        reg.internal_addr = Network().RudpAddress();
+        reg.external_addr =
+            Address(Network().RudpAddress().Ip(), external_network_.RudpAddress().Port());
+        reg.known_app_id = app_id_;
+        if (auto r = baseappmgr_channel_->SendMessage(reg); !r) {
+          ATLAS_LOG_WARNING("BaseApp: RegisterBaseApp send failed: {}", r.Error().Message());
         }
       },
-      nullptr);
+      [this](const machined::DeathNotification& n) {
+        if (baseappmgr_addr_ == n.internal_addr) {
+          baseappmgr_channel_ = nullptr;
+        }
+      });
 
   auto& table = Network().InterfaceTable();
   (void)table.RegisterTypedHandler<login::PrepareLogin>(
@@ -2771,7 +2779,8 @@ void BaseApp::FlushPendingSpawnLocalEntities(SpaceID space_id, const Address& ho
   pending_spawn_local_entities_.erase(qit);
 }
 
-void BaseApp::OnRegisterBaseappAck(Channel& /*ch*/, const baseappmgr::RegisterBaseAppAck& msg) {
+void BaseApp::OnRegisterBaseappAck(Channel& ch, const baseappmgr::RegisterBaseAppAck& msg) {
+  if (&ch != baseappmgr_channel_ || ch.IsCondemned()) return;
   if (!msg.success) {
     ATLAS_LOG_ERROR("BaseApp: RegisterBaseAppAck failed; shutting down");
     Shutdown();

@@ -199,6 +199,8 @@ class BSPInternal : public BSPNode {
 
 class BSPTree {
  public:
+  static constexpr std::size_t kMaxDeserializeDepth = 64;
+  static constexpr std::size_t kMaxDeserializeNodes = 8191;
   BSPTree() = default;
 
   // Initialise with a single leaf covering the whole space.

@@ -87,9 +87,9 @@ void LaunchedProcess::Reset() {
 }
 
 auto LaunchedProcess::IsAlive() const -> bool {
-  if (platform_token_ == 0) return false;
+  if (platform_token_ == 0) return pid_ != 0;
   DWORD code = 0;
-  if (!GetExitCodeProcess(TokenToHandle(platform_token_), &code)) return false;
+  if (!GetExitCodeProcess(TokenToHandle(platform_token_), &code)) return true;
   return code == STILL_ACTIVE;
 }
 
@@ -168,23 +168,23 @@ auto LaunchDetachedProcess(ProcessLaunchOptions opts) -> Result<LaunchedProcess>
   return LaunchedProcess(pid, HandleToToken(pi.hProcess));
 }
 
+auto ObserveProcess(uint32_t pid) -> Result<LaunchedProcess> {
+  if (pid == 0) return Error{ErrorCode::kInvalidArgument, "process ID is zero"};
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
+  if (process == nullptr) {
+    return Error{ErrorCode::kIoError, "cannot observe process identity"};
+  }
+  return LaunchedProcess(pid, HandleToToken(process));
+}
+
 auto IsProcessAlive(uint32_t pid) -> bool {
   if (pid == 0) return false;
   HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (proc == nullptr) return false;
+  if (proc == nullptr) return GetLastError() != ERROR_INVALID_PARAMETER;
   DWORD code = 0;
-  const bool alive = GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+  const bool alive = !GetExitCodeProcess(proc, &code) || code == STILL_ACTIVE;
   CloseHandle(proc);
   return alive;
-}
-
-auto TerminateProcessByPid(uint32_t pid) -> bool {
-  if (pid == 0) return false;
-  HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-  if (proc == nullptr) return false;
-  const bool ok = TerminateProcess(proc, 1) != FALSE;
-  CloseHandle(proc);
-  return ok;
 }
 
 }  // namespace atlas

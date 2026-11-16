@@ -1,20 +1,19 @@
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
+#include <limits>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -23,35 +22,6 @@
 
 namespace atlas {
 namespace {
-
-// /proc/$pid/stat field 22 is process start time in clock ticks.
-// It distinguishes this process from a later pid reuse.
-auto ReadStartTicks(pid_t pid) -> uint64_t {
-  std::array<char, 64> path_buf{};
-  std::snprintf(path_buf.data(), path_buf.size(), "/proc/%d/stat", static_cast<int>(pid));
-  std::ifstream stat(path_buf.data());
-  if (!stat.is_open()) return 0;
-  std::string line;
-  if (!std::getline(stat, line)) return 0;
-  // comm is parenthesized and may contain spaces.
-  // start_time is 19 fields after state.
-  const auto rparen = line.rfind(')');
-  if (rparen == std::string::npos || rparen + 2 >= line.size()) return 0;
-  std::string_view tail(line.data() + rparen + 2, line.size() - rparen - 2);
-  for (int field = 0; field < 19; ++field) {
-    const auto sp = tail.find(' ');
-    if (sp == std::string_view::npos) return 0;
-    tail.remove_prefix(sp + 1);
-  }
-  const auto sp = tail.find(' ');
-  std::string_view ticks_view = sp == std::string_view::npos ? tail : tail.substr(0, sp);
-  uint64_t ticks = 0;
-  for (char c : ticks_view) {
-    if (c < '0' || c > '9') return 0;
-    ticks = ticks * 10 + static_cast<uint64_t>(c - '0');
-  }
-  return ticks;
-}
 
 auto WriteAll(int fd, const void* data, std::size_t size) -> bool {
   auto* bytes = static_cast<const char*>(data);
@@ -75,6 +45,7 @@ LaunchedProcess::LaunchedProcess(LaunchedProcess&& other) noexcept
 
 auto LaunchedProcess::operator=(LaunchedProcess&& other) noexcept -> LaunchedProcess& {
   if (this != &other) {
+    Reset();
     pid_ = other.pid_;
     platform_token_ = other.platform_token_;
     other.pid_ = 0;
@@ -86,25 +57,29 @@ auto LaunchedProcess::operator=(LaunchedProcess&& other) noexcept -> LaunchedPro
 LaunchedProcess::~LaunchedProcess() { Reset(); }
 
 void LaunchedProcess::Reset() {
+  if (platform_token_ != 0) close(static_cast<int>(platform_token_ - 1));
   pid_ = 0;
   platform_token_ = 0;
 }
 
 auto LaunchedProcess::IsAlive() const -> bool {
   if (pid_ == 0) return false;
-  const auto ticks_now = ReadStartTicks(static_cast<pid_t>(pid_));
-  if (ticks_now == 0) {
-    // /proc/$pid/stat missing: exited, absent, or not readable.
-    if (kill(static_cast<pid_t>(pid_), 0) != 0) return false;
-    return errno == EPERM;  // EPERM means a process exists; we just can't read
-  }
-  if (platform_token_ != 0 && ticks_now != platform_token_) return false;  // pid reused
-  return true;
+  if (platform_token_ == 0) return IsProcessAlive(pid_);
+  pollfd descriptor{static_cast<int>(platform_token_ - 1), POLLIN, 0};
+  int result;
+  do {
+    result = poll(&descriptor, 1, 0);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0) return true;
+  return (descriptor.revents & (POLLIN | POLLHUP)) == 0;
 }
 
 auto LaunchedProcess::Terminate() -> bool {
+  if (platform_token_ == 0) return false;
   if (!IsAlive()) return false;
-  return kill(static_cast<pid_t>(pid_), SIGKILL) == 0 || errno == ESRCH;
+  return syscall(SYS_pidfd_send_signal, static_cast<int>(platform_token_ - 1), SIGKILL, nullptr,
+                 0u) == 0 ||
+         errno == ESRCH;
 }
 
 auto LaunchDetachedProcess(ProcessLaunchOptions opts) -> Result<LaunchedProcess> {
@@ -211,20 +186,29 @@ auto LaunchDetachedProcess(ProcessLaunchOptions opts) -> Result<LaunchedProcess>
     return Error{ErrorCode::kInternalError, "detached launch helper failed"};
   }
 
-  const auto start_ticks = ReadStartTicks(launched_pid);
-  return LaunchedProcess(static_cast<uint32_t>(launched_pid), start_ticks);
+  auto observed = ObserveProcess(static_cast<uint32_t>(launched_pid));
+  if (observed) return std::move(*observed);
+  // An unobserved launch cannot be terminated and blocks replacement while its PID exists.
+  return LaunchedProcess(static_cast<uint32_t>(launched_pid), 0);
+}
+
+auto ObserveProcess(uint32_t pid) -> Result<LaunchedProcess> {
+  if (pid == 0 || pid > static_cast<uint32_t>(std::numeric_limits<pid_t>::max())) {
+    return Error{ErrorCode::kInvalidArgument, "invalid process ID"};
+  }
+  const auto fd = syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0u);
+  if (fd < 0) {
+    return Error{errno == ENOSYS ? ErrorCode::kNotSupported : ErrorCode::kIoError,
+                 "cannot obtain process pidfd; automatic termination requires pidfd support"};
+  }
+  return LaunchedProcess(pid, static_cast<uint64_t>(fd) + 1);
 }
 
 auto IsProcessAlive(uint32_t pid) -> bool {
   if (pid == 0) return false;
+  if (pid > static_cast<uint32_t>(std::numeric_limits<pid_t>::max())) return true;
   if (kill(static_cast<pid_t>(pid), 0) == 0) return true;
-  return errno == EPERM;
-}
-
-auto TerminateProcessByPid(uint32_t pid) -> bool {
-  if (pid == 0) return false;
-  if (kill(static_cast<pid_t>(pid), SIGKILL) == 0) return true;
-  return errno == ESRCH;
+  return errno != ESRCH;
 }
 
 }  // namespace atlas

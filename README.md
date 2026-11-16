@@ -369,13 +369,15 @@ tools\bin\test_cluster.bat --base-assembly <your-base-assembly>
 ```
 
 `test_cluster` also accepts `--base-assembly <script.dll>` to load a test script in
-BaseApp. The default remains `Atlas.Runtime.dll`; a missing explicit assembly fails
-before any cluster process starts. The `atlas_rpc_fixture_base_dll_deploy` and
+BaseApp. Pass an explicit assembly; a missing assembly fails before any cluster process starts.
+The `atlas_rpc_fixture_base_dll_deploy` and
 `atlas_rpc_fixture_client_dll_deploy` CMake targets build test-only generated RPC peers.
 `--cell-assembly <script.dll>` adds one CellAppMgr and one CellApp; the matching
 `atlas_rpc_fixture_cell_dll_deploy` target builds the Cell peer. Missing assemblies fail
 before process startup. `--baseapps 2` starts a second BaseApp for handoff verification;
 run manifests and READY output record the actual BaseApp count and endpoints.
+`--cellapps 2` requires `--cell-assembly` and adds a second CellApp for recovery verification;
+the database run manifest and READY output record the actual worker counts.
 `--log-level debug` enables existing server diagnostics for this isolated run; C# fixtures accept
 the same override through `ATLAS_TEST_CLUSTER_LOG_LEVEL`. The default remains `info`.
 The test launcher's stdin accepts `kill-baseapp <internal-port>` for crash injection and confirms
@@ -385,6 +387,10 @@ termination with `KILLED`. It only terminates its own live BaseApp children.
 `restart-baseapp <internal-port>` restarts a stopped owned BaseApp with its original arguments,
 confirms `RESTARTED`, and retains earlier logs under the run directory. Confirmation means
 process creation; tests separately wait for registration and check that old sessions cannot bind.
+`kill-process <name>` and `restart-process <name>` provide the same crash/restart controls for
+owned CellApps, DBApp and machined. Unknown names, already stopped targets and restarting a live
+process are rejected. Restart reuses the original arguments and preserves logs; tests must wait
+for registration and verify recovery separately.
 
 For the standalone generated-mailbox test, set `ATLAS_BIN_DIR` to the absolute isolated
 binary directory and use an empty test database through `ATLAS_DB_MYSQL_*`. The existing
@@ -397,6 +403,66 @@ dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedNa
 This covers Client→Base and Client→Cell replies, Base→Cell and Cell→Base calls,
 Base/Cell→Client notifications, asynchronous ordering, business errors, one-way calls,
 timeout, cancellation, late replies and cleanup. Build all three RPC fixture targets first.
+
+Manager recovery uses reports from surviving workers. CellAppMgr accepts space geometry only
+from the registered CellApp address and channel, rejects condemned channels and trailing BSP
+bytes, and requires the reporter to own a leaf and every leaf owner to be registered. A rejected
+report leaves the current topology unchanged. The DBAppMgr HA verifier requires the recovery
+window to be explicitly closed before declaring recovery healthy. CTest's `test_ha_verifiers`
+runs the existing CellAppMgr and BaseAppMgr verifier unit tests together with the DBAppMgr checks;
+these checks alone do not establish process crash or communication interruption coverage.
+CellAppMgr retains the highest valid geometry while leaf owners re-register. Every owner must
+report the same BSP, geometry version and nonzero freeze epoch on its current registered channel.
+Reports are stable only when all expected local cells exist, are unfrozen at the same epoch and
+have initialized SpaceData. The manager restores that version, epoch and broadcast baseline;
+an unchanged topology does not create a new version. Missing or older confirmations keep the
+space waiting; unstable or conflicting reports pause it. Interrupted topology changes are not
+automatically completed: resolve worker state before restarting a blocked manager.
+Each manager retains at most 1024 recovery records and
+16 MiB of geometry/owner buffers. Duplicate reports do not accumulate; an equal-version geometry
+conflict, lost source/owner, or exhausted byte budget pauses that space without falling back.
+Paused and waiting spaces reject space creation/reuse, host resolution and topology publication; other
+healthy spaces continue. Exhausting record slots closes admission for unknown spaces, even after
+buffers drain, because their rejected version watermarks could not be retained. Resolve the worker
+state and restart the manager to clear a blocked recovery; newer reports do not clear a conflict.
+Existing worker ticks and cached entity routes continue while manager topology decisions are paused.
+Watch `cellappmgr/ha/recovery_pending`, `recovery_bytes`, `recovery_blocked` and
+`recovery_admission_closed`. The HA verifier rejects pending, blocked or unavailable recovery state.
+BSP decoding allows at most 8191 nodes and depth 64; malformed or over-limit trees are rejected.
+Machined registry queries use 64-bit request IDs and explicit success or failure results.
+Concurrent queries do not replace each other; late and duplicate replies are ignored. At most
+128 queries may wait per client, and exhausted IDs are never reused. Query timeout, disconnect,
+send failure or overload does not mean an empty registry. Reviver does not count such failures
+as missing processes or use them to authorize a cold start; a newer target generation also
+invalidates an older audit. `atlas_tool list` exits with an error if a query fails. Rebuild
+machined, servers and tools together for machined registration protocol 3 and the new query layout.
+A disconnected machined watcher is not a Manager health failure. After registration reconnects,
+Reviver requires a fresh successful audit that contains the target before using registry-based
+health or absence checks; local process liveness and direct heartbeats remain active. TCP error/hangup events close
+the failed connection so workers can re-register; closing during dispatch stops the remaining bundle.
+BaseApp re-registers with its existing app ID on BaseAppMgr birth, clears the binding on the
+matching death notification, and accepts registration acknowledgements only on its current channel.
+CellApp also retains its app ID across manager death or disconnect and sends it on re-registration,
+so worker identities do not depend on their return order.
+Reviver restarts an observed target only after its previous local process has exited. It pins local
+process identity before termination and checks exit again before launching; unreadable liveness is
+treated conservatively as still alive. A remote or unconfirmed target becomes `restart_blocked`
+under `reviver/<manager>/status` and `/restart_blocked`, requiring operator isolation and recovery.
+Automatic supervision requires a loopback target on the same host; configuring the same manager
+for cold start on multiple hosts is unsupported. No cross-host fencing or automatic relocation is provided.
+Linux termination uses a stable pidfd instead of a PID checked earlier; unavailable pidfd support
+prevents automatic termination. Windows uses a retained process handle.
+
+For repeatable framework recovery acceptance, supply an isolated MySQL database through
+`ATLAS_DB_MYSQL_*` or `--database-config`, build the RPC Base/Cell fixtures, then run
+`tools\bin\verify_framework_ha.bat --build framework-verify --scenario all` on Windows, or
+`bash tools/bin/verify_framework_ha.sh --build framework-verify --scenario all` on Linux.
+`managers` runs three Manager restarts and overlapping faults; `workers` runs DBApp, both CellApps
+and machined crash/restart cycles. The tool reuses the existing HA verifiers and launcher, checks
+one two-leaf space and two Real probes, and records per-fault logs under `.tmp/framework-ha-*`.
+It rejects SQLite and missing MySQL settings. It creates no database and deletes no data; use an
+empty test database, since DBApp initializes its schema. BaseApp session/crash tests remain in
+the existing `ClientHandoffRealTests` suite. This local topology does not verify cross-host fencing.
 
 ## Database
 

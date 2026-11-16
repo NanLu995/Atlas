@@ -324,8 +324,9 @@ auto wait_for_process_registration(
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     auto entries = machined_client.QuerySync(type, std::chrono::milliseconds(300));
-    if (last_entries != nullptr) *last_entries = entries;
-    for (const auto& entry : entries) {
+    if (!entries) continue;
+    if (last_entries != nullptr) *last_entries = *entries;
+    for (const auto& entry : *entries) {
       if (entry.internal_addr.Port() != expected_internal_port) continue;
       if (expected_external_port.has_value() &&
           entry.external_addr.Port() != *expected_external_port) {

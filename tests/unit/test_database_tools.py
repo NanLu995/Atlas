@@ -110,7 +110,8 @@ class DatabaseToolsTest(unittest.TestCase):
             process = Mock()
             process.poll.return_value = None
             process.args = ['owned-baseapp', '--name', 'baseapp']
-            previous = SimpleNamespace(name='baseapp', process=process, start_order=4)
+            previous = SimpleNamespace(name='baseapp', process=process, start_order=4,
+                                       stdout_handle=Mock(), stderr_handle=Mock())
             processes = [previous]
             with patch.object(test_cluster, 'start_logged_process') as start:
                 with self.assertRaisesRegex(RuntimeError, 'not in this test cluster'):
@@ -124,6 +125,23 @@ class DatabaseToolsTest(unittest.TestCase):
                 self.assertEqual(processes[0].start_order, 4)
                 self.assertEqual(start.call_args.kwargs['arguments'], ['--name', 'baseapp'])
                 self.assertTrue(start.call_args.kwargs['log_directory'].is_relative_to(root / 'restarts'))
+                previous.stdout_handle.close.assert_called_once_with()
+                previous.stderr_handle.close.assert_called_once_with()
+
+    def test_named_process_control_is_limited_to_owned_processes(self):
+        for name in ('cellapp', 'dbapp', 'machined'):
+            process = Mock()
+            process.poll.return_value = None
+            entry = SimpleNamespace(name=name, process=process)
+            with self.assertRaisesRegex(RuntimeError, 'not in this test cluster'):
+                test_cluster._process_index([entry], 'unowned')
+            self.assertEqual(test_cluster._process_index([entry], name), 0)
+            test_cluster._kill_process(entry)
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=5)
+            process.poll.return_value = 1
+            with self.assertRaisesRegex(RuntimeError, 'already exited'):
+                test_cluster._kill_process(entry)
 
     def test_cluster_kill_is_limited_to_its_own_live_baseapp(self):
         first, second = Mock(), Mock()
@@ -153,6 +171,19 @@ class DatabaseToolsTest(unittest.TestCase):
              patch.object(sys, 'stderr', new_callable=io.StringIO):
             with self.assertRaises(SystemExit):
                 test_cluster.parse_args()
+
+    def test_recovery_cluster_cell_count_is_explicit_and_requires_an_assembly(self):
+        with patch.object(sys, 'argv', ['test_cluster.py']):
+            self.assertEqual(test_cluster.parse_args().cellapps, 1)
+        with patch.object(sys, 'argv', ['test_cluster.py', '--cellapps', '2',
+                                      '--cell-assembly', 'Cell.dll']):
+            self.assertEqual(test_cluster.parse_args().cellapps, 2)
+        for arguments in (['--cellapps', '2'], ['--cellapps', '3']):
+            with self.subTest(arguments=arguments), \
+                 patch.object(sys, 'argv', ['test_cluster.py', *arguments]), \
+                 patch.object(sys, 'stderr', new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    test_cluster.parse_args()
 
     def test_registration_matches_the_whole_process_name(self):
         outputs = [SimpleNamespace(returncode=0, stdout='baseapp baseapp-2 127.0.0.1:25001'),

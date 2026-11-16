@@ -55,12 +55,9 @@ static std::vector<ProcessInfo> wait_for_registry_entry(
   std::vector<ProcessInfo> result;
   auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
-    bool done = false;
-    client.QueryAsync(type, [&](std::vector<ProcessInfo> infos) {
-      result = std::move(infos);
-      done = true;
-    });
-    poll_until(disp, [&] { return done; }, std::chrono::milliseconds(300));
+    disp.ProcessOnce();
+    auto infos = client.QuerySync(type, std::chrono::milliseconds(300));
+    if (infos) result = std::move(*infos);
     if (!result.empty()) break;
   }
   return result;
@@ -204,6 +201,51 @@ TEST_F(MachinedRegistrationTest, PeerRestartReplacesTransportAndRejectsOldDeath)
   EXPECT_EQ(peers.Find(birth.internal_addr), client_ni_.FindChannel(birth.internal_addr));
 }
 
+TEST_F(MachinedRegistrationTest, InterruptedRegistryChannelReplaysIdentityAndSubscriptions) {
+  MachinedClient client(client_disp_, client_ni_);
+  ASSERT_TRUE(client.Connect(machined_addr_));
+  ServerConfig config;
+  config.process_type = ProcessType::kBaseApp;
+  config.process_name = "reconnecting-base";
+  config.internal_port = 7200;
+  config.process_instance = 123456;
+  int births = 0;
+  client.Subscribe(ListenerType::kBoth, ProcessType::kBaseApp,
+                   [&](const BirthNotification&) { ++births; }, {});
+  client.SendRegister(config);
+  ASSERT_TRUE(poll_until(client_disp_, [&] {
+    client.Tick();
+    return births != 0;
+  }));
+  const int initial_births = births;
+  const auto initial_generation = client.RegistrationGeneration();
+  ASSERT_NE(initial_generation, 0u);
+  int completions = 0;
+  client.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult result) {
+    ++completions;
+    EXPECT_FALSE(result);
+  });
+  client_ni_.DisconnectChannel(machined_addr_);
+  client.Tick();
+  EXPECT_EQ(completions, 1);
+  EXPECT_FALSE(client.IsConnected());
+  EXPECT_EQ(client.RegistrationGeneration(), 0u);
+  ASSERT_TRUE(poll_until(
+      client_disp_,
+      [&] {
+        client.Tick();
+        return client.IsConnected() && births > initial_births;
+      },
+      std::chrono::seconds(5)));
+  auto processes = client.QuerySync(ProcessType::kBaseApp);
+  EXPECT_GT(client.RegistrationGeneration(), initial_generation);
+  ASSERT_TRUE(processes);
+  ASSERT_EQ(processes->size(), 1u);
+  EXPECT_EQ(processes->front().name, config.process_name);
+  EXPECT_EQ(processes->front().process_instance, config.process_instance);
+  EXPECT_EQ(completions, 1);
+}
+
 TEST_F(MachinedRegistrationTest, RegisterReceivesAck) {
   MachinedClient client(client_disp_, client_ni_);
 
@@ -222,12 +264,8 @@ TEST_F(MachinedRegistrationTest, RegisterReceivesAck) {
   bool found = false;
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
   while (!found && std::chrono::steady_clock::now() < deadline) {
-    bool query_done = false;
-    client.QueryAsync(ProcessType::kBaseApp, [&](std::vector<ProcessInfo> infos) {
-      result = std::move(infos);
-      query_done = true;
-    });
-    poll_until(client_disp_, [&] { return query_done; }, std::chrono::milliseconds(200));
+    auto infos = client.QuerySync(ProcessType::kBaseApp, std::chrono::milliseconds(200));
+    if (infos) result = std::move(*infos);
     if (!result.empty()) found = true;
   }
 
@@ -276,8 +314,9 @@ TEST_F(MachinedRegistrationTest, DeregisterRemovesEntry) {
 
   std::vector<ProcessInfo> result;
   bool query_done = false;
-  client.QueryAsync(ProcessType::kBaseApp, [&](std::vector<ProcessInfo> infos) {
-    result = std::move(infos);
+  client.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult infos) {
+    ASSERT_TRUE(infos);
+    result = std::move(*infos);
     query_done = true;
   });
   ASSERT_TRUE(poll_until(client_disp_, [&] { return query_done; }));
@@ -361,8 +400,9 @@ TEST_F(MachinedRegistrationTest, DuplicateRegistrationRejected) {
 
   std::vector<ProcessInfo> result;
   bool query_done = false;
-  client_a.QueryAsync(ProcessType::kBaseApp, [&](std::vector<ProcessInfo> infos) {
-    result = std::move(infos);
+  client_a.QueryAsync(ProcessType::kBaseApp, [&](MachinedClient::QueryResult infos) {
+    ASSERT_TRUE(infos);
+    result = std::move(*infos);
     query_done = true;
   });
   ASSERT_TRUE(poll_until(client_disp_, [&] { return query_done; }));
@@ -399,12 +439,8 @@ TEST_F(MachinedRegistrationTest, MultipleProcessesCanRegister) {
   while (result.size() < 2 && std::chrono::steady_clock::now() < deadline2) {
     client2_disp.ProcessOnce();
 
-    bool done = false;
-    client1.QueryAsync(ProcessType::kBaseApp, [&](std::vector<ProcessInfo> infos) {
-      result = std::move(infos);
-      done = true;
-    });
-    poll_until(client_disp_, [&] { return done; }, std::chrono::milliseconds(300));
+    auto infos = client1.QuerySync(ProcessType::kBaseApp, std::chrono::milliseconds(300));
+    if (infos) result = std::move(*infos);
   }
   EXPECT_EQ(result.size(), 2u) << "Both BaseApp processes should be registered";
 }
@@ -488,14 +524,8 @@ TEST(MachinedMeshIntegration, RemoteRegistryGossipResolvesInQuery) {
   bool evicted = false;
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
   while (!evicted && std::chrono::steady_clock::now() < deadline) {
-    std::vector<ProcessInfo> after;
-    bool done = false;
-    client.QueryAsync(ProcessType::kCellApp, [&](std::vector<ProcessInfo> infos) {
-      after = std::move(infos);
-      done = true;
-    });
-    poll_until(client_disp, [&] { return done; }, std::chrono::milliseconds(200));
-    evicted = after.empty();
+    auto after = client.QuerySync(ProcessType::kCellApp, std::chrono::milliseconds(200));
+    evicted = after && after->empty();
   }
 
   stop.store(true, std::memory_order_release);

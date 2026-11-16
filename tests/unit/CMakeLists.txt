@@ -281,6 +281,11 @@ atlas_add_test(NAME test_reviver_subject
   DEPS atlas_server atlas_network atlas_foundation
 )
 
+atlas_add_test(NAME test_reviver_recovery
+  SOURCES test_reviver_recovery.cpp
+  DEPS atlas_reviver_lib atlas_network
+)
+
 atlas_add_test(NAME test_machined_mesh
   SOURCES test_machined_mesh.cpp
   DEPS atlas_server atlas_network atlas_foundation

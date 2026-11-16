@@ -120,7 +120,12 @@ static auto CmdList(MachinedClient& client, std::optional<ProcessType> type_filt
   std::vector<ProcessInfo> all_processes;
 
   if (type_filter) {
-    all_processes = client.QuerySync(*type_filter);
+    auto result = client.QuerySync(*type_filter);
+    if (!result) {
+      std::cerr << "Registry query failed: " << result.Error().Message() << "\n";
+      return 1;
+    }
+    all_processes = std::move(*result);
   } else {
     constexpr ProcessType kTypes[] = {
         ProcessType::kLoginApp, ProcessType::kBaseApp,    ProcessType::kBaseAppMgr,
@@ -129,7 +134,11 @@ static auto CmdList(MachinedClient& client, std::optional<ProcessType> type_filt
     };
     for (auto t : kTypes) {
       auto procs = client.QuerySync(t, std::chrono::seconds(2));
-      for (auto& p : procs) all_processes.push_back(std::move(p));
+      if (!procs) {
+        std::cerr << "Registry query failed: " << procs.Error().Message() << "\n";
+        return 1;
+      }
+      for (auto& p : *procs) all_processes.push_back(std::move(p));
     }
   }
 

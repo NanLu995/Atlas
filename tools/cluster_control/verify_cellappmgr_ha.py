@@ -1129,10 +1129,8 @@ def build_standby_reviver_health_record(
 def read_recovery_health(
     args: argparse.Namespace, exe: Path, target: str, require_restored: bool
 ) -> RecoveryHealthReport:
-    window_active = (
-        watcher_value(exe, args.machined, target, "cellappmgr/ha/recovery_window_active")
-        == "true"
-    )
+    active_value = watcher_value(exe, args.machined, target, "cellappmgr/ha/recovery_window_active")
+    window_active = active_value == "true"
     window_status = watcher_value(
         exe, args.machined, target, "cellappmgr/ha/recovery_window_status"
     )
@@ -1140,12 +1138,23 @@ def read_recovery_health(
     pending_geometry = int_watcher(
         exe, args.machined, target, "cellappmgr/lb/pending_geometry_broadcasts"
     )
-    window_closed = not window_active and pending_geometry == 0
+    try:
+        pending_reports = int(window_fields.get("pending_reports", "-1"))
+        blocked_reports = int(window_fields.get("blocked_reports", "-1"))
+    except ValueError as exc:
+        raise RuntimeError("invalid CellAppMgr recovery report counters in recovery_window_status") from exc
+    admission_value = window_fields.get("admission_closed")
+    admission_closed = None if admission_value not in ("0", "1") else admission_value == "1"
+    window_closed = (active_value == "false" and pending_geometry == 0
+                     and pending_reports == 0 and blocked_reports == 0 and admission_closed is False)
     window_payload: dict[str, object] = {
         "healthy": window_closed,
         "active": window_active,
         "remaining_ms": int(window_fields.get("remaining_ms", "0") or 0),
         "pending_geometry": pending_geometry,
+        "pending_reports": pending_reports,
+        "blocked_reports": blocked_reports,
+        "admission_closed": admission_closed,
         "detail": (
             f"recovery_window_active={window_active} "
             f"pending_geometry={pending_geometry}; recovery_window_status={window_status}"

@@ -22,7 +22,7 @@ struct ProcessInfo {
   uint64_t process_instance{0};
 };
 
-inline constexpr uint8_t kProtocolVersion = 2;
+inline constexpr uint8_t kProtocolVersion = 3;
 
 struct RegisterMessage {
   uint8_t protocol_version{kProtocolVersion};
@@ -161,6 +161,7 @@ struct DeregisterMessage {
 };
 
 struct QueryMessage {
+  uint64_t request_id{0};
   ProcessType process_type{ProcessType::kBaseApp};
 
   static auto Descriptor() -> const MessageDesc& {
@@ -171,10 +172,16 @@ struct QueryMessage {
     return kDesc;
   }
 
-  void Serialize(BinaryWriter& w) const { w.Write<uint8_t>(static_cast<uint8_t>(process_type)); }
+  void Serialize(BinaryWriter& w) const {
+    w.Write(request_id);
+    w.Write<uint8_t>(static_cast<uint8_t>(process_type));
+  }
 
   static auto Deserialize(BinaryReader& r) -> Result<QueryMessage> {
     QueryMessage msg;
+    auto id = r.Read<uint64_t>();
+    if (!id) return id.Error();
+    msg.request_id = *id;
     auto pt = r.Read<uint8_t>();
     if (!pt) return pt.Error();
     msg.process_type = static_cast<ProcessType>(*pt);
@@ -183,6 +190,7 @@ struct QueryMessage {
 };
 
 struct QueryResponse {
+  uint64_t request_id{0};
   std::vector<ProcessInfo> processes;
 
   static auto Descriptor() -> const MessageDesc& {
@@ -196,6 +204,7 @@ struct QueryResponse {
   }
 
   void Serialize(BinaryWriter& w) const {
+    w.Write(request_id);
     w.Write<uint32_t>(static_cast<uint32_t>(processes.size()));
     for (const auto& p : processes) {
       w.Write<uint8_t>(static_cast<uint8_t>(p.process_type));
@@ -211,6 +220,8 @@ struct QueryResponse {
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<QueryResponse> {
+    auto id = r.Read<uint64_t>();
+    if (!id) return id.Error();
     auto count = r.Read<uint32_t>();
     if (!count) return count.Error();
 
@@ -220,6 +231,7 @@ struct QueryResponse {
     }
 
     QueryResponse resp;
+    resp.request_id = *id;
     resp.processes.reserve(*count);
     for (uint32_t i = 0; i < *count; ++i) {
       ProcessInfo p;

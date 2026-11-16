@@ -119,17 +119,21 @@ TEST(MachinedTypes, DeregisterRoundTrip) {
 
 TEST(MachinedTypes, QueryRoundTrip) {
   QueryMessage orig;
+  orig.request_id = UINT64_MAX;
   orig.process_type = ProcessType::kLoginApp;
 
   auto result = round_trip(orig);
   ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result->request_id, orig.request_id);
   EXPECT_EQ(result->process_type, ProcessType::kLoginApp);
 }
 
 TEST(MachinedTypes, QueryResponseEmpty) {
   QueryResponse orig;
+  orig.request_id = UINT64_MAX;
   auto result = round_trip(orig);
   ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result->request_id, orig.request_id);
   EXPECT_TRUE(result->processes.empty());
 }
 
@@ -170,6 +174,7 @@ TEST(MachinedTypes, QueryResponseMultipleProcesses) {
 
 TEST(MachinedTypes, QueryResponseCountExceedsLimit) {
   BinaryWriter w;
+  w.Write<uint64_t>(1);
   w.Write<uint32_t>(10001u);
   auto data = w.Data();
   BinaryReader r(data);
@@ -180,6 +185,7 @@ TEST(MachinedTypes, QueryResponseCountExceedsLimit) {
 
 TEST(MachinedTypes, QueryResponseTruncatedAfterCount) {
   BinaryWriter w;
+  w.Write<uint64_t>(1);
   w.Write<uint32_t>(3u);
   auto data = w.Data();
   BinaryReader r(data);

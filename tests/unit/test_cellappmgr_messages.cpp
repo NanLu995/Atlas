@@ -333,6 +333,8 @@ TEST(CellAppMgrMessages, RecoverCellAppState_RoundTrip) {
   RecoverCellAppState::SpaceGeometry a;
   a.space_id = 12;
   a.geometry_version = 7;
+  a.freeze_epoch = 99;
+  a.stable = true;
   a.bsp_blob = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
   RecoverCellAppState::SpaceGeometry b;
   b.space_id = 34;
@@ -344,9 +346,13 @@ TEST(CellAppMgrMessages, RecoverCellAppState_RoundTrip) {
   ASSERT_EQ(rt->spaces.size(), 2u);
   EXPECT_EQ(rt->spaces[0].space_id, 12u);
   EXPECT_EQ(rt->spaces[0].geometry_version, 7u);
+  EXPECT_EQ(rt->spaces[0].freeze_epoch, 99u);
+  EXPECT_TRUE(rt->spaces[0].stable);
   ASSERT_EQ(rt->spaces[0].bsp_blob.size(), 3u);
   EXPECT_EQ(rt->spaces[0].bsp_blob[1], std::byte{0x02});
   EXPECT_EQ(rt->spaces[1].space_id, 34u);
+  EXPECT_EQ(rt->spaces[1].freeze_epoch, 0u);
+  EXPECT_FALSE(rt->spaces[1].stable);
   EXPECT_TRUE(rt->spaces[1].bsp_blob.empty());
 }
 
@@ -378,4 +384,38 @@ TEST(CellAppMgrMessages, MessageIdsAreStable) {
   EXPECT_EQ(msg_id::Id(msg_id::CellAppMgr::kHealthProbe), 7011u);
   EXPECT_EQ(msg_id::Id(msg_id::CellAppMgr::kHealthProbeAck), 7012u);
   EXPECT_EQ(msg_id::Id(msg_id::CellAppMgr::kRecoverCellAppState), 7013u);
+}
+
+TEST(CellAppMgrMessages, RecoverCellAppStateRejectsImpossibleCountBeforeAllocation) {
+  BinaryWriter writer;
+  writer.WritePackedInt(UINT32_MAX);
+  BinaryReader reader(writer.Data());
+  auto result = RecoverCellAppState::Deserialize(reader);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kInvalidArgument);
+}
+
+TEST(CellAppMgrMessages, RecoverCellAppStateAllowsEmptyReport) {
+  BinaryWriter writer;
+  writer.WritePackedInt(0);
+  BinaryReader reader(writer.Data());
+  auto result = RecoverCellAppState::Deserialize(reader);
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(result->spaces.empty());
+}
+
+TEST(CellAppMgrMessages, RecoverCellAppStateRejectsInvalidStabilityAndTruncatedEpoch) {
+  BinaryWriter writer;
+  writer.WritePackedInt(1);
+  writer.Write<uint32_t>(12);
+  writer.Write<uint64_t>(7);
+  writer.Write<uint64_t>(99);
+  writer.Write<uint8_t>(2);
+  writer.WritePackedInt(0);
+  const auto bytes = writer.Detach();
+  for (std::size_t size = 0; size <= bytes.size(); ++size) {
+    SCOPED_TRACE(size);
+    BinaryReader reader(std::span<const std::byte>(bytes.data(), size));
+    EXPECT_FALSE(RecoverCellAppState::Deserialize(reader));
+  }
 }

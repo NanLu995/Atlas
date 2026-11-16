@@ -83,6 +83,11 @@ add_test(NAME test_database_tools
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_database_tools.py)
 set_tests_properties(test_database_tools PROPERTIES LABELS "unit")
 
+add_test(NAME test_ha_verifiers
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p "test_verify_*_ha.py")
+set_tests_properties(test_ha_verifiers PROPERTIES LABELS "unit")
+
 add_test(NAME test_build_openssl
   COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_build_openssl.py)

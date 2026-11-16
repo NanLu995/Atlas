@@ -62,6 +62,7 @@ TEST_F(ChannelTest, TcpChannelStateTransitions) {
 
   channel.Condemn();
   EXPECT_EQ(channel.State(), ChannelState::kCondemned);
+  EXPECT_EQ(channel.Fd(), kInvalidFd);
 }
 
 TEST_F(ChannelTest, SendOnCondemnedReturnsError) {
@@ -75,6 +76,32 @@ TEST_F(ChannelTest, SendOnCondemnedReturnsError) {
   auto result = channel.Send();
   EXPECT_FALSE(result.HasValue());
   EXPECT_EQ(result.Error().Code(), ErrorCode::kChannelCondemned);
+}
+
+TEST_F(ChannelTest, CondemningFromHandlerStopsRemainingBundleMessages) {
+  class DispatchChannel : public Channel {
+   public:
+    using Channel::Channel;
+    using Channel::DispatchMessages;
+    auto Fd() const -> FdHandle override { return kInvalidFd; }
+    auto DoSend(std::span<const std::byte> data) -> Result<size_t> override { return data.size(); }
+  };
+  DispatchChannel channel(dispatcher_, table_, Address{});
+  channel.Activate();
+  int calls = 0;
+  ASSERT_TRUE(table_.RegisterTypedHandler<ChannelTestMsg>(
+      [&](const Address&, Channel* source, const ChannelTestMsg& message) {
+        ++calls;
+        EXPECT_EQ(message.seq, 1u);
+        source->Condemn();
+        EXPECT_EQ(message.payload, "first");
+      }));
+  Bundle bundle;
+  bundle.AddMessage(ChannelTestMsg{1, "first"});
+  bundle.AddMessage(ChannelTestMsg{2, "second"});
+  channel.DispatchMessages(bundle.Finalize());
+  EXPECT_EQ(calls, 1);
+  EXPECT_TRUE(channel.IsCondemned());
 }
 
 TEST_F(ChannelTest, NonpositiveInactivityTimeoutDisablesTimerAndCanBeRestored) {

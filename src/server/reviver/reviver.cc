@@ -231,6 +231,8 @@ void Reviver::RegisterTargetWatchers(ManagedTarget& t) {
                    std::function<uint64_t()>([&t] { return t.launch_timeout_count; }));
   wr.Add<bool>(root + "/restart_limit_reached",
                std::function<bool()>([&t] { return t.restart_limit_reached; }));
+  wr.Add<bool>(root + "/restart_blocked",
+               std::function<bool()>([&t] { return t.restart_blocked; }));
   wr.Add<uint64_t>(root + "/restart_limit_hits",
                    std::function<uint64_t()>([&t] { return t.restart_limit_hit_count; }));
   wr.Add<uint64_t>(root + "/liveness_failures",
@@ -332,6 +334,17 @@ void Reviver::RememberTarget(ManagedTarget& t, std::string_view name, const Addr
   t.subject_down_at = {};
   t.last_addr = addr;
   t.last_pid = pid;
+  t.observed.Reset();
+  if (IsLoopbackAddress(addr)) {
+    auto observed = ObserveProcess(pid);
+    if (observed) {
+      t.observed = std::move(*observed);
+    } else {
+      ATLAS_LOG_WARNING("Reviver: cannot pin {} process identity: {}", t.slug,
+                        observed.Error().Message());
+    }
+  }
+  t.restart_blocked = false;
   ResetTargetLaunch(t);
   ResetTargetManagerHealth(t);
   ResetTargetHeartbeat(t);
@@ -370,15 +383,19 @@ void Reviver::AuditRevive(ManagedTarget& t) {
   // died. A registry query right before launch dedups racing Revivers: if a
   // higher-priority survivor already revived it, we adopt it instead.
   if (Clock::now() < t.startup_check_at) return;
+  if (t.restart_blocked) return;
   if (t.active || t.intentional_down) return;
   if (t.query_pending || t.launch_pending || t.restart_timer.IsValid()) return;
   if (!t.ever_active && !t.on_start) return;  // never seen + not auto-started
   t.query_pending = true;
+  const uint64_t generation = t.active_generation;
   GetMachinedClient().QueryAsync(t.process_type,
-                                 [this, &t](std::vector<machined::ProcessInfo> infos) {
+                                 [this, &t, generation](MachinedClient::QueryResult infos) {
                                    t.query_pending = false;
+                                   if (generation != t.active_generation) return;
+                                   if (!infos) return;
                                    if (t.active) return;
-                                   for (const auto& info : infos) {
+                                   for (const auto& info : *infos) {
                                      if (!MatchesTargetName(t, info.name)) continue;
                                      RememberTarget(t, info.name, info.internal_addr, info.pid);
                                      return;
@@ -396,9 +413,13 @@ void Reviver::AuditTargetRegistry(ManagedTarget& t) {
   t.next_registry_audit_at = now + Milliseconds(t.audit_interval_ms);
   t.query_pending = true;
   ++t.registry_audit_count;
+  const uint64_t generation = t.active_generation;
   GetMachinedClient().QueryAsync(t.process_type,
-                                 [this, &t](std::vector<machined::ProcessInfo> infos) {
-                                   OnTargetRegistryAudit(t, std::move(infos));
+                                 [this, &t, generation](MachinedClient::QueryResult infos) {
+                                   t.query_pending = false;
+                                   if (generation != t.active_generation) return;
+                                   if (!infos) return;
+                                   OnTargetRegistryAudit(t, std::move(*infos));
                                  });
 }
 
@@ -418,13 +439,9 @@ void Reviver::AuditTargetLaunch(ManagedTarget& t) {
 
 void Reviver::AuditTargetLiveness(ManagedTarget& t) {
   if (!t.active || t.last_pid == 0) return;
-  if (!CanCheckLocalPid()) return;
-  // Catches the gap where the supervised process died but machined hasn't yet
-  // routed us a death notification. Use the owning handle when this is OUR
-  // launched process (no PID-reuse hazard); fall back to pid-only check for
-  // externally-started loopback processes.
-  if (t.launched.IsValid() && t.last_pid == t.launched.Pid()) {
-    if (t.launched.IsAlive()) return;
+  // Prefer the pinned identity; a PID-only fallback may only confirm absence.
+  if (auto* process = TargetProcess(t)) {
+    if (process->IsAlive()) return;
   } else if (IsLoopbackAddress(t.last_addr)) {
     if (IsProcessAlive(t.last_pid)) return;
   } else {
@@ -544,6 +561,11 @@ void Reviver::OnDbAppMgrHeartbeatAck(const Address& src, Channel*,
 void Reviver::AuditTargetHealth(ManagedTarget& t) {
   if (!t.active) return;
   if (t.health_interval_ms <= 0) return;
+  const auto registry_generation = GetMachinedClient().RegistrationGeneration();
+  if (registry_generation == 0 || t.confirmed_registry_generation != registry_generation) {
+    ResetTargetManagerHealth(t);
+    return;
+  }
   const auto now = Clock::now();
   if (t.health_pending) {
     const auto timeout_ms = std::max(1, t.manager_health_timeout_ms);
@@ -558,7 +580,6 @@ void Reviver::AuditTargetHealth(ManagedTarget& t) {
     RecordTargetManagerHealthFailure(t, "manager health watcher timed out");
     return;
   }
-  if (!GetMachinedClient().IsConnected()) return;
   if (t.next_health_check_at != TimePoint{} && now < t.next_health_check_at) return;
   t.next_health_check_at = now + Milliseconds(t.health_interval_ms);
   t.health_pending = true;
@@ -576,7 +597,10 @@ void Reviver::OnTargetHealth(ManagedTarget& t, uint64_t generation, bool found) 
   if (generation != t.health_check_generation) return;
   t.health_pending = false;
   t.health_check_sent_at = {};
-  if (!t.active) return;
+  const auto registry_generation = GetMachinedClient().RegistrationGeneration();
+  if (!t.active || registry_generation == 0 ||
+      t.confirmed_registry_generation != registry_generation)
+    return;
   if (found) {
     t.manager_health_failure_streak = 0;
     return;
@@ -589,6 +613,7 @@ void Reviver::OnTargetRegistryAudit(ManagedTarget& t, std::vector<machined::Proc
   if (!t.active) return;
   for (const auto& info : infos) {
     if (!MatchesTargetName(t, info.name)) continue;
+    t.confirmed_registry_generation = GetMachinedClient().RegistrationGeneration();
     if (t.last_pid != info.pid || t.last_addr != info.internal_addr) {
       RememberTarget(t, info.name, info.internal_addr, info.pid);
     } else {
@@ -597,6 +622,9 @@ void Reviver::OnTargetRegistryAudit(ManagedTarget& t, std::vector<machined::Proc
     return;
   }
 
+  if (GetMachinedClient().RegistrationGeneration() == 0 ||
+      t.confirmed_registry_generation != GetMachinedClient().RegistrationGeneration())
+    return;
   ++t.registry_missing_streak;
   ++t.registry_missing_count;
   const auto threshold = static_cast<uint32_t>(std::max(1, t.missing_audit_threshold));
@@ -666,20 +694,25 @@ void Reviver::ResetTargetLaunch(ManagedTarget& t) {
 }
 
 void Reviver::TerminateTargetIfLocal(ManagedTarget& t, std::string_view reason) {
-  if (t.last_pid == 0 || !CanCheckLocalPid()) return;
-  bool killed = false;
-  if (t.launched.IsValid() && t.last_pid == t.launched.Pid()) {
-    if (!t.launched.IsAlive()) return;
-    killed = t.launched.Terminate();
-  } else if (IsLoopbackAddress(t.last_addr)) {
-    if (!IsProcessAlive(t.last_pid)) return;
-    killed = TerminateProcessByPid(t.last_pid);
-  } else {
-    return;
-  }
-  if (!killed) return;
+  if (!IsLoopbackAddress(t.last_addr)) return;
+  auto* process = TargetProcess(t);
+  if (process == nullptr || !process->IsAlive() || !process->Terminate()) return;
   ++t.forced_termination_count;
   ATLAS_LOG_WARNING("Reviver: terminated {} pid={} reason={}", t.slug, t.last_pid, reason);
+}
+
+auto Reviver::TargetProcess(ManagedTarget& t) -> LaunchedProcess* {
+  if (t.observed.IsValid() && t.last_pid == t.observed.Pid()) return &t.observed;
+  if (t.launched.IsValid() && t.last_pid == t.launched.Pid()) return &t.launched;
+  return nullptr;
+}
+
+auto Reviver::CanRestartTarget(ManagedTarget& t) -> bool {
+  if (t.launched.IsValid() && t.launched.IsAlive()) return false;
+  if (t.last_pid == 0) return !t.ever_active;
+  if (!IsLoopbackAddress(t.last_addr)) return false;
+  if (auto* process = TargetProcess(t)) return !process->IsAlive();
+  return !IsProcessAlive(t.last_pid);
 }
 
 void Reviver::TerminateLaunchedTarget(ManagedTarget& t, std::string_view reason) {
@@ -692,6 +725,7 @@ void Reviver::TerminateLaunchedTarget(ManagedTarget& t, std::string_view reason)
 }
 
 void Reviver::ScheduleTargetRestart(ManagedTarget& t, Duration delay) {
+  if (t.restart_blocked) return;
   if (!ShouldSupervise(t)) return;
   if (t.restart_timer.IsValid()) return;
   if (t.restart_attempts >= static_cast<uint32_t>(std::max(0, Config().revive_max_restarts))) {
@@ -720,6 +754,13 @@ void Reviver::ScheduleTargetRestart(ManagedTarget& t, Duration delay) {
 void Reviver::LaunchTarget(ManagedTarget& t) {
   if (!ShouldSupervise(t)) return;
   if (t.active) return;
+  if (t.restart_blocked) return;
+  if (!CanRestartTarget(t)) {
+    t.restart_blocked = true;
+    t.last_error = "restart blocked: previous local process exit is not confirmed";
+    ATLAS_LOG_ERROR("Reviver: {} {}", t.slug, t.last_error);
+    return;
+  }
   ++t.restart_attempts;
   // Resolve exe relative to the Reviver process when no explicit path was
   // configured (matches the legacy CellAppMgr behaviour).
@@ -810,13 +851,8 @@ auto Reviver::MatchesTargetName(const ManagedTarget& t, std::string_view name) c
   return t.configured_name.empty() || name == t.configured_name;
 }
 
-auto Reviver::CanCheckLocalPid() const -> bool {
-  // Liveness probes only make sense for processes the Reviver itself
-  // launched OR processes on loopback (single-host development).
-  return true;
-}
-
 auto Reviver::TargetStatus(const ManagedTarget& t) const -> std::string {
+  if (t.restart_blocked) return "restart_blocked";
   // restart_limit_reached only happens to a Reviver that was supervising and
   // gave up, so report it before the standby check (a standby never restarts).
   if (t.restart_limit_reached) return "restart_limited";

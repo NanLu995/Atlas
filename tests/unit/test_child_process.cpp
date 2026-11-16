@@ -12,6 +12,11 @@
 #include "platform/platform_config.h"
 #include "platform/process_launcher.h"
 
+#if ATLAS_PLATFORM_LINUX
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 using namespace atlas;
 using namespace std::chrono_literals;
 
@@ -139,6 +144,48 @@ TEST(ChildProcess, TerminateStopsDetachedChild) {
   }
   EXPECT_FALSE(launched->IsAlive());
 }
+
+TEST(ChildProcess, ObservedIdentityTracksExitWithoutTerminatingOnReset) {
+  auto launched = LaunchDetachedProcess(MakeDetachedSleepOptions(30));
+  ASSERT_TRUE(launched);
+  auto observed = ObserveProcess(launched->Pid());
+  ASSERT_TRUE(observed);
+  EXPECT_TRUE(observed->IsAlive());
+  observed->Reset();
+  EXPECT_TRUE(launched->IsAlive());
+  observed = ObserveProcess(launched->Pid());
+  ASSERT_TRUE(observed);
+  EXPECT_TRUE(observed->Terminate());
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (observed->IsAlive() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  EXPECT_FALSE(observed->IsAlive());
+  EXPECT_FALSE(launched->IsAlive());
+}
+
+TEST(ChildProcess, RejectsInvalidObservedProcessIdentity) {
+  auto result = ObserveProcess(0);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kInvalidArgument);
+}
+
+#if ATLAS_PLATFORM_LINUX
+TEST(ChildProcess, ObservedExitedUnreapedChildIsNotAlive) {
+  const auto pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) _exit(0);
+  auto observed = ObserveProcess(static_cast<uint32_t>(pid));
+  siginfo_t info{};
+  EXPECT_EQ(waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOWAIT), 0);
+  EXPECT_TRUE(observed);
+  if (observed) {
+    EXPECT_FALSE(observed->IsAlive());
+  }
+  int status = 0;
+  EXPECT_EQ(waitpid(pid, &status, 0), pid);
+}
+#endif
 
 TEST(ChildProcess, DetachedProcessRedirectsOutputToFile) {
   auto path = std::filesystem::temp_directory_path() /
