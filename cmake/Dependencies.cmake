@@ -256,8 +256,7 @@ if(ATLAS_DB_MYSQL)
   set(CLIENT_PLUGIN_CLIENT_ED25519 OFF CACHE STRING "" FORCE)
   set(CLIENT_PLUGIN_PARSEC OFF CACHE STRING "" FORCE)
   set(CLIENT_PLUGIN_AUTH_GSSAPI_CLIENT OFF CACHE STRING "" FORCE)
-  # TLS is mandatory in the connector: Schannel is built into Windows, OpenSSL
-  # on Unix (libssl-dev on CI). caching_sha2 auth needs it in production anyway.
+  # Connector TLS uses Schannel on Windows and the pinned OpenSSL SDK on Unix.
   if(WIN32)
     set(WITH_SSL SCHANNEL CACHE STRING "" FORCE)
   else()

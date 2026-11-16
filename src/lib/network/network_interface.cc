@@ -1,6 +1,7 @@
 #include "network/network_interface.h"
 
 #include <algorithm>
+#include <array>
 
 #include "foundation/log.h"
 #include "foundation/profiler.h"
@@ -34,6 +35,7 @@ NetworkInterface::~NetworkInterface() {
   channels_by_id_.clear();
   condemned_rudp_by_addr_.clear();
   condemned_.clear();
+  dtls_sessions_.clear();
 
   if (tcp_listen_socket_) {
     (void)dispatcher_.Deregister(tcp_listen_socket_->Fd());
@@ -240,6 +242,8 @@ auto NetworkInterface::StartRudpServer(const Address& addr) -> Result<void> {
 
 auto NetworkInterface::StartRudpServer(const Address& addr, const RudpProfile& accept_profile)
     -> Result<void> {
+  if (dtls_context_ && !dtls_context_->IsServer())
+    return Error{ErrorCode::kInvalidArgument, "DTLS client cannot start a RUDP listener"};
   if (rudp_socket_) {
     return Error(ErrorCode::kAlreadyExists, "RUDP socket already open");
   }
@@ -276,10 +280,140 @@ auto NetworkInterface::ConnectRudp(const Address& addr) -> Result<ReliableUdpCha
   return ConnectRudp(addr, RudpProfile{});
 }
 
+auto NetworkInterface::ConfigureDtls(std::shared_ptr<TlsContext> context, std::string peer_identity)
+    -> Result<void> {
+  if (rudp_socket_ || !channels_.empty() || dtls_context_)
+    return Error{ErrorCode::kAlreadyExists, "Configure DTLS before opening any RUDP socket"};
+  if (!context || !context->IsDatagram() ||
+      (!context->IsServer() &&
+       (peer_identity.empty() || peer_identity.find('\0') != std::string::npos)))
+    return Error{ErrorCode::kInvalidArgument,
+                 "DTLS context and client target identity are required"};
+  dtls_context_ = std::move(context);
+  dtls_peer_identity_ = std::move(peer_identity);
+  return {};
+}
+
+auto NetworkInterface::IsRudpReady(const Address& addr) const -> bool {
+  if (!channels_.contains(addr)) return false;
+  if (!dtls_context_) return true;
+  const auto peer = dtls_sessions_.find(addr);
+  return peer != dtls_sessions_.end() && peer->second.session->IsReady();
+}
+
+auto NetworkInterface::CreateDtlsSession(const Address& peer) -> Result<void> {
+  if (dtls_sessions_.contains(peer)) return {};
+  const auto pending = std::ranges::count_if(
+      dtls_sessions_, [](const auto& entry) { return !entry.second.session->IsReady(); });
+  if (pending >= static_cast<std::ptrdiff_t>(kMaxDtlsHandshakes) ||
+      dtls_sessions_.size() >= kMaxChannels)
+    return Error{ErrorCode::kRateLimited, "DTLS handshake or session capacity reached"};
+  auto session = TlsStream::Create(dtls_context_, dtls_peer_identity_);
+  if (!session) return session.Error();
+  const auto now = Clock::now();
+  dtls_sessions_.emplace(
+      peer, DtlsPeer{std::move(*session), now + std::chrono::seconds(10), TimePoint::max(), {}});
+  auto started = dtls_sessions_.at(peer).session->Handshake();
+  if (!started) {
+    dtls_sessions_.erase(peer);
+    return started.Error();
+  }
+  auto flushed = FlushDtls(peer);
+  if (!flushed) dtls_sessions_.erase(peer);
+  return flushed;
+}
+
+auto NetworkInterface::AcceptDtlsDatagram(const Address& peer, std::span<const std::byte> data)
+    -> Result<bool> {
+  auto session = TlsStream::Create(dtls_context_);
+  if (!session) return session.Error();
+  if (auto fed = (*session)->FeedCiphertext(data); !fed) return fed.Error();
+  auto verified = (*session)->ListenDatagram(peer);
+  if (!verified) return verified.Error();
+  if (!*verified) {
+    std::array<std::byte, 1200> response{};
+    auto output = (*session)->DrainCiphertext(response);
+    if (output && *output <= data.size())
+      (void)rudp_socket_->SendTo(std::span(response).first(*output), peer);
+    return false;
+  }
+  const auto pending = std::ranges::count_if(
+      dtls_sessions_, [](const auto& entry) { return !entry.second.session->IsReady(); });
+  if (pending >= static_cast<std::ptrdiff_t>(kMaxDtlsHandshakes) ||
+      dtls_sessions_.size() >= kMaxChannels)
+    return Error{ErrorCode::kRateLimited, "DTLS handshake or session capacity reached"};
+  dtls_sessions_.emplace(
+      peer,
+      DtlsPeer{std::move(*session), Clock::now() + std::chrono::seconds(10), TimePoint::max(), {}});
+  return true;
+}
+
+auto NetworkInterface::FlushDtls(const Address& address) -> Result<void> {
+  auto& peer = dtls_sessions_.at(address);
+  std::array<std::byte, 1200> buffer{};
+  for (int i = 0; i < 64; ++i) {
+    if (peer.pending_ciphertext.empty()) {
+      auto output = peer.session->DrainCiphertext(buffer);
+      if (!output) {
+        if (output.Error().Code() != ErrorCode::kWouldBlock) return output.Error();
+        break;
+      }
+      peer.pending_ciphertext.assign(buffer.begin(), buffer.begin() + *output);
+    }
+    auto sent = rudp_socket_->SendTo(peer.pending_ciphertext, address);
+    if (!sent) {
+      if (sent.Error().Code() == ErrorCode::kWouldBlock) break;
+      return sent.Error();
+    }
+    if (*sent != peer.pending_ciphertext.size())
+      return Error{ErrorCode::kIoError, "DTLS UDP send was incomplete"};
+    peer.pending_ciphertext.clear();
+  }
+  const auto timeout = peer.session->RetransmitTimeout();
+  peer.next_timeout = timeout ? Clock::now() + *timeout : TimePoint::max();
+  return {};
+}
+
+auto NetworkInterface::SendDtls(const Address& peer, std::span<const std::byte> data)
+    -> Result<std::size_t> {
+  auto found = dtls_sessions_.find(peer);
+  if (found == dtls_sessions_.end())
+    return Error{ErrorCode::kConnectionReset, "DTLS peer is unavailable"};
+  auto sent = found->second.session->Write(data);
+  if (!sent) return sent.Error();
+  if (auto flushed = FlushDtls(peer); !flushed) return flushed.Error();
+  return *sent;
+}
+
+void NetworkInterface::FailDtls(const Address& peer) {
+  dtls_sessions_.erase(peer);
+  if (auto* channel = FindChannel(peer)) OnChannelDisconnect(*channel);
+}
+
+void NetworkInterface::ProcessDtlsTimers() {
+  const auto now = Clock::now();
+  std::vector<Address> failed;
+  for (auto& [address, peer] : dtls_sessions_) {
+    const bool attached = channels_.contains(address) || condemned_rudp_by_addr_.contains(address);
+    if ((!attached && peer.channel_attached) ||
+        (!peer.session->IsReady() && now >= peer.deadline) || (!attached && now >= peer.deadline)) {
+      failed.push_back(address);
+      continue;
+    }
+    if (now >= peer.next_timeout && !peer.session->HandleTimeout()) {
+      failed.push_back(address);
+      continue;
+    }
+    if (!FlushDtls(address)) failed.push_back(address);
+  }
+  for (const auto& address : failed) FailDtls(address);
+}
+
 void NetworkInterface::CloseRudpSocket() {
   // Drop condemned channels first; their channels still reference the socket.
   condemned_rudp_by_addr_.clear();
   condemned_.clear();
+  dtls_sessions_.clear();
   if (rudp_socket_) {
     (void)dispatcher_.Deregister(rudp_socket_->Fd());
     rudp_socket_->Close();
@@ -290,6 +424,8 @@ void NetworkInterface::CloseRudpSocket() {
 auto NetworkInterface::ConnectRudp(const Address& addr, const RudpProfile& profile)
     -> Result<ReliableUdpChannel*> {
   if (shutting_down_) return Error(ErrorCode::kChannelCondemned, "Shutting down");
+  if (dtls_context_ && dtls_context_->IsServer())
+    return Error{ErrorCode::kInvalidArgument, "DTLS listener cannot initiate an outbound peer"};
 
   if (!rudp_socket_) {
     auto sock = Socket::CreateUdp();
@@ -322,17 +458,26 @@ auto NetworkInterface::ConnectRudp(const Address& addr, const RudpProfile& profi
     return rudp;
   }
 
+  if (dtls_context_) {
+    if (dtls_sessions_.contains(addr))
+      return Error{ErrorCode::kWouldBlock, "DTLS peer is still draining"};
+    if (auto created = CreateDtlsSession(addr); !created) return created.Error();
+  }
   auto channel =
       make_intrusive<ReliableUdpChannel>(dispatcher_, interface_table_, *rudp_socket_, addr);
   channel->SetChannelId(next_channel_id_++);
   channel->SetDisconnectCallback([this](Channel& ch) { OnChannelDisconnect(ch); });
   channel->SetMarkDirtyCallback([this](Channel& ch) { MarkChannelDirty(ch); });
   ApplyRudpProfile(*channel, profile);
+  if (dtls_context_)
+    channel->SetDatagramSender(
+        [this, addr](std::span<const std::byte> data) { return SendDtls(addr, data); });
   channel->Activate();
 
   auto* raw = static_cast<ReliableUdpChannel*>(channel.get());
   channels_by_id_[raw->ChannelId()] = raw;
   channels_[addr] = std::move(channel);
+  if (dtls_context_) dtls_sessions_.at(addr).channel_attached = true;
   return raw;
 }
 
@@ -406,12 +551,16 @@ auto NetworkInterface::PendingSendCount() const -> std::size_t {
   for (const auto& condemned : condemned_) {
     if (pending(condemned.channel.get())) ++count;
   }
+  for (const auto& [_, peer] : dtls_sessions_) {
+    if (!peer.session->IsReady() || !peer.pending_ciphertext.empty()) ++count;
+  }
   return count;
 }
 
 void NetworkInterface::DoTask() {
   ATLAS_PROFILE_ZONE_N("NetworkInterface::DoTask");
   ProcessCondemnedChannels();
+  ProcessDtlsTimers();
 
   // Backup drain so yielded RUDP channels don't wait for the next datagram.
   if (!hot_channels_.empty()) {
@@ -556,6 +705,7 @@ void NetworkInterface::OnRudpReadable() {
   auto recv_buffer = DatagramRecvBuffer();
   std::size_t datagrams = 0;
   while (datagrams < kMaxDatagramsPerCallback) {
+    if (!rudp_socket_) break;
     if (Clock::now() >= deadline) break;
 
     auto result = rudp_socket_->RecvFrom(recv_buffer);
@@ -571,40 +721,37 @@ void NetworkInterface::OnRudpReadable() {
 
     auto [bytes, src_addr] = *result;
     ++datagrams;
-    if (!HasConnectionProtocolHeader(recv_buffer.first(bytes))) continue;
-
-    if (rate_limit_ > 0 && !CheckRateLimit(src_addr.Ip())) continue;
-
-    auto it = channels_.find(src_addr);
-    if (it == channels_.end()) {
-      if (auto cond_it = condemned_rudp_by_addr_.find(src_addr);
-          cond_it != condemned_rudp_by_addr_.end()) {
-        cond_it->second->OnDatagramReceived(recv_buffer.first(bytes), deadline);
-        continue;
-      }
-
-      if (!rudp_server_mode_ || shutting_down_ || !accepting_connections_ ||
-          channels_.size() >= kMaxChannels)
-        continue;
-
-      auto channel = make_intrusive<ReliableUdpChannel>(dispatcher_, interface_table_,
-                                                        *rudp_socket_, src_addr);
-      channel->SetChannelId(next_channel_id_++);
-      channel->SetDisconnectCallback([this](Channel& ch) { OnChannelDisconnect(ch); });
-      channel->SetMarkDirtyCallback([this](Channel& ch) { MarkChannelDirty(ch); });
-      channel->SetHotCallback([this](ReliableUdpChannel& ch) { hot_channels_.insert(&ch); });
-      ApplyRudpProfile(*channel, rudp_accept_profile_);
-      channel->Activate();
-
-      ATLAS_LOG_DEBUG("RUDP: new peer {}", src_addr.ToString());
-      channels_by_id_[channel->ChannelId()] = channel.get();
-      auto [inserted_it, _] = channels_.emplace(src_addr, std::move(channel));
-      it = inserted_it;
-      if (accept_callback_) accept_callback_(*it->second);
+    if (!dtls_context_) {
+      DispatchRudpDatagram(src_addr, recv_buffer.first(bytes), deadline);
+      continue;
     }
-
-    auto* rudp_ch = static_cast<ReliableUdpChannel*>(it->second.get());
-    rudp_ch->OnDatagramReceived(recv_buffer.first(bytes), deadline);
+    if (rate_limit_ > 0 && !CheckRateLimit(src_addr.Ip())) continue;
+    if (!dtls_sessions_.contains(src_addr)) {
+      if (!rudp_server_mode_ || !accepting_connections_ || shutting_down_) continue;
+      auto accepted = AcceptDtlsDatagram(src_addr, recv_buffer.first(bytes));
+      if (!accepted || !*accepted) continue;
+    } else {
+      if (!dtls_sessions_.at(src_addr).session->FeedCiphertext(recv_buffer.first(bytes))) continue;
+    }
+    auto& peer = dtls_sessions_.at(src_addr);
+    auto handshake = peer.session->Handshake();
+    if (!handshake || !FlushDtls(src_addr)) {
+      FailDtls(src_addr);
+      continue;
+    }
+    if (!*handshake) continue;
+    auto* session = peer.session.get();
+    std::array<std::byte, 1200> plaintext{};
+    for (int i = 0; i < 64 && Clock::now() < deadline; ++i) {
+      auto decrypted = session->Read(plaintext);
+      if (!decrypted) {
+        if (decrypted.Error().Code() != ErrorCode::kWouldBlock) FailDtls(src_addr);
+        break;
+      }
+      DispatchRudpDatagram(src_addr, std::span(plaintext).first(*decrypted), deadline);
+      const auto current = dtls_sessions_.find(src_addr);
+      if (current == dtls_sessions_.end() || current->second.session.get() != session) break;
+    }
   }
 
   if (!hot_channels_.empty()) {
@@ -612,6 +759,50 @@ void NetworkInterface::OnRudpReadable() {
   }
 
   FlushDirtySendChannels();
+}
+
+void NetworkInterface::DispatchRudpDatagram(const Address& source, std::span<const std::byte> data,
+                                            TimePoint deadline) {
+  if (!HasConnectionProtocolHeader(data)) return;
+
+  if (!dtls_context_ && rate_limit_ > 0 && !CheckRateLimit(source.Ip())) return;
+
+  auto it = channels_.find(source);
+  if (it == channels_.end()) {
+    if (auto cond_it = condemned_rudp_by_addr_.find(source);
+        cond_it != condemned_rudp_by_addr_.end()) {
+      cond_it->second->OnDatagramReceived(data, deadline);
+      return;
+    }
+
+    if (!rudp_server_mode_ || shutting_down_ || !accepting_connections_ ||
+        channels_.size() >= kMaxChannels)
+      return;
+    if (dtls_context_ && dtls_sessions_.at(source).channel_attached) return;
+
+    auto channel =
+        make_intrusive<ReliableUdpChannel>(dispatcher_, interface_table_, *rudp_socket_, source);
+    channel->SetChannelId(next_channel_id_++);
+    channel->SetDisconnectCallback([this](Channel& ch) { OnChannelDisconnect(ch); });
+    channel->SetMarkDirtyCallback([this](Channel& ch) { MarkChannelDirty(ch); });
+    channel->SetHotCallback([this](ReliableUdpChannel& ch) { hot_channels_.insert(&ch); });
+    ApplyRudpProfile(*channel, rudp_accept_profile_);
+    if (dtls_context_)
+      channel->SetDatagramSender(
+          [this, source](std::span<const std::byte> bytes) { return SendDtls(source, bytes); });
+    channel->Activate();
+
+    ATLAS_LOG_DEBUG("RUDP: new peer {}", source.ToString());
+    channels_by_id_[channel->ChannelId()] = channel.get();
+    auto [inserted_it, _] = channels_.emplace(source, std::move(channel));
+    it = inserted_it;
+    if (dtls_context_) dtls_sessions_.at(source).channel_attached = true;
+    if (accept_callback_) accept_callback_(*it->second);
+  }
+
+  auto channel = it->second;
+  auto* rudp_ch = static_cast<ReliableUdpChannel*>(channel.get());
+  rudp_ch->OnDatagramReceived(data, deadline);
 }
 
 void NetworkInterface::FlushDirtySendChannels() {

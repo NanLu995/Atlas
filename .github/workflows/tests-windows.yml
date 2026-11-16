@@ -60,6 +60,9 @@ jobs:
             dotnet restore "$proj"
           done
 
+      - name: Build pinned OpenSSL SDK
+        run: python tools/build_openssl.py --config Debug
+
       - name: Configure
         env:
           SCCACHE_DIR: ${{ github.workspace }}/.sccache

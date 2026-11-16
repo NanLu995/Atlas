@@ -217,10 +217,16 @@ class RpcSecurityFixture : public ::testing::Test {
   CellApp app_{dispatcher_, network_};
   EntityID observer_id_{200};
   EntityID peer_id_{300};
+  Address base_address_{"127.0.0.1", 12345};
+  Channel* base_channel_{nullptr};
 
   void SetUp() override {
     EntityDefRegistry::Instance().clear();
-    app_.InsertTrustedBaseAppForTest(Address{});
+    ASSERT_TRUE(network_.StartRudpServer(Address("127.0.0.1", 0)).HasValue());
+    auto channel = network_.ConnectRudpNocwnd(base_address_);
+    ASSERT_TRUE(channel.HasValue());
+    base_channel_ = *channel;
+    app_.InsertTrustedBaseAppForTest(base_address_, base_channel_);
   }
   void TearDown() override { EntityDefRegistry::Instance().clear(); }
 
@@ -245,7 +251,7 @@ TEST_F(RpcSecurityFixture, NonExposedCellRpcRejected) {
   msg.target_entity_id = observer_id_;
   msg.source_entity_id = observer_id_;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward(base_address_, base_channel_, msg);
 }
 
 TEST_F(RpcSecurityFixture, OwnClientRpcRejectedWhenSourceNeTarget) {
@@ -258,7 +264,7 @@ TEST_F(RpcSecurityFixture, OwnClientRpcRejectedWhenSourceNeTarget) {
   msg.target_entity_id = observer_id_;
   msg.source_entity_id = peer_id_;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward(base_address_, base_channel_, msg);
 }
 
 TEST_F(RpcSecurityFixture, AllClientsRpcAcceptedAcrossEntities) {
@@ -271,7 +277,7 @@ TEST_F(RpcSecurityFixture, AllClientsRpcAcceptedAcrossEntities) {
   msg.target_entity_id = observer_id_;
   msg.source_entity_id = peer_id_;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward(base_address_, base_channel_, msg);
 }
 
 TEST_F(RpcSecurityFixture, WrongDirectionRpcRejected) {
@@ -283,7 +289,7 @@ TEST_F(RpcSecurityFixture, WrongDirectionRpcRejected) {
   msg.target_entity_id = observer_id_;
   msg.source_entity_id = observer_id_;
   msg.rpc_id = kBaseRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward(base_address_, base_channel_, msg);
 }
 
 TEST_F(RpcSecurityFixture, InternalCellRpcBypassesExposedCheck) {

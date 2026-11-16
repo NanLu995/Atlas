@@ -103,6 +103,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      - name: Build pinned OpenSSL SDK
+        run: python3 tools/build_openssl.py --config Release
       - name: Configure
         run: cmake --preset net-client-linux-x64
       - name: Build

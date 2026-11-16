@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
+using Atlas.Client.Desktop;
 
 namespace Atlas.Client.IntegrationTests;
 
@@ -20,6 +21,8 @@ public sealed class RealClusterFixture : IDisposable
     internal string HandoffFixtureDirectory { get; } = Path.Combine(ResolveRepoRoot(), ".tmp",
         "rpc_handoff_" + Guid.NewGuid().ToString("N"));
     private readonly List<ushort> _baseInternalPorts = new();
+    private readonly string? _dtlsTrust;
+    private readonly string? _dtlsIdentity;
 
     public RealClusterFixture() : this(null) { }
 
@@ -29,6 +32,23 @@ public sealed class RealClusterFixture : IDisposable
         var launcher = Path.Combine(repoRoot, "tools", "cluster_control", "test_cluster.py");
         if (!File.Exists(launcher))
             throw new FileNotFoundException("test_cluster.py not found", launcher);
+        assembly ??= Environment.GetEnvironmentVariable("ATLAS_TEST_BASE_ASSEMBLY");
+
+        var certificate = Environment.GetEnvironmentVariable("ATLAS_TEST_DTLS_CERTIFICATE");
+        var privateKey = Environment.GetEnvironmentVariable("ATLAS_TEST_DTLS_PRIVATE_KEY");
+        var trust = Environment.GetEnvironmentVariable("ATLAS_TEST_DTLS_CA");
+        var identity = Environment.GetEnvironmentVariable("ATLAS_TEST_DTLS_SERVER_IDENTITY");
+        if (certificate is not null || privateKey is not null || trust is not null || identity is not null)
+        {
+            if (string.IsNullOrWhiteSpace(certificate) || string.IsNullOrWhiteSpace(privateKey) ||
+                string.IsNullOrWhiteSpace(trust) || string.IsNullOrWhiteSpace(identity))
+                throw new InvalidOperationException("DTLS tests require ATLAS_TEST_DTLS_CERTIFICATE, " +
+                    "ATLAS_TEST_DTLS_PRIVATE_KEY, ATLAS_TEST_DTLS_CA and ATLAS_TEST_DTLS_SERVER_IDENTITY");
+            if (!File.Exists(trust))
+                throw new FileNotFoundException("ATLAS_TEST_DTLS_CA file is missing", trust);
+            _dtlsTrust = trust;
+            _dtlsIdentity = identity;
+        }
 
         _launcher = new Process
         {
@@ -51,6 +71,13 @@ public sealed class RealClusterFixture : IDisposable
         }
         var arguments = _launcher.StartInfo.ArgumentList;
         arguments.Add(launcher);
+        if (_dtlsTrust is not null)
+        {
+            arguments.Add("--dtls-certificate");
+            arguments.Add(certificate!);
+            arguments.Add("--dtls-private-key");
+            arguments.Add(privateKey!);
+        }
         arguments.Add("--db-backend");
         arguments.Add(Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql");
         arguments.Add("--baseapps");
@@ -111,6 +138,16 @@ public sealed class RealClusterFixture : IDisposable
             $"last stdout line: {line ?? "<EOF>"}\n" +
             $"--- stdout transcript ---\n{_stdoutBuf}" +
             $"--- stderr transcript ---\n{stderr}");
+    }
+
+    internal void ConfigureClient(LoginClient client)
+    {
+        if (_dtlsTrust is not null) client.ConfigureDtls(_dtlsTrust, _dtlsIdentity!);
+    }
+
+    internal void ConfigureClient(AtlasClient client)
+    {
+        if (_dtlsTrust is not null) client.ConfigureDtls(_dtlsTrust, _dtlsIdentity!);
     }
 
     private void ParseReady(string line)

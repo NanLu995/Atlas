@@ -48,8 +48,16 @@ def parse_args() -> argparse.Namespace:
                         help="Lowest port to use; 0 = auto-pick a free range.")
     # Allow database initialization and cold .NET JIT startup.
     parser.add_argument("--registration-timeout-sec", type=int, default=60)
+    parser.add_argument("--dtls-certificate", type=Path, help="Public DTLS certificate chain PEM.")
+    parser.add_argument("--dtls-private-key", type=Path, help="Public DTLS private key PEM.")
     add_database_options(parser)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.dtls_certificate) != bool(args.dtls_private_key):
+        parser.error("--dtls-certificate and --dtls-private-key must be supplied together")
+    for path in (args.dtls_certificate, args.dtls_private_key):
+        if path and not path.is_file():
+            parser.error(f"DTLS file missing: {path}; supply an existing PEM file")
+    return args
 
 
 # Reserve one 16-slot block for machined, its UDP ports, core apps, and tools.
@@ -275,6 +283,11 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--update-hertz", "50", "--log-level", args.log_level]))
             processes[-1].start_order = 3
 
+        public_transport = []
+        if args.dtls_certificate:
+            public_transport = ["--production", "true", "--external-dtls-certificate",
+                                str(args.dtls_certificate.resolve()), "--external-dtls-private-key",
+                                str(args.dtls_private_key.resolve())]
         baseapp_ports = [(baseapp_internal_port, baseapp_external_port)]
         if args.baseapps == 2:
             baseapp_ports.append((port_base + 10, port_base + 11))
@@ -289,7 +302,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                            "--external-port", str(external_port),
                            "--assembly", str(base_assembly),
                            "--runtime-config", str(runtime_config),
-                           "--update-hertz", "50", "--log-level", args.log_level]))
+                           "--update-hertz", "50", "--log-level", args.log_level] + public_transport))
             processes[-1].start_order = 4
 
         processes.append(start_logged_process(
@@ -303,7 +316,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
                        # sequential RealCluster tests sharing 127.0.0.1.
                        "--login-rate-limit-per-ip", "10000",
                        "--login-rate-limit-global", "100000",
-                       "--update-hertz", "50", "--log-level", args.log_level]))
+                       "--update-hertz", "50", "--log-level", args.log_level] + public_transport))
         processes[-1].start_order = 5
 
         # Grace window for bind failures (WSAEACCES → immediate exit).

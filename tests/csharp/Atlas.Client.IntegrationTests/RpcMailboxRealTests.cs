@@ -17,6 +17,30 @@ namespace Atlas.Client.IntegrationTests;
 [Collection("RpcCluster")]
 public sealed class RpcMailboxRealTests
 {
+    [Theory]
+    [InlineData("ATLAS_TEST_DTLS_CERTIFICATE")]
+    [InlineData("ATLAS_TEST_DTLS_PRIVATE_KEY")]
+    [InlineData("ATLAS_TEST_DTLS_CA")]
+    [InlineData("ATLAS_TEST_DTLS_SERVER_IDENTITY")]
+    public void PartialDtlsConfigurationRejectsBeforeLaunchingCluster(string missing)
+    {
+        string[] names = ["ATLAS_TEST_DTLS_CERTIFICATE", "ATLAS_TEST_DTLS_PRIVATE_KEY",
+            "ATLAS_TEST_DTLS_CA", "ATLAS_TEST_DTLS_SERVER_IDENTITY"];
+        var previous = Array.ConvertAll(names, Environment.GetEnvironmentVariable);
+        try
+        {
+            foreach (var name in names) Environment.SetEnvironmentVariable(name, "test-only");
+            Environment.SetEnvironmentVariable(missing, null);
+            var error = Assert.Throws<InvalidOperationException>(() => new RealClusterFixture());
+            Assert.Contains(missing, error.Message);
+        }
+        finally
+        {
+            for (int i = 0; i < names.Length; ++i)
+                Environment.SetEnvironmentVariable(names[i], previous[i]);
+        }
+    }
+
     [Fact]
     public async Task GeneratedMailboxCompletesAndCleansUpAgainstRealBaseApp()
     {
@@ -29,6 +53,7 @@ public sealed class RpcMailboxRealTests
         var session = new ClientSession();
         Atlas.Def.DefBootstrap.RegisterInto(session);
         using var client = new LoginClient(session);
+        cluster.ConfigureClient(client);
         try
         {
             await Await(client.LoginAsync("127.0.0.1", cluster.LoginAppPort,

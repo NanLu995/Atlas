@@ -44,6 +44,33 @@ TEST(ProcessType, RoundTrip) {
   }
 }
 
+TEST(ServerConfig, ExternalDtlsCliFieldsAndProductionAreExplicit) {
+  FakeArgv args({"exe", "--production", "true", "--external-dtls-certificate", "server.pem",
+                 "--external-dtls-private-key", "server.key"});
+  auto config = ServerConfig::Load(args.argc(), args.argv());
+  ASSERT_TRUE(config);
+  EXPECT_TRUE(config->is_production);
+  EXPECT_EQ(config->external_dtls_certificate, "server.pem");
+  EXPECT_EQ(config->external_dtls_private_key, "server.key");
+}
+
+TEST(ServerConfig, InvalidProductionValueCannotSilentlySelectDevelopment) {
+  FakeArgv args({"exe", "--production", "tru"});
+  EXPECT_FALSE(ServerConfig::FromArgs(args.argc(), args.argv()));
+  auto path = write_temp_json(R"({"is_production":"tru"})");
+  EXPECT_FALSE(ServerConfig::FromJsonFile(path));
+  path = write_temp_json(R"({"is_production":true,"external_dtls_certificate":"cert.pem",
+                           "external_dtls_private_key":"key.pem"})");
+  auto config = ServerConfig::FromJsonFile(path);
+  ASSERT_TRUE(config);
+  EXPECT_TRUE(config->is_production);
+  EXPECT_EQ(config->external_dtls_certificate, "cert.pem");
+  path = write_temp_json(R"({"is_production":"on"})");
+  config = ServerConfig::FromJsonFile(path);
+  ASSERT_TRUE(config);
+  EXPECT_TRUE(config->is_production);
+}
+
 TEST(ProcessType, CaseInsensitive) {
   auto r = ProcessTypeFromName("BaseApp");
   ASSERT_TRUE(r.HasValue());

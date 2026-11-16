@@ -13,6 +13,37 @@ namespace Atlas.Client.Tests;
 public sealed class LoginClientTests
 {
     [Fact]
+    public async Task FailedDtlsConfigurationCannotStartPlaintextLogin()
+    {
+        using var client = new LoginClient(new ClientSession());
+        Assert.Throws<ArgumentException>(() => client.ConfigureDtls("", "atlas.test"));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await client.LoginAsync("127.0.0.1", 1, "account", "test-only-credential"));
+    }
+
+    [Fact]
+    public async Task DesktopFacadePreservesFailedDtlsConfiguration()
+    {
+        using var client = new AtlasClient(installCoroLoop: false);
+        Assert.Throws<ArgumentException>(() => client.ConfigureDtls("", "atlas.test"));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await client.ConnectAsync("127.0.0.1", 1, "account", "test-only-credential"));
+    }
+    [Theory]
+    [InlineData("", "credential")]
+    [InlineData("account", "")]
+    [InlineData("a\0b", "credential")]
+    [InlineData("account", "p\0q")]
+    public async Task InvalidCredentialsAreRejectedBeforeNativeStringConversion(
+        string username, string credential)
+    {
+        using var client = new LoginClient(new ClientSession());
+        for (int attempt = 0; attempt < 2; ++attempt)
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await client.LoginAsync("127.0.0.1", 1, username, credential));
+    }
+
+    [Fact]
     public void MailboxSendReportsDisconnectedAndDisposed()
     {
         var session = new ClientSession();

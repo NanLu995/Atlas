@@ -39,6 +39,20 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
 
     public ClientSession Session { get; }
 
+    public void ConfigureDtls(string trustFile, string serverIdentity)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (string.IsNullOrEmpty(trustFile) || trustFile.IndexOf('\0') >= 0 ||
+            string.IsNullOrEmpty(serverIdentity) || serverIdentity.IndexOf('\0') >= 0)
+        {
+            AtlasNetNative.AtlasNetConfigureDtls(_ctx, "", "");
+            throw new ArgumentException("DTLS trust file and server identity must be nonempty and contain no NUL");
+        }
+        var result = AtlasNetNative.AtlasNetConfigureDtls(_ctx, trustFile, serverIdentity);
+        if (result != AtlasNetReturnCode.Ok)
+            throw NativeRcException("AtlasNetConfigureDtls", result);
+    }
+
     public RpcSendResult SendBaseRpc(uint entityId, uint rpcId, ReadOnlySpan<byte> payload,
         ulong traceId = 0)
     {
@@ -103,6 +117,14 @@ public sealed unsafe class LoginClient : IDisposable, IAtlasNetEvents
         {
             _loginInflight = null;
             return AtlasTask<LoginResult>.FromCanceled();
+        }
+
+        if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(passwordHash) ||
+            username.IndexOf('\0') >= 0 || passwordHash.IndexOf('\0') >= 0)
+        {
+            _loginInflight = null;
+            return AtlasTask<LoginResult>.FromException(
+                new ArgumentException("Username and credential must be nonempty and contain no NUL"));
         }
 
         if (ct.CanBeCanceled)

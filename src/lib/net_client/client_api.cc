@@ -187,6 +187,12 @@ int32_t AtlasNetSetEntityDefDigest(AtlasNetContext* ctx, const uint8_t* data, in
   return ATLAS_NET_OK;
 }
 
+int32_t AtlasNetConfigureDtls(AtlasNetContext* ctx, const char* trust_file,
+                              const char* peer_identity) {
+  if (!ctx || !trust_file || !peer_identity) return ATLAS_NET_ERR_INVAL;
+  return ctx->ConfigureDtls(trust_file, peer_identity);
+}
+
 int32_t AtlasNetDisconnect(AtlasNetContext* ctx, AtlasDisconnectReason reason) {
   if (!ctx || ctx->destroy_requested) return ATLAS_NET_ERR_INVAL;
   ContextCall call(ctx);

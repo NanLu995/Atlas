@@ -65,6 +65,8 @@ class ReliableUdpChannel : public Channel {
 
   using HotCallback = std::function<void(ReliableUdpChannel&)>;
   void SetHotCallback(HotCallback cb) { hot_cb_ = std::move(cb); }
+  using DatagramSender = std::function<Result<std::size_t>(std::span<const std::byte>)>;
+  void SetDatagramSender(DatagramSender sender) { datagram_sender_ = std::move(sender); }
 
   [[nodiscard]] auto FlushReceiveBuffer(TimePoint deadline) -> bool;
 
@@ -238,6 +240,7 @@ class ReliableUdpChannel : public Channel {
   // Initial cwnd raised above the TCP-Reno-style 1 so a fresh observer's
   // AoI Enter burst doesn't stall on cold-start; Witness still paces Enters.
   uint32_t cwnd_{32};
+  DatagramSender datagram_sender_;
   uint32_t ssthresh_{64};
   uint32_t cwnd_incr_{0};
 

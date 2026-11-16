@@ -153,6 +153,10 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
       });
 
   if (cfg.external_port > 0) {
+    if (auto secured = cfg.ConfigureExternalTransport(external_network_); !secured) {
+      ATLAS_LOG_ERROR("Public transport configuration failed: {}", secured.Error().Message());
+      return false;
+    }
     Address listen_addr(0, cfg.external_port);
     auto result =
         external_network_.StartRudpServer(listen_addr, NetworkInterface::InternetRudpProfile());
@@ -367,6 +371,10 @@ void LoginApp::OnLoginRequest(const Address& src, Channel* ch, const login::Logi
   }
   if (IsShuttingDown()) {
     SendLoginError(ch->ChannelId(), login::LoginStatus::kServerNotReady, "server_stopping");
+    return;
+  }
+  if (!login::AreCredentialsValid(msg.username, msg.password_hash)) {
+    SendLoginError(ch->ChannelId(), login::LoginStatus::kInvalidCredentials, "invalid_credentials");
     return;
   }
 

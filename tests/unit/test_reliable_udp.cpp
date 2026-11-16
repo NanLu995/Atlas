@@ -294,6 +294,86 @@ TEST_F(ReliableUdpTest, FragmentTableCappedUnderAttack) {
   EXPECT_GT(channel_b.PendingFragmentGroupCount(), 0u);
 }
 
+TEST_F(ReliableUdpTest, RejectsOversizedFragmentBeforeRecordingSequence) {
+  auto socket = Socket::CreateUdp();
+  ASSERT_TRUE(socket.HasValue());
+  ASSERT_TRUE(socket->Bind(Address("127.0.0.1", 0)).HasValue());
+  ReliableUdpChannel channel(dispatcher_, table_, *socket, Address("127.0.0.1", 1234));
+  channel.Activate();
+
+  auto fragment = [&](std::size_t payload_size) {
+    BinaryWriter writer;
+    writer.Write<uint8_t>(rudp::kFlagHasSeq | rudp::kFlagFragment);
+    writer.Write<uint32_t>(1);
+    writer.Write<uint16_t>(1);
+    writer.Write<uint8_t>(0);
+    writer.Write<uint8_t>(2);
+    const std::vector<std::byte> payload(payload_size, std::byte{0xAB});
+    writer.WriteBytes(payload);
+    return WithConnectionProtocolHeader(writer.Data());
+  };
+
+  auto oversized = fragment(channel.MaxUdpPayload() + 1);
+  ASSERT_LE(oversized.size(), rudp::kDefaultMtu);
+  channel.OnDatagramReceived(oversized);
+  EXPECT_EQ(channel.PendingFragmentGroupCount(), 0u);
+  channel.OnDatagramReceived(fragment(channel.MaxUdpPayload()));
+  EXPECT_EQ(channel.PendingFragmentGroupCount(), 1u);
+}
+
+TEST_F(ReliableUdpTest, RejectsDatagramsLargerThanChannelMtu) {
+  auto socket = Socket::CreateUdp();
+  ASSERT_TRUE(socket.HasValue());
+  ASSERT_TRUE(socket->Bind(Address("127.0.0.1", 0)).HasValue());
+  ReliableUdpChannel channel(dispatcher_, table_, *socket, Address("127.0.0.1", 1234));
+  channel.Activate();
+  uint32_t calls = 0;
+  table_.RegisterTypedHandler<RudpTestMsg>(
+      [&](const Address&, Channel*, const RudpTestMsg&) { ++calls; });
+  Bundle bundle;
+  bundle.AddMessage(RudpTestMsg{42});
+  BinaryWriter writer;
+  writer.Write<uint8_t>(0);
+  writer.WriteBytes(bundle.Finalize());
+  auto packet = WithConnectionProtocolHeader(writer.Data());
+  packet.resize(rudp::kDefaultMtu + 1, std::byte{0});
+  channel.OnDatagramReceived(packet);
+  EXPECT_EQ(calls, 0u);
+}
+
+TEST_F(ReliableUdpTest, RejectsInvalidFragmentHeadersWithoutDispatch) {
+  auto socket = Socket::CreateUdp();
+  ASSERT_TRUE(socket.HasValue());
+  ASSERT_TRUE(socket->Bind(Address("127.0.0.1", 0)).HasValue());
+  ReliableUdpChannel channel(dispatcher_, table_, *socket, Address("127.0.0.1", 1234));
+  channel.Activate();
+  uint32_t calls = 0;
+  table_.RegisterTypedHandler<RudpTestMsg>(
+      [&](const Address&, Channel*, const RudpTestMsg&) { ++calls; });
+  Bundle bundle;
+  bundle.AddMessage(RudpTestMsg{42});
+  const auto payload = bundle.Finalize();
+  auto fragment = [&](bool sequenced, uint8_t index, uint8_t count, bool empty) {
+    BinaryWriter writer;
+    writer.Write<uint8_t>(rudp::kFlagFragment | (sequenced ? rudp::kFlagHasSeq : 0));
+    if (sequenced) writer.Write<uint32_t>(1);
+    writer.Write<uint16_t>(1);
+    writer.Write<uint8_t>(index);
+    writer.Write<uint8_t>(count);
+    if (!empty) writer.WriteBytes(payload);
+    channel.OnDatagramReceived(WithConnectionProtocolHeader(writer.Data()));
+  };
+
+  fragment(false, 0, 1, false);
+  fragment(true, 0, 0, false);
+  fragment(true, 2, 2, false);
+  fragment(true, 0, 1, true);
+  EXPECT_EQ(calls, 0u);
+  EXPECT_EQ(channel.PendingFragmentGroupCount(), 0u);
+  fragment(true, 0, 1, false);
+  EXPECT_EQ(calls, 1u);
+}
+
 TEST_F(ReliableUdpTest, AckOnlyDatagramBumpsInactivity) {
   auto sock_a = Socket::CreateUdp();
   ASSERT_TRUE(sock_a.HasValue());

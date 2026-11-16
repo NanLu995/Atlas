@@ -19,6 +19,7 @@
 #include "entity_id_allocator.h"
 #include "entitydef/entity_def_registry.h"
 #include "foundation/latency_histogram.h"
+#include "network/bg_task_manager.h"
 #include "network/machined_types.h"
 #include "platform/sha256.h"
 #include "server/manager_app.h"
@@ -33,6 +34,7 @@ struct AuthLoginResult;
 class DBApp : public ManagerApp {
  public:
   using ManagerApp::ManagerApp;
+  ~DBApp() override;
 
   static auto Run(int argc, char* argv[]) -> int;
 
@@ -61,6 +63,10 @@ class DBApp : public ManagerApp {
   void OnPutEntityIds(const Address& src, Channel* ch, const dbapp::PutEntityIds& msg);
 
   void OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin& msg);
+  void StartAuthentication(const Address& src, const login::AuthLogin& msg);
+  void PumpAuthentication();
+  void StopAuthentication();
+  void SendAuthenticationResult(const Address& src, const login::AuthLoginResult& reply);
 
   void OnDbAppMgrBirth(const machined::BirthNotification& msg);
   void OnDbAppMgrDeath(const machined::DeathNotification& msg);
@@ -151,6 +157,18 @@ class DBApp : public ManagerApp {
   LatencyHistogram checkout_reply_latency_;
   LatencyHistogram write_reply_latency_;
   static constexpr std::size_t kRequestAckCacheLimit = 4096;
+
+  struct PendingAuthentication {
+    Address reply_addr;
+    uint32_t request_id;
+    std::function<void()> start;
+  };
+  static constexpr uint32_t kMaxActiveAuthentications = 2;
+  static constexpr std::size_t kMaxQueuedAuthentications = 128;
+  std::deque<PendingAuthentication> pending_authentications_;
+  std::size_t active_authentications_{0};
+  bool authentication_stopping_{false};
+  std::unique_ptr<BgTaskManager> authentication_tasks_;
 };
 
 }  // namespace atlas

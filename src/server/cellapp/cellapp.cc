@@ -423,7 +423,13 @@ auto CellApp::Init(int argc, char* argv[]) -> bool {
   GetMachinedClient().Subscribe(
       machined::ListenerType::kBoth, ProcessType::kBaseApp,
       [this](const machined::BirthNotification& n) {
-        trusted_baseapps_.insert(n.internal_addr);
+        auto channel = Network().ConnectRudpNocwnd(n.internal_addr);
+        if (!channel) {
+          ATLAS_LOG_ERROR("CellApp: cannot connect registered BaseApp: {}",
+                          channel.Error().Message());
+          return;
+        }
+        trusted_baseapps_.insert_or_assign(n.internal_addr, IntrusivePtr<Channel>{*channel});
         ATLAS_LOG_INFO("CellApp: trusted BaseApp at {}:{}", n.internal_addr.Ip(),
                        n.internal_addr.Port());
       },
@@ -1362,7 +1368,8 @@ void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
   }
   // Hard trust boundary: outside peers bypass BaseApp validation.
   // source_entity_id stamping must come from a trusted BaseApp.
-  if (!trusted_baseapps_.contains(src)) {
+  const auto peer = trusted_baseapps_.find(src);
+  if (!ch || peer == trusted_baseapps_.end() || peer->second.get() != ch || ch->IsCondemned()) {
     ATLAS_LOG_WARNING(
         "CellApp: ClientCellRpcForward from untrusted src {}:{} "
         "(target={}, rpc=0x{:06X}) - dropping",
@@ -1388,8 +1395,8 @@ void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
   }
 
   const auto* rpc = EntityDefRegistry::Instance().FindRpc(msg.rpc_id);
-  if (!rpc) {
-    ATLAS_LOG_WARNING("CellApp: ClientCellRpcForward unknown rpc_id=0x{:06X}", msg.rpc_id);
+  if (!rpc || !EntityDefRegistry::Instance().ValidateRpc(entity->TypeId(), msg.rpc_id)) {
+    ATLAS_LOG_WARNING("CellApp: ClientCellRpcForward incompatible rpc_id=0x{:06X}", msg.rpc_id);
     return;
   }
   if (rpc->Direction() != 0x02) {
@@ -1420,6 +1427,22 @@ void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
     }
     return;
   }
+  if (msg.source_entity_id != msg.target_entity_id) {
+    const auto* source = FindRealEntity(msg.source_entity_id);
+    const auto* witness = source && !source->IsDestroyed() ? source->GetWitness() : nullptr;
+    if (!witness || !witness->IsActive() || &source->GetSpace() != &entity->GetSpace()) {
+      entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4,
+                                      "Caller visibility unavailable");
+      return;
+    }
+    const auto visible = witness->AoIMap().find(entity->Id());
+    if (visible == witness->AoIMap().end() || visible->second.entity != entity ||
+        !visible->second.IsUpdatable()) {
+      entity_rpc_reply::RejectRequest(ch, msg.rpc_id, msg.payload, -4,
+                                      "Target is not visible to caller");
+      return;
+    }
+  }
 
   // entity->Id() is the cell_entity_id - the key C# registered under.
   auto dispatch_fn = native_provider_ ? native_provider_->dispatch_rpc_fn() : nullptr;
@@ -1434,10 +1457,11 @@ void CellApp::OnClientCellRpcForward(const Address& src, Channel* ch,
               static_cast<int32_t>(msg.payload.size()), msg.trace_id);
 }
 
-void CellApp::OnClientMovementInputForward(const Address& src, Channel* /*ch*/,
+void CellApp::OnClientMovementInputForward(const Address& src, Channel* ch,
                                            const cellapp::ClientMovementInputForward& msg) {
   movement_system_.RecordInputPacket();
-  if (!trusted_baseapps_.contains(src)) {
+  const auto peer = trusted_baseapps_.find(src);
+  if (!ch || peer == trusted_baseapps_.end() || peer->second.get() != ch || ch->IsCondemned()) {
     movement_system_.RecordInputDrop();
     ATLAS_LOG_WARNING(
         "CellApp: ClientMovementInputForward from untrusted src {}:{} target={} - dropping",
@@ -2048,6 +2072,10 @@ void CellApp::OnSpaceDataSnapshot(const Address& src, Channel* /*ch*/,
 
 void CellApp::OnOutboundChannelDeath(Channel& dying) {
   rpc_registry_.CancelByChannel(&dying);
+  if (auto peer = trusted_baseapps_.find(dying.RemoteAddress());
+      peer != trusted_baseapps_.end() && peer->second.get() == &dying) {
+    trusted_baseapps_.erase(peer);
+  }
 
   // RUDP dead link condemns + schedules delete before machined DeathNotification
   // catches up; clear cached pointers now to avoid use-after-free.

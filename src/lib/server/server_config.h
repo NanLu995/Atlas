@@ -17,6 +17,7 @@ namespace atlas {
 
 class DataSection;
 class DataSectionTree;
+class NetworkInterface;
 
 // The raw DataSectionTree is retained so that ServerAppOption<T> instances
 // can extract their own keys without requiring explicit support here.
@@ -28,6 +29,8 @@ struct ServerConfig {
   Address machined_address{};  // default resolved lazily from "127.0.0.1:20018"
   uint16_t internal_port = 0;  // 0 = OS-assigned
   uint16_t external_port = 0;
+  std::filesystem::path external_dtls_certificate;
+  std::filesystem::path external_dtls_private_key;
 
   // Decentralized per-host machined UDP mesh (M4) is the canonical model; only
   // turned off for port-0 / contained test instances.
@@ -136,6 +139,7 @@ struct ServerConfig {
   [[nodiscard]] static auto FromJsonFile(const std::filesystem::path& path) -> Result<ServerConfig>;
 
   [[nodiscard]] static auto Load(int argc, char* argv[]) -> Result<ServerConfig>;
+  [[nodiscard]] auto ConfigureExternalTransport(NetworkInterface& network) const -> Result<void>;
 };
 
 }  // namespace atlas

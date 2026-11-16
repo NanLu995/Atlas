@@ -12,13 +12,13 @@
 #include "foundation/clock.h"
 #include "foundation/intrusive_ptr.h"
 #include "foundation/memory/stream_buffer_pool.h"
-#include "network/channel.h"
 #include "network/address.h"
 #include "network/channel.h"
 #include "network/event_dispatcher.h"
 #include "network/frequent_task.h"
 #include "network/interface_table.h"
 #include "network/socket.h"
+#include "network/tls_stream.h"
 
 namespace atlas {
 
@@ -65,6 +65,10 @@ class NetworkInterface : public FrequentTask {
 
   // For intra-DC links where latency outweighs fairness.
   [[nodiscard]] auto ConnectRudpNocwnd(const Address& addr) -> Result<ReliableUdpChannel*>;
+  [[nodiscard]] auto ConfigureDtls(std::shared_ptr<TlsContext> context,
+                                   std::string peer_identity = "") -> Result<void>;
+  [[nodiscard]] auto IsRudpReady(const Address& addr) const -> bool;
+  [[nodiscard]] auto DtlsSessionCount() const -> std::size_t { return dtls_sessions_.size(); }
 
   [[nodiscard]] static auto InternetRudpProfile() -> RudpProfile;
   [[nodiscard]] static auto ClusterRudpProfile() -> RudpProfile;
@@ -116,6 +120,16 @@ class NetworkInterface : public FrequentTask {
   void OnTcpAccept();
   void OnUdpReadable();
   void OnRudpReadable();
+  void DispatchRudpDatagram(const Address& source, std::span<const std::byte> data,
+                            TimePoint deadline);
+  [[nodiscard]] auto CreateDtlsSession(const Address& peer) -> Result<void>;
+  [[nodiscard]] auto AcceptDtlsDatagram(const Address& peer, std::span<const std::byte> data)
+      -> Result<bool>;
+  [[nodiscard]] auto FlushDtls(const Address& peer) -> Result<void>;
+  [[nodiscard]] auto SendDtls(const Address& peer, std::span<const std::byte> data)
+      -> Result<std::size_t>;
+  void ProcessDtlsTimers();
+  void FailDtls(const Address& peer);
 
   void OnChannelDisconnect(Channel& channel);
   void CondemnChannel(Address addr);
@@ -149,6 +163,17 @@ class NetworkInterface : public FrequentTask {
   bool rudp_server_mode_{false};
   std::optional<Address> rudp_client_bind_address_;
   RudpProfile rudp_accept_profile_{};
+  std::shared_ptr<TlsContext> dtls_context_;
+  std::string dtls_peer_identity_;
+  struct DtlsPeer {
+    std::unique_ptr<TlsStream> session;
+    TimePoint deadline;
+    TimePoint next_timeout;
+    std::vector<std::byte> pending_ciphertext;
+    bool channel_attached{false};
+  };
+  std::unordered_map<Address, DtlsPeer> dtls_sessions_;
+  static constexpr std::size_t kMaxDtlsHandshakes = 128;
 
   std::unordered_map<Address, IntrusivePtr<Channel>> channels_;
   std::unordered_map<ChannelId, Channel*> channels_by_id_;

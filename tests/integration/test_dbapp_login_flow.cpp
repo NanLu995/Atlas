@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -84,8 +85,8 @@ struct DBAppArgv {
 class TestDBApp final : public DBApp {
  public:
   TestDBApp(EventDispatcher& dispatcher, NetworkInterface& network, std::promise<Address>& addr,
-            std::atomic<bool>& stop_flag)
-      : DBApp(dispatcher, network), addr_promise_(addr), stop_flag_(stop_flag) {}
+            std::stop_token stop)
+      : DBApp(dispatcher, network), addr_promise_(addr), stop_(stop) {}
 
  protected:
   auto Init(int argc, char* argv[]) -> bool override {
@@ -102,12 +103,12 @@ class TestDBApp final : public DBApp {
 
   void OnTickComplete() override {
     DBApp::OnTickComplete();
-    if (stop_flag_.load(std::memory_order_acquire)) Shutdown();
+    if (stop_.stop_requested()) Shutdown();
   }
 
  private:
   std::promise<Address>& addr_promise_;
-  std::atomic<bool>& stop_flag_;
+  std::stop_token stop_;
 };
 
 struct DBAppClient {
@@ -116,6 +117,7 @@ struct DBAppClient {
     (void)network.InterfaceTable().RegisterTypedHandler<login::AuthLoginResult>(
         [this](const Address&, Channel*, const login::AuthLoginResult& msg) {
           auth_result = msg;
+          auth_results.push_back(msg);
           auth_received.store(true, std::memory_order_release);
         });
   }
@@ -130,6 +132,7 @@ struct DBAppClient {
   NetworkInterface network;
   std::atomic<bool> auth_received{false};
   login::AuthLoginResult auth_result;
+  std::vector<login::AuthLoginResult> auth_results;
 };
 
 }  // namespace
@@ -145,13 +148,11 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
 
   std::promise<Address> addr_promise;
   auto addr_future = addr_promise.get_future();
-  std::atomic<bool> stop_flag{false};
-
-  std::thread app_thread([&]() {
+  std::jthread app_thread([&](std::stop_token stop) {
     EventDispatcher dispatcher{"dbapp_server"};
     dispatcher.SetMaxPollWait(Milliseconds(1));
     NetworkInterface network(dispatcher);
-    TestDBApp app(dispatcher, network, addr_promise, stop_flag);
+    TestDBApp app(dispatcher, network, addr_promise, stop);
     DBAppArgv args(port, entity_defs, sqlite_path);
     EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
   });
@@ -210,38 +211,48 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
   EXPECT_FALSE(client.auth_result.success);
   EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
 
-  client.reset_auth();
   auto empty_password = missing;
   empty_password.request_id = 5;
   empty_password.password_hash.clear();
-  ASSERT_TRUE((*ch)->SendMessage(empty_password).HasValue());
-  ASSERT_TRUE(poll_until(client.dispatcher,
-                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
-  EXPECT_FALSE(client.auth_result.success);
-  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
-
-  client.reset_auth();
+  std::vector<login::AuthLogin> invalid_requests{empty_password};
   empty_password.request_id = 6;
   empty_password.username = "empty_password_account";
   empty_password.auto_create = true;
-  ASSERT_TRUE((*ch)->SendMessage(empty_password).HasValue());
-  ASSERT_TRUE(poll_until(client.dispatcher,
-                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
-  EXPECT_FALSE(client.auth_result.success);
-  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
-
-  client.reset_auth();
+  invalid_requests.push_back(empty_password);
   auto empty_username = missing;
   empty_username.request_id = 7;
   empty_username.username.clear();
   empty_username.auto_create = true;
-  ASSERT_TRUE((*ch)->SendMessage(empty_username).HasValue());
-  ASSERT_TRUE(poll_until(client.dispatcher,
-                         [&] { return client.auth_received.load(std::memory_order_acquire); }));
-  EXPECT_FALSE(client.auth_result.success);
-  EXPECT_EQ(client.auth_result.status, login::LoginStatus::kInvalidCredentials);
+  invalid_requests.push_back(empty_username);
+  auto nul_username = missing;
+  nul_username.request_id = 8;
+  nul_username.username = std::string("hero\0other", 10);
+  invalid_requests.push_back(nul_username);
+  auto nul_password = missing;
+  nul_password.request_id = 9;
+  nul_password.password_hash = std::string("pw\0other", 8);
+  invalid_requests.push_back(nul_password);
+  for (const auto& invalid : invalid_requests) {
+    BinaryWriter writer;
+    invalid.Serialize(writer);
+    BinaryReader reader(writer.Data());
+    EXPECT_FALSE(login::AuthLogin::Deserialize(reader).HasValue());
+    ASSERT_TRUE((*ch)->SendMessage(invalid).HasValue());
+  }
 
-  stop_flag.store(true, std::memory_order_release);
+  client.reset_auth();
+  auto final_auth = missing;
+  final_auth.request_id = 10;
+  ASSERT_TRUE((*ch)->SendMessage(final_auth).HasValue());
+  ASSERT_TRUE(poll_until(client.dispatcher,
+                         [&] { return client.auth_result.request_id == final_auth.request_id; }));
+  EXPECT_TRUE(client.auth_result.success);
+  EXPECT_EQ(client.auth_result.dbid, created_dbid);
+  for (const auto& result : client.auth_results) {
+    EXPECT_TRUE(result.request_id <= 4 || result.request_id == final_auth.request_id);
+  }
+
+  app_thread.request_stop();
   app_thread.join();
 
   std::filesystem::remove(sqlite_path);

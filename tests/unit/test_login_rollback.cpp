@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <format>
 #include <initializer_list>
@@ -22,6 +23,7 @@
 #include "foundation/intrusive_ptr.h"
 #include "loginapp/loginapp.h"
 #include "network/reliable_udp.h"
+#include "platform/password_hash.h"
 #include "serialization/binary_stream.h"
 #include "server/db_shard_routing.h"
 #include "test_null_channel.h"
@@ -3587,6 +3589,10 @@ class FakeDatabase final : public IDatabase {
     ++lookup_by_name_calls;
     last_lookup_type_id = type_id;
     last_lookup_identifier = identifier;
+    if (defer_name_lookups) {
+      name_lookup_callbacks.push_back(std::move(callback));
+      return;
+    }
     LookupResult result;
     result.found = lookup_found;
     result.dbid = lookup_dbid;
@@ -3731,6 +3737,8 @@ class FakeDatabase final : public IDatabase {
   std::string put_error;
   int duplicate_dbid_failures_before_success{0};
   int lookup_by_name_calls{0};
+  bool defer_name_lookups{false};
+  std::vector<std::function<void(LookupResult)>> name_lookup_callbacks;
   uint16_t last_lookup_type_id{0};
   std::string last_lookup_identifier;
   bool lookup_found{false};
@@ -3803,9 +3811,24 @@ class DBAppRollbackTest : public ::testing::Test {
   }
 
   void auth_login(Channel* ch, const login::AuthLogin& auth,
-                  const Address& src = Address("127.0.0.1", 30001)) {
+                  const Address& src = Address("127.0.0.1", 30001), bool wait_for_password = true) {
     app_.OnAuthLogin(src, ch, auth);
+    if (wait_for_password) drain_authentication_tasks();
   }
+
+  void drain_authentication_tasks() {
+    dispatcher_.SetMaxPollWait(Milliseconds(1));
+    const auto deadline = Clock::now() + Seconds(3);
+    while (app_.authentication_tasks_ && app_.authentication_tasks_->InFlightCount() != 0 &&
+           Clock::now() < deadline)
+      dispatcher_.ProcessOnce();
+    ASSERT_TRUE(!app_.authentication_tasks_ || app_.authentication_tasks_->InFlightCount() == 0);
+  }
+  auto active_authentications() const -> std::size_t { return app_.active_authentications_; }
+  auto queued_authentications() const -> std::size_t {
+    return app_.pending_authentications_.size();
+  }
+  void stop_authentication() { app_.Shutdown(); }
 
   void checkout_entity(Channel* ch, const dbapp::CheckoutEntity& checkout) {
     app_.OnCheckoutEntity(Address("127.0.0.1", 30001), ch, checkout);
@@ -4185,6 +4208,19 @@ TEST_F(DBAppRollbackTest, MismatchedLoginDefinitionsDoNotQueryOrCreateAccounts) 
   auto replies = DecodeSentMessages<login::AuthLoginResult>(reply);
   ASSERT_EQ(replies.size(), 1u);
   EXPECT_EQ(replies[0].status, login::LoginStatus::kDefMismatch);
+}
+
+TEST_F(DBAppRollbackTest, EmbeddedNullCredentialsDoNotQueryOrCreateAccounts) {
+  set_auto_create_accounts(true, 1);
+  for (bool null_username : {true, false}) {
+    login::AuthLogin request;
+    request.username = null_username ? std::string("a\0b", 3) : "account";
+    request.password_hash = null_username ? "credential" : std::string("p\0q", 3);
+    request.auto_create = true;
+    auth_login(nullptr, request);
+  }
+  EXPECT_EQ(db().lookup_by_name_calls, 0);
+  EXPECT_EQ(db().put_entity_with_password_calls, 0);
 }
 
 TEST_F(DBAppRollbackTest, SingleDbappLogoffForwardsLeaseAndKeepsNewOwnerOnLateCompletion) {
@@ -4707,6 +4743,150 @@ TEST_F(DBAppRollbackTest, WriteEntityCreateRetriesDuplicateDbidInsideOwnedShard)
   EXPECT_TRUE(HasFlag(db().last_put_flags, WriteFlags::kExplicitDbid));
 }
 
+TEST_F(DBAppRollbackTest, AutoCreateStoresServerDerivedPassword) {
+  set_auto_create_accounts(true, 1);
+  login::AuthLogin auth;
+  auth.request_id = 87;
+  auth.username = "derived_account";
+  auth.password_hash = "test-only-credential";
+  auth.auto_create = true;
+  auth_login(test_support::FakeChannel(0x1506), auth);
+  ASSERT_EQ(db().put_entity_with_password_calls, 1);
+  EXPECT_NE(db().last_password_hash, auth.password_hash);
+  EXPECT_TRUE(db().last_password_hash.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"));
+  auto valid = VerifyPassword(auth.password_hash, db().last_password_hash);
+  ASSERT_TRUE(valid);
+  EXPECT_TRUE(*valid);
+}
+
+TEST_F(DBAppRollbackTest, ExistingAccountsRequireDerivedRecordsAndCorrectCredentials) {
+  auto record = HashPassword("test-only-credential");
+  ASSERT_TRUE(record);
+  db().lookup_found = true;
+  db().lookup_dbid = 91;
+  NetworkInterface receiver(dispatcher_);
+  ASSERT_TRUE(receiver.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = network_.ConnectRudpNocwnd(receiver.RudpAddress());
+  ASSERT_TRUE(connected);
+  std::vector<login::AuthLoginResult> responses;
+  ASSERT_TRUE(receiver.InterfaceTable().RegisterTypedHandler<login::AuthLoginResult>(
+      [&](const Address&, Channel*, const login::AuthLoginResult& result) {
+        responses.push_back(result);
+      }));
+  const std::pair<std::string, std::string> cases[] = {
+      {"test-only-credential", *record},
+      {"incorrect", *record},
+      {"test-only-credential", "test-only-credential"},
+      {"test-only-credential", "$argon2id$broken"}};
+  for (std::size_t i = 0; i < std::size(cases); ++i) {
+    db().lookup_password_hash = cases[i].second;
+    login::AuthLogin auth;
+    auth.request_id = static_cast<uint32_t>(i + 1);
+    auth.username = "existing_account";
+    auth.password_hash = cases[i].first;
+    auth_login(*connected, auth, receiver.RudpAddress());
+    const auto deadline = Clock::now() + Seconds(2);
+    while (responses.size() <= i && Clock::now() < deadline) dispatcher_.ProcessOnce();
+    ASSERT_EQ(responses.size(), i + 1);
+    EXPECT_EQ(responses.back().success, i == 0);
+    EXPECT_EQ(responses.back().status,
+              i == 0 ? login::LoginStatus::kSuccess : login::LoginStatus::kInvalidCredentials);
+    EXPECT_EQ(responses.back().dbid, i == 0 ? DatabaseID{91} : kInvalidDBID);
+  }
+  EXPECT_EQ(db().put_entity_with_password_calls, 0);
+  EXPECT_EQ(active_authentications(), 0u);
+}
+
+TEST_F(DBAppRollbackTest, AuthenticationBoundsWholeRequestsAndRejectsWaitersOnShutdown) {
+  db().defer_name_lookups = true;
+  NetworkInterface receiver(dispatcher_);
+  ASSERT_TRUE(receiver.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = network_.ConnectRudpNocwnd(receiver.RudpAddress());
+  ASSERT_TRUE(connected);
+  std::vector<login::AuthLoginResult> responses;
+  ASSERT_TRUE(receiver.InterfaceTable().RegisterTypedHandler<login::AuthLoginResult>(
+      [&](const Address&, Channel*, const login::AuthLoginResult& result) {
+        responses.push_back(result);
+      }));
+  for (uint32_t id = 1; id <= 131; ++id) {
+    login::AuthLogin auth;
+    auth.request_id = id;
+    auth.username = "bounded_account";
+    auth.password_hash = "test-only-credential";
+    auth_login(*connected, auth, receiver.RudpAddress(), false);
+  }
+  EXPECT_EQ(active_authentications(), 2u);
+  EXPECT_EQ(queued_authentications(), 128u);
+  EXPECT_EQ(db().lookup_by_name_calls, 2);
+  stop_authentication();
+  EXPECT_EQ(queued_authentications(), 0u);
+  auto callbacks = std::move(db().name_lookup_callbacks);
+  ASSERT_EQ(callbacks.size(), 2u);
+  for (auto& callback : callbacks) callback(LookupResult{});
+  EXPECT_EQ(active_authentications(), 0u);
+  login::AuthLogin after_stop;
+  after_stop.request_id = 132;
+  after_stop.username = "stopped_account";
+  after_stop.password_hash = "test-only-credential";
+  auth_login(*connected, after_stop, receiver.RudpAddress());
+  dispatcher_.SetMaxPollWait(Milliseconds(1));
+  const auto deadline = Clock::now() + Seconds(3);
+  while (responses.size() < 132 && Clock::now() < deadline) dispatcher_.ProcessOnce();
+  ASSERT_EQ(responses.size(), 132u);
+  std::unordered_set<uint32_t> completed;
+  for (const auto& response : responses) {
+    EXPECT_TRUE(completed.insert(response.request_id).second);
+    EXPECT_FALSE(response.success);
+    EXPECT_EQ(response.status, response.request_id == 131 ? login::LoginStatus::kServerBusy
+                                                          : login::LoginStatus::kServerNotReady);
+  }
+  EXPECT_EQ(db().lookup_by_name_calls, 2);
+  EXPECT_EQ(db().put_entity_with_password_calls, 0);
+}
+
+TEST_F(DBAppRollbackTest, ShutdownDuringPasswordDerivationDoesNotCreateAccount) {
+  set_auto_create_accounts(true, 1);
+  login::AuthLogin auth;
+  auth.request_id = 86;
+  auth.username = "shutdown_account";
+  auth.password_hash = "test-only-credential";
+  auth.auto_create = true;
+  auth_login(test_support::FakeChannel(0x1506), auth, Address("127.0.0.1", 30001), false);
+  EXPECT_EQ(active_authentications(), 1u);
+  stop_authentication();
+  drain_authentication_tasks();
+  EXPECT_EQ(active_authentications(), 0u);
+  EXPECT_EQ(db().put_entity_with_password_calls, 0);
+}
+
+TEST_F(DBAppRollbackTest, AuthenticationCompletionAdmitsNextWaiterOnlyOnce) {
+  db().defer_name_lookups = true;
+  for (uint32_t id = 1; id <= 4; ++id) {
+    login::AuthLogin auth;
+    auth.request_id = id;
+    auth.username = "queued_account";
+    auth.password_hash = "test-only-credential";
+    auth_login(nullptr, auth, Address("127.0.0.1", 30001), false);
+  }
+  EXPECT_EQ(active_authentications(), 2u);
+  EXPECT_EQ(queued_authentications(), 2u);
+  ASSERT_EQ(db().name_lookup_callbacks.size(), 2u);
+  auto first = db().name_lookup_callbacks.front();
+  first(LookupResult{});
+  first(LookupResult{});
+  EXPECT_EQ(active_authentications(), 2u);
+  EXPECT_EQ(queued_authentications(), 1u);
+  EXPECT_EQ(db().lookup_by_name_calls, 3);
+  for (std::size_t i = 1; i <= 3; ++i) {
+    ASSERT_GT(db().name_lookup_callbacks.size(), i);
+    auto complete = db().name_lookup_callbacks[i];
+    complete(LookupResult{});
+  }
+  EXPECT_EQ(active_authentications(), 0u);
+  EXPECT_EQ(queued_authentications(), 0u);
+  EXPECT_EQ(db().lookup_by_name_calls, 4);
+}
+
 TEST_F(DBAppRollbackTest, AuthLoginAutoCreateAllocatesDbidFromUsernameShard) {
   db().complete_put_immediately = false;
   set_auto_create_accounts(true, 1);
@@ -4736,7 +4916,9 @@ TEST_F(DBAppRollbackTest, AuthLoginAutoCreateAllocatesDbidFromUsernameShard) {
   EXPECT_EQ(db().put_entity_with_password_calls, 1);
   EXPECT_EQ(db().last_put_dbid, low);
   EXPECT_EQ(db().last_put_identifier, username);
-  EXPECT_EQ(db().last_password_hash, "pw_hash");
+  auto verified = VerifyPassword("pw_hash", db().last_password_hash);
+  ASSERT_TRUE(verified);
+  EXPECT_TRUE(*verified);
   EXPECT_TRUE(HasFlag(db().last_put_flags, WriteFlags::kCreateNew));
   EXPECT_TRUE(HasFlag(db().last_put_flags, WriteFlags::kExplicitDbid));
 }
@@ -4749,17 +4931,23 @@ TEST_F(DBAppRollbackTest, AccountCreationConfirmsConflictsAndUnknownCommitsByCre
     std::string lookup_error;
     login::LoginStatus status;
   };
+  auto expected = HashPassword("expected");
+  auto different = HashPassword("different");
+  ASSERT_TRUE(expected);
+  ASSERT_TRUE(different);
   const Case cases[] = {
-      {DatabaseErrorKind::kDuplicateIdentifier, true, "expected", "", login::LoginStatus::kSuccess},
-      {DatabaseErrorKind::kDuplicateIdentifier, true, "different", "",
+      {DatabaseErrorKind::kDuplicateIdentifier, true, *expected, "", login::LoginStatus::kSuccess},
+      {DatabaseErrorKind::kDuplicateIdentifier, true, *different, "",
+       login::LoginStatus::kInvalidCredentials},
+      {DatabaseErrorKind::kDuplicateIdentifier, true, "expected", "",
        login::LoginStatus::kInvalidCredentials},
       {DatabaseErrorKind::kDuplicateIdentifier, true, "", "",
        login::LoginStatus::kInvalidCredentials},
-      {DatabaseErrorKind::kCommitUnknown, true, "expected", "", login::LoginStatus::kSuccess},
+      {DatabaseErrorKind::kCommitUnknown, true, *expected, "", login::LoginStatus::kSuccess},
       {DatabaseErrorKind::kCommitUnknown, false, "", "", login::LoginStatus::kInternalError},
-      {DatabaseErrorKind::kCommitUnknown, true, "expected", "lookup failed",
+      {DatabaseErrorKind::kCommitUnknown, true, *expected, "lookup failed",
        login::LoginStatus::kInternalError},
-      {DatabaseErrorKind::kNone, true, "expected", "", login::LoginStatus::kInternalError},
+      {DatabaseErrorKind::kNone, true, *expected, "", login::LoginStatus::kInternalError},
   };
   db().complete_put_immediately = false;
   set_auto_create_accounts(true, 1);
@@ -4836,7 +5024,9 @@ TEST_F(DBAppRollbackTest, AuthLoginAutoCreateRetriesDuplicateDbidInsideUsernameS
   EXPECT_EQ(db().put_entity_with_password_calls, 2);
   EXPECT_EQ(db().last_put_dbid, low + 1);
   EXPECT_EQ(db().last_put_identifier, username);
-  EXPECT_EQ(db().last_password_hash, "pw_hash");
+  auto verified = VerifyPassword("pw_hash", db().last_password_hash);
+  ASSERT_TRUE(verified);
+  EXPECT_TRUE(*verified);
   EXPECT_TRUE(HasFlag(db().last_put_flags, WriteFlags::kCreateNew));
   EXPECT_TRUE(HasFlag(db().last_put_flags, WriteFlags::kExplicitDbid));
 }

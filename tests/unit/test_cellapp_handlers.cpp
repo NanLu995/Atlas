@@ -1,7 +1,8 @@
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
+#include <format>
 #include <memory>
 #include <vector>
 
@@ -19,13 +20,13 @@
 #include "entitydef/entity_def_registry.h"
 #include "intercell_messages.h"
 #include "math/vector3.h"
-#include "test_null_channel.h"
 #include "network/channel.h"
 #include "network/event_dispatcher.h"
 #include "network/machined_types.h"
 #include "network/network_interface.h"
 #include "real_entity_data.h"
 #include "space.h"
+#include "test_null_channel.h"
 
 namespace atlas {
 namespace {
@@ -122,6 +123,11 @@ struct GhostCall {
 };
 std::vector<GhostCall>* g_ghost_calls = nullptr;
 std::vector<std::byte>* g_serialize_blob = nullptr;
+uint32_t g_client_rpc_calls = 0;
+
+void RecordClientRpc(uint32_t, uint32_t, intptr_t, const uint8_t*, int32_t, uint64_t) {
+  ++g_client_rpc_calls;
+}
 
 extern "C" void GhostTestRestoreGhost(uint32_t eid, uint16_t tid, const uint8_t*, int32_t len) {
   if (g_ghost_calls) g_ghost_calls->push_back({GhostCall::kRestoreGhost, eid, tid, len});
@@ -188,9 +194,10 @@ class CellAppHandlersTest : public ::testing::Test {
 
   void SetUp() override {
     EntityDefRegistry::Instance().clear();
-    app_.InsertTrustedBaseAppForTest(Address{});
+    app_.InsertTrustedBaseAppForTest(Address{}, test_support::FakeChannel(0xFEED));
     app_.PeerRegistryForTest().InsertForTest(Address{}, test_support::FakeChannel(0xFEED));
     g_ghost_calls = &ghost_calls_;
+    g_client_rpc_calls = 0;
   }
   void TearDown() override {
     g_ghost_calls = nullptr;
@@ -208,6 +215,13 @@ class CellAppHandlersTest : public ::testing::Test {
     table.restore_ghost = reinterpret_cast<void*>(&GhostTestRestoreGhost);
     table.destroy_ghost = reinterpret_cast<void*>(&GhostTestDestroyGhost);
     app_.NativeProvider()->SetNativeCallbacks(&table, sizeof(table));
+  }
+
+  void EnableClientRpcDispatch() {
+    native_provider_holder_ = app_.CreateNativeProviderForTest();
+    GhostTestCallbackTable callbacks{};
+    callbacks.dispatch_rpc = reinterpret_cast<void*>(&RecordClientRpc);
+    app_.NativeProvider()->SetNativeCallbacks(&callbacks, sizeof(callbacks));
   }
 
   auto MakeCreate(EntityID entity_id, SpaceID sp, math::Vector3 pos = {0, 0, 0})
@@ -634,7 +648,7 @@ TEST(CellAppWatchers, MovementStepTimeWatcherRecordsTick) {
   EventDispatcher dispatcher{"test_cellapp_movement_step_watcher"};
   NetworkInterface network{dispatcher};
   WatcherCellApp app{dispatcher, network};
-  app.InsertTrustedBaseAppForTest(Address{});
+  app.InsertTrustedBaseAppForTest(Address{}, test_support::FakeChannel(0xFEED));
   app.RegisterWatchersForTest();
 
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/step_time/count").value_or(""), "0");
@@ -653,7 +667,7 @@ TEST(CellAppWatchers, MovementStepTimeWatcherRecordsTick) {
   input.source_entity_id = 302;
   input.target_entity_id = 302;
   input.frames.push_back({1, 1, 0, 127, 0, 0, 0, 16});
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
   app.TickMovementSystemForTest(1.0f / 30.0f);
 
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/step_time/count").value_or(""), "1");
@@ -665,7 +679,7 @@ TEST(CellAppWatchers, MovementPositionHistoryRecordsTick) {
   EventDispatcher dispatcher{"test_cellapp_movement_history_watcher"};
   NetworkInterface network{dispatcher};
   WatcherCellApp app{dispatcher, network};
-  app.InsertTrustedBaseAppForTest(Address{});
+  app.InsertTrustedBaseAppForTest(Address{}, test_support::FakeChannel(0xFEED));
   app.RegisterWatchersForTest();
 
   ASSERT_TRUE(app.GetWatcherRegistry().Get("movement/position_history_entities").has_value());
@@ -685,7 +699,7 @@ TEST(CellAppWatchers, MovementPositionHistoryRecordsTick) {
   input.source_entity_id = 304;
   input.target_entity_id = 304;
   input.frames.push_back({1, 1, 0, 127, 0, 0, 0, 16});
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
   app.TickMovementSystemForTest(1.0f / 30.0f);
 
   const auto* history = app.MovementSystemForTest().position_history().Find(304);
@@ -776,7 +790,7 @@ TEST(CellAppWatchers, MovementInputDropBreakdownWatchers) {
   EventDispatcher dispatcher{"test_cellapp_movement_input_watchers"};
   NetworkInterface network{dispatcher};
   WatcherCellApp app{dispatcher, network};
-  app.InsertTrustedBaseAppForTest(Address{});
+  app.InsertTrustedBaseAppForTest(Address{}, test_support::FakeChannel(0xFEED));
   app.RegisterWatchersForTest();
 
   ASSERT_TRUE(app.GetWatcherRegistry().Get("movement/input_stale_dropped_total").has_value());
@@ -795,15 +809,15 @@ TEST(CellAppWatchers, MovementInputDropBreakdownWatchers) {
   input.source_entity_id = 303;
   input.target_entity_id = 303;
   input.frames.push_back({10, 10, 0, 127, 0, 0, 0, 16});
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
 
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/input_stale_dropped_total").value_or(""),
             "1");
 
   input.frames.clear();
   input.frames.push_back({400, 11, 0, 127, 0, 0, 0, 16});
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/input_seq_gap_dropped_total").value_or(""),
             "1");
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/input_overflow_dropped_total").value_or(""),
@@ -811,7 +825,7 @@ TEST(CellAppWatchers, MovementInputDropBreakdownWatchers) {
 
   input.frames.clear();
   input.frames.push_back({401, 12, 0, 127, 0, 0, 0, 0});
-  app.OnClientMovementInputForward({}, nullptr, input);
+  app.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), input);
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/input_invalid_dropped_total").value_or(""),
             "1");
   EXPECT_EQ(app.GetWatcherRegistry().Get("movement/input_dropped_total").value_or(""),
@@ -1127,7 +1141,7 @@ auto PackRpcId(uint8_t direction, uint16_t type_index, uint8_t method_index) -> 
 
 auto RegisterTypeWithRpc(uint16_t type_id, uint32_t rpc_id, ExposedScope scope) {
   BinaryWriter w;
-  w.WriteString("TestEntity");
+  w.WriteString(std::format("TestEntity{}", type_id));
   w.Write<uint16_t>(type_id);
   w.Write<uint8_t>(1);  // has_cell
   w.Write<uint8_t>(1);  // has_client
@@ -1158,7 +1172,7 @@ TEST_F(CellAppHandlersTest, ClientCellRpcRejectsUntrustedSource) {
   app_.OnClientCellRpcForward(untrusted, nullptr, msg);
   SUCCEED();
 
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
 }
 
 TEST_F(CellAppHandlersTest, ClientCellRpcRejectsUnknownRpcId) {
@@ -1168,7 +1182,50 @@ TEST_F(CellAppHandlersTest, ClientCellRpcRejectsUnknownRpcId) {
   msg.target_entity_id = 100;
   msg.source_entity_id = 100;
   msg.rpc_id = 0xDEADBEEF;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+}
+
+TEST_F(CellAppHandlersTest, ClientRpcRejectsAnotherChannelAtRegisteredAddress) {
+  EnableClientRpcDispatch();
+  const auto rpc = PackRpcId(0x02, 1, 1);
+  RegisterTypeWithRpc(1, rpc, ExposedScope::kOwnClient);
+  app_.OnCreateCellEntity({}, nullptr, MakeCreate(100, 1));
+  RecordingChannel impostor(dispatcher_, network_.InterfaceTable(), Address{});
+  cellapp::ClientCellRpcForward msg;
+  msg.target_entity_id = 100;
+  msg.source_entity_id = 100;
+  msg.rpc_id = rpc;
+  app_.OnClientCellRpcForward({}, &impostor, msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  auto replacement =
+      make_intrusive<RecordingChannel>(dispatcher_, network_.InterfaceTable(), Address{});
+  app_.InsertTrustedBaseAppForTest({}, replacement.get());
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  app_.OnClientCellRpcForward({}, replacement.get(), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+}
+
+TEST_F(CellAppHandlersTest, ClientCellRpcRejectsExposedComponentMethodFromAnotherEntityType) {
+  EnableClientRpcDispatch();
+  const auto own_rpc = (1u << 24) | PackRpcId(0x02, 1, 1);
+  const auto foreign_rpc = (1u << 24) | PackRpcId(0x02, 2, 1);
+  RegisterTypeWithRpc(1, own_rpc, ExposedScope::kNone);
+  RegisterTypeWithRpc(2, foreign_rpc, ExposedScope::kOwnClient);
+  app_.OnCreateCellEntity({}, nullptr, MakeCreate(100, 1));
+
+  cellapp::ClientCellRpcForward msg;
+  msg.target_entity_id = 100;
+  msg.source_entity_id = 100;
+  msg.rpc_id = foreign_rpc;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  msg.rpc_id = own_rpc;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  EntityDefRegistry::Instance().types[0].rpcs[0].exposed = ExposedScope::kOwnClient;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
 }
 
 TEST_F(CellAppHandlersTest, ClientCellRpcRejectsNonExposed) {
@@ -1181,7 +1238,7 @@ TEST_F(CellAppHandlersTest, ClientCellRpcRejectsNonExposed) {
   msg.target_entity_id = 100;
   msg.source_entity_id = 100;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
 }
 
 TEST_F(CellAppHandlersTest, ClientCellRpcRejectsWrongDirection) {
@@ -1194,7 +1251,7 @@ TEST_F(CellAppHandlersTest, ClientCellRpcRejectsWrongDirection) {
   msg.target_entity_id = 100;
   msg.source_entity_id = 100;
   msg.rpc_id = kBaseRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
 }
 
 TEST_F(CellAppHandlersTest, ClientCellRpcOwnClientRejectsCrossEntity) {
@@ -1208,10 +1265,11 @@ TEST_F(CellAppHandlersTest, ClientCellRpcOwnClientRejectsCrossEntity) {
   msg.target_entity_id = 100;
   msg.source_entity_id = 200;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
 }
 
 TEST_F(CellAppHandlersTest, ClientCellRpcAcceptsAllClientsCrossEntity) {
+  EnableClientRpcDispatch();
   const uint16_t kTypeId = 1;
   const uint32_t kCellRpc = PackRpcId(0x02, kTypeId, 1);
   RegisterTypeWithRpc(kTypeId, kCellRpc, ExposedScope::kAllClients);
@@ -1222,7 +1280,40 @@ TEST_F(CellAppHandlersTest, ClientCellRpcAcceptsAllClientsCrossEntity) {
   msg.target_entity_id = 100;
   msg.source_entity_id = 200;
   msg.rpc_id = kCellRpc;
-  app_.OnClientCellRpcForward({}, nullptr, msg);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  auto* source = app_.FindRealEntity(200);
+  auto* target = app_.FindRealEntity(100);
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  source->EnableWitness(50.f, [](std::span<const std::byte>) {});
+  auto* witness = source->GetWitness();
+  ASSERT_NE(witness, nullptr);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 0u);
+  (void)witness->Update(20000);
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+  target->SetPositionAndDirection({1000, 0, 0}, {1, 0, 0});
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+  msg.source_entity_id = 999;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+  app_.OnCreateCellEntity({}, nullptr, MakeCreate(201, 2));
+  auto* other_space = app_.FindRealEntity(201);
+  ASSERT_NE(other_space, nullptr);
+  other_space->EnableWitness(50.f, [](std::span<const std::byte>) {});
+  msg.source_entity_id = 201;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+  source->ConvertRealToGhost(test_support::FakeChannel(0xFEED));
+  msg.source_entity_id = 200;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 1u);
+  msg.source_entity_id = msg.target_entity_id;
+  app_.OnClientCellRpcForward({}, test_support::FakeChannel(0xFEED), msg);
+  EXPECT_EQ(g_client_rpc_calls, 2u);
 }
 
 TEST_F(CellAppHandlersTest, ClientMovementInputQueuesTrustedRealFrames) {
@@ -1234,7 +1325,7 @@ TEST_F(CellAppHandlersTest, ClientMovementInputQueuesTrustedRealFrames) {
   msg.frames.push_back({10, 100, 127, 0, 0, 0, 0, 16});
   msg.frames.push_back({11, 101, 0, 127, 0, 0, 0, 16});
 
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   auto drained = app_.MovementSystemForTest().input_buffer().Drain(700, 4);
   ASSERT_EQ(drained.size(), 2u);
@@ -1250,7 +1341,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemConsumesOneInputFrame) {
   msg.target_entity_id = 710;
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
   msg.frames.push_back({11, 101, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(1.0f / 30.0f);
 
@@ -1283,7 +1374,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemStepsOnStaticPhysicsBox) {
   msg.source_entity_id = 714;
   msg.target_entity_id = 714;
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.2f);
 
@@ -1307,7 +1398,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemGroundProbeUsesCapsuleRadius) {
   msg.source_entity_id = 718;
   msg.target_entity_id = 718;
   msg.frames.push_back({10, 100, 0, 0, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.1f);
 
@@ -1325,7 +1416,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemStopsLargeFallOnStaticGround) {
   msg.source_entity_id = 719;
   msg.target_entity_id = 719;
   msg.frames.push_back({10, 100, 0, 0, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.1f);
 
@@ -1347,7 +1438,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemKeepsJumpCeilingHitAirborne) {
   msg.source_entity_id = 721;
   msg.target_entity_id = 721;
   msg.frames.push_back({10, 100, 0, 0, 0, 0, movement::kInputButtonJump, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.1f);
 
@@ -1365,7 +1456,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemDepenetratesStaticGround) {
   msg.source_entity_id = 720;
   msg.target_entity_id = 720;
   msg.frames.push_back({10, 100, 0, 0, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.1f);
 
@@ -1393,12 +1484,12 @@ TEST_F(CellAppHandlersTest, TickMovementSystemUsesEntitySpacePhysicsQuery) {
   msg.source_entity_id = 715;
   msg.target_entity_id = 715;
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   msg.source_entity_id = 716;
   msg.target_entity_id = 716;
   msg.frames.clear();
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.2f);
 
@@ -1422,7 +1513,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemRejectsSteepStaticPhysicsPlane) {
   msg.source_entity_id = 717;
   msg.target_entity_id = 717;
   msg.frames.push_back({10, 100, 0, 0, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.2f);
 
@@ -1437,7 +1528,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemAdvancesActiveStateWithoutNewInput
   msg.source_entity_id = 711;
   msg.target_entity_id = 711;
   msg.frames.push_back({20, 200, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   app_.TickMovementSystemForTest(1.0f / 30.0f);
 
   auto* entity = app_.FindRealEntity(711);
@@ -1571,7 +1662,7 @@ TEST_F(CellAppHandlersTest, TickMovementSystemDropsUnknownCommandCurve) {
   msg.source_entity_id = 725;
   msg.target_entity_id = 725;
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(1.0f / 30.0f);
 
@@ -1613,7 +1704,7 @@ TEST_F(CellAppHandlersTest, SuppressedMovementCommandDropsBufferedClientInput) {
   msg.source_entity_id = 734;
   msg.target_entity_id = 734;
   msg.frames.push_back({10, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   ASSERT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(734), 1u);
 
   const auto command = MakeNativeMovementCommand(99);
@@ -1622,7 +1713,7 @@ TEST_F(CellAppHandlersTest, SuppressedMovementCommandDropsBufferedClientInput) {
 
   msg.frames.clear();
   msg.frames.push_back({11, 101, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(734), 0u);
 
   EXPECT_TRUE(app_.NativeProvider()->ClearMovementCommand(734, 99));
@@ -1650,7 +1741,7 @@ TEST_F(CellAppHandlersTest, AllowTurnMovementCommandConsumesInputForDirectionOnl
   msg.source_entity_id = 735;
   msg.target_entity_id = 735;
   msg.frames.push_back({20, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   app_.TickMovementSystemForTest(0.5f);
 
@@ -1865,7 +1956,7 @@ TEST_F(CellAppHandlersTest, ClientMovementInputRejectsUntrustedAndCrossEntity) {
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(701), 0u);
 
   msg.target_entity_id = 702;
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(702), 0u);
 }
 
@@ -1875,7 +1966,7 @@ TEST_F(CellAppHandlersTest, ClientMovementInputDropsUnknownTarget) {
   msg.target_entity_id = 900;
   msg.frames.push_back({1, 1, 0, 127, 0, 0, 0, 16});
 
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().TotalQueueDepth(), 0u);
 }
@@ -1887,17 +1978,17 @@ TEST_F(CellAppHandlersTest, ClientMovementInputDropsInvalidClientDt) {
   msg.source_entity_id = 704;
   msg.target_entity_id = 704;
   msg.frames.push_back({1, 1, 0, 127, 0, 0, 0, 0});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(704), 0u);
 
   msg.frames.clear();
   msg.frames.push_back({2, 2, 0, 127, 0, 0, 0, 1000});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(704), 0u);
 
   msg.frames.clear();
   msg.frames.push_back({3, 3, 0, 127, 0, 0, 0, 33});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   EXPECT_EQ(app_.MovementSystemForTest().input_buffer().QueueDepth(704), 1u);
 }
 
@@ -1911,7 +2002,7 @@ TEST_F(CellAppHandlersTest, ClientMovementInputRateLimitsPacketBurst) {
   for (uint32_t seq = 1; seq <= 32; ++seq) {
     msg.frames.clear();
     msg.frames.push_back({seq, seq, 0, 127, 0, 0, 0, 16});
-    app_.OnClientMovementInputForward({}, nullptr, msg);
+    app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
   }
 
   EXPECT_LT(app_.MovementSystemForTest().input_buffer().QueueDepth(703), 32u);
@@ -1920,7 +2011,7 @@ TEST_F(CellAppHandlersTest, ClientMovementInputRateLimitsPacketBurst) {
   const auto before = app_.MovementSystemForTest().input_buffer().QueueDepth(703);
   msg.frames.clear();
   msg.frames.push_back({100, 100, 0, 127, 0, 0, 0, 16});
-  app_.OnClientMovementInputForward({}, nullptr, msg);
+  app_.OnClientMovementInputForward({}, test_support::FakeChannel(0xFEED), msg);
 
   EXPECT_GT(app_.MovementSystemForTest().input_buffer().QueueDepth(703), before);
 }

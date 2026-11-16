@@ -8,6 +8,7 @@
 #include <type_traits>
 #include <variant>
 
+#include "network/network_interface.h"
 #include "platform/environment.h"
 #include "serialization/data_section.h"
 
@@ -65,6 +66,14 @@ auto ParseBoolString(std::string_view s) -> bool {
   return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
 }
 
+auto ValidProductionValue(std::string_view value) -> bool {
+  auto lower = std::string(value);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower == "true" || lower == "false" || lower == "1" || lower == "0" || lower == "yes" ||
+         lower == "no" || lower == "on" || lower == "off";
+}
+
 void LoadStringArray(const DataSection* section, std::vector<std::string>& out) {
   if (!section) {
     return;
@@ -90,6 +99,9 @@ static const CliField kCliFields[] = {
     {"name",                       &ServerConfig::process_name},
     {"internal-port",              &ServerConfig::internal_port},
     {"external-port",              &ServerConfig::external_port},
+    {"external-dtls-certificate",  &ServerConfig::external_dtls_certificate},
+    {"external-dtls-private-key",  &ServerConfig::external_dtls_private_key},
+    {"production",                 &ServerConfig::is_production},
     {"update-hertz",               &ServerConfig::update_hertz},
     {"assembly",                   &ServerConfig::script_assembly},
     {"runtime-config",             &ServerConfig::runtime_config},
@@ -212,7 +224,13 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
 
   cfg.update_hertz =
       static_cast<int>(root->ReadUint("update_hertz", static_cast<uint32_t>(cfg.update_hertz)));
-  cfg.is_production = root->ReadBool("is_production", cfg.is_production);
+  if (auto* production = root->Child("is_production");
+      production && (!production->Children().empty() || !ValidProductionValue(production->Value())))
+    return Error{ErrorCode::kInvalidArgument, "is_production must be a boolean"};
+  if (auto* production = root->Child("is_production"))
+    cfg.is_production = ParseBoolString(production->Value());
+  cfg.external_dtls_certificate = root->ReadString("external_dtls_certificate", "");
+  cfg.external_dtls_private_key = root->ReadString("external_dtls_private_key", "");
 
   auto machined_str = root->ReadString("machined_address", "");
   if (!machined_str.empty()) {
@@ -389,6 +407,8 @@ auto ServerConfig::FromArgs(int argc, char* argv[]) -> Result<ServerConfig> {
     } else {
       for (const auto& field : kCliFields) {
         if (key == field.key) {
+          if (key == "production" && !ValidProductionValue(val))
+            return Error{ErrorCode::kInvalidArgument, "--production requires a boolean value"};
           auto err = ParseAndAssign(cfg, field.ptr, key, val);
           if (err) return *err;
           ++i;
@@ -461,6 +481,27 @@ auto ServerConfig::Load(int argc, char* argv[]) -> Result<ServerConfig> {
   }
 
   return cfg;
+}
+
+auto ServerConfig::ConfigureExternalTransport(NetworkInterface& network) const -> Result<void> {
+  const bool certificate = !external_dtls_certificate.empty();
+  const bool key = !external_dtls_private_key.empty();
+  if (certificate != key)
+    return Error{ErrorCode::kInvalidArgument,
+                 "External DTLS requires both certificate and private key"};
+  if (!certificate) {
+    if (is_production)
+      return Error{ErrorCode::kPermissionDenied,
+                   "Production public ingress requires DTLS credentials"};
+    return {};
+  }
+  auto context = TlsContext::Server(external_dtls_certificate.string(),
+                                    external_dtls_private_key.string(), TlsTransport::kDatagram);
+  if (!context) return context.Error();
+  auto configured = network.ConfigureDtls(*context);
+  if (!configured) return configured.Error();
+  network.SetRateLimit(1000);
+  return {};
 }
 
 }  // namespace atlas

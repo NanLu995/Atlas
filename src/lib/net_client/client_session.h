@@ -53,6 +53,7 @@ class ClientSession {
 
   auto SetTransportImpairment(uint32_t one_way_latency_ms, uint32_t loss_permyriad,
                               uint32_t seed) -> int32_t;
+  auto ConfigureDtls(const char* trust_file, const char* peer_identity) -> int32_t;
 
   auto SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const uint8_t* payload, int32_t len)
       -> int32_t;
@@ -94,6 +95,9 @@ class ClientSession {
   void CloseBaseAppChannel();
   void ClearSessionKey();
   void ApplyTransportImpairment(Channel* channel) const;
+  [[nodiscard]] auto SendAfterHandshake(Channel* channel, std::function<Result<void>()> send)
+      -> Result<void>;
+  void ClearTransportSend(Channel* channel);
 
   EventDispatcher dispatcher_{"net_client"};
   NetworkInterface network_{dispatcher_};
@@ -131,6 +135,10 @@ class ClientSession {
   uint32_t transport_impairment_seed_{1};
 
   std::string last_error_;
+  std::function<Result<void>()> pending_transport_send_;
+  ChannelId pending_transport_channel_{0};
+  bool dtls_required_{false};
+  bool dtls_configured_{false};
 
   static constexpr Duration kLoginTimeout{std::chrono::seconds(10)};
   static constexpr Duration kAuthTimeout{std::chrono::seconds(5)};

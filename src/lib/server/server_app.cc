@@ -188,14 +188,15 @@ auto ServerApp::Init(int argc, char* argv[]) -> bool {
   RegisterWatchers();
 
   (void)network_.InterfaceTable().RegisterTypedHandler<msg::ShutdownRequest>(
-      [this](const Address&, Channel*, const msg::ShutdownRequest& req) {
+      [this](const Address&, Channel* ch, const msg::ShutdownRequest& req) {
+        if (!machined_client_.IsMachinedChannel(ch)) return;
         ATLAS_LOG_INFO("Received ShutdownRequest (reason={}); shutting down", req.reason);
         Shutdown();
       });
 
   (void)network_.InterfaceTable().RegisterTypedHandler<machined::WatcherForward>(
       [this](const Address&, Channel* ch, const machined::WatcherForward& fwd) {
-        if (ch == nullptr) return;
+        if (!machined_client_.IsMachinedChannel(ch)) return;
         machined::WatcherReply reply;
         reply.request_id = fwd.request_id;
         if (fwd.op == machined::WatcherOp::kSet &&

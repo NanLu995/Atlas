@@ -7,6 +7,7 @@
 
 #include "server/common_messages.h"
 #include "server/server_app.h"
+#include "test_null_channel.h"
 #include "test_shutdown_access.h"
 
 using namespace atlas;
@@ -392,4 +393,123 @@ TEST(ServerApp, NextTickBoundary_PhaseAlignment) {
 
   // Zero / negative period: caller has no aligned tick to converge to.
   EXPECT_EQ(ServerApp::NextTickBoundary(epoch, epoch, Duration::zero()), epoch);
+}
+
+class MachinedSourceTest : public ::testing::Test {
+ protected:
+  EventDispatcher dispatcher_{"machined_source"};
+  NetworkInterface controller_{dispatcher_};
+  NetworkInterface network_{dispatcher_};
+  MachinedClient client_{dispatcher_, network_};
+  Channel* channel_{nullptr};
+
+  void SetUp() override {
+    dispatcher_.SetMaxPollWait(Milliseconds(1));
+    ASSERT_TRUE(controller_.StartTcpServer(Address("127.0.0.1", 0)).HasValue());
+    ASSERT_TRUE(client_.Connect(controller_.TcpAddress()));
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    while (!client_.IsConnected() && Clock::now() < deadline) dispatcher_.ProcessOnce();
+    ASSERT_TRUE(client_.IsConnected());
+    channel_ = network_.FindChannel(controller_.TcpAddress());
+    ASSERT_NE(channel_, nullptr);
+  }
+
+  template <NetworkMessage Msg>
+  void Dispatch(Channel* channel, const Msg& msg) {
+    BinaryWriter writer;
+    msg.Serialize(writer);
+    BinaryReader reader(writer.Data());
+    ASSERT_TRUE(network_.InterfaceTable()
+                    .Dispatch(controller_.TcpAddress(), channel, Msg::Descriptor().id, reader)
+                    .HasValue());
+  }
+};
+
+TEST_F(MachinedSourceTest, QueryResponseRequiresCurrentMachinedChannel) {
+  uint32_t calls = 0;
+  client_.QueryAsync(ProcessType::kBaseApp, [&](auto) { ++calls; });
+  test_support::TestNullChannel impostor(dispatcher_, network_.InterfaceTable(),
+                                         controller_.TcpAddress());
+  machined::QueryResponse response;
+  Dispatch(nullptr, response);
+  Dispatch(&impostor, response);
+  EXPECT_EQ(calls, 0u);
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 1u);
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(MachinedSourceTest, WatcherResponseRequiresCurrentMachinedChannel) {
+  uint32_t calls = 0;
+  const auto id = client_.QueryWatcher(ProcessType::kBaseApp, "", "app/name",
+                                       [&](bool, const auto&, const auto&) { ++calls; });
+  ASSERT_NE(id, 0u);
+  test_support::TestNullChannel impostor(dispatcher_, network_.InterfaceTable(),
+                                         controller_.TcpAddress());
+  machined::WatcherResponse response;
+  response.request_id = id;
+  response.found = true;
+  Dispatch(nullptr, response);
+  Dispatch(&impostor, response);
+  EXPECT_EQ(calls, 0u);
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 1u);
+  Dispatch(channel_, response);
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(MachinedSourceTest, DisconnectedMachinedCannotCompletePendingQuery) {
+  uint32_t calls = 0;
+  client_.QueryAsync(ProcessType::kBaseApp, [&](auto) { ++calls; });
+  IntrusivePtr<Channel> old_channel{channel_};
+  network_.DisconnectChannel(controller_.TcpAddress());
+  Dispatch(old_channel.get(), machined::QueryResponse{});
+  EXPECT_EQ(calls, 0u);
+  client_.Tick();
+  EXPECT_EQ(calls, 1u);
+}
+
+TEST(ServerApp, RejectsUnregisteredControlCommands) {
+  class App final : public TestServerApp {
+   public:
+    using TestServerApp::TestServerApp;
+    int value = 0;
+
+   protected:
+    void OnTickComplete() override {
+      GetWatcherRegistry().AddRw("security/value", value);
+      test_support::TestNullChannel impostor(Dispatcher(), Network().InterfaceTable(),
+                                             Address("127.0.0.1", 1234));
+      machined::WatcherForward command;
+      command.op = machined::WatcherOp::kSet;
+      command.watcher_path = "security/value";
+      command.set_value = "7";
+      BinaryWriter writer;
+      command.Serialize(writer);
+      BinaryReader reader(writer.Data());
+      EXPECT_TRUE(
+          Network()
+              .InterfaceTable()
+              .Dispatch(impostor.RemoteAddress(), &impostor, command.Descriptor().id, reader)
+              .HasValue());
+      EXPECT_EQ(value, 0);
+      BinaryWriter shutdown;
+      msg::ShutdownRequest request{0};
+      request.Serialize(shutdown);
+      BinaryReader shutdown_reader(shutdown.Data());
+      EXPECT_TRUE(Network()
+                      .InterfaceTable()
+                      .Dispatch(impostor.RemoteAddress(), &impostor, request.Descriptor().id,
+                                shutdown_reader)
+                      .HasValue());
+      EXPECT_FALSE(IsShuttingDown());
+      Shutdown();
+    }
+  };
+  EventDispatcher dispatcher("unregistered_control");
+  NetworkInterface network(dispatcher);
+  App app(dispatcher, network);
+  MinimalArgv args;
+  EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
 }

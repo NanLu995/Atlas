@@ -62,6 +62,10 @@ auto MachinedClient::IsConnected() const -> bool {
   return channel_->IsConnected();
 }
 
+auto MachinedClient::IsMachinedChannel(const Channel* channel) const -> bool {
+  return channel != nullptr && channel == channel_ && IsConnected();
+}
+
 void MachinedClient::SendRegister(const ServerConfig& cfg) {
   cached_reg_ = RegistrationInfo{cfg.process_type, cfg.process_name, cfg.internal_port,
                                  cfg.external_port, cfg.process_instance};
@@ -418,8 +422,9 @@ void MachinedClient::RegisterHandlers() {
 
 }
 
-void MachinedClient::OnRegisterAck(const Address& src, Channel* /*ch*/,
+void MachinedClient::OnRegisterAck(const Address& src, Channel* ch,
                                    const machined::RegisterAck& msg) {
+  if (!IsMachinedChannel(ch)) return;
   if (msg.success) {
     registered_ = true;
 
@@ -447,8 +452,9 @@ void MachinedClient::OnRegisterAck(const Address& src, Channel* /*ch*/,
 void MachinedClient::OnHeartbeatAck(const Address& /*src*/, Channel* /*ch*/,
                                     const machined::HeartbeatAck& /*msg*/) {}
 
-void MachinedClient::OnQueryResponse(const Address& /*src*/, Channel* /*ch*/,
+void MachinedClient::OnQueryResponse(const Address& /*src*/, Channel* ch,
                                      const machined::QueryResponse& msg) {
+  if (!IsMachinedChannel(ch)) return;
   if (sync_query_.has_value()) {
     sync_query_->result = msg.processes;
     sync_query_->done = true;
@@ -463,7 +469,7 @@ void MachinedClient::OnQueryResponse(const Address& /*src*/, Channel* /*ch*/,
 
 void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* ch,
                                          const machined::BirthNotification& msg) {
-  if (ch == nullptr || ch != channel_) return;
+  if (!IsMachinedChannel(ch)) return;
   if (msg.process_instance != 0 && msg.internal_addr != machined_addr_) {
     auto [it, inserted] = peer_instances_.try_emplace(msg.internal_addr, msg.process_instance);
     if (!inserted && it->second != msg.process_instance) {
@@ -484,7 +490,7 @@ void MachinedClient::OnBirthNotification(const Address& /*src*/, Channel* ch,
 
 void MachinedClient::OnDeathNotification(const Address& /*src*/, Channel* ch,
                                          const machined::DeathNotification& msg) {
-  if (ch == nullptr || ch != channel_) return;
+  if (!IsMachinedChannel(ch)) return;
   if (msg.process_instance != 0 && msg.internal_addr != machined_addr_) {
     auto [it, inserted] = peer_instances_.try_emplace(msg.internal_addr, msg.process_instance);
     if (!inserted && it->second != msg.process_instance) return;
@@ -497,15 +503,17 @@ void MachinedClient::OnDeathNotification(const Address& /*src*/, Channel* ch,
   }
 }
 
-void MachinedClient::OnListenerAck(const Address& /*src*/, Channel* /*ch*/,
+void MachinedClient::OnListenerAck(const Address& /*src*/, Channel* ch,
                                    const machined::ListenerAck& msg) {
+  if (!IsMachinedChannel(ch)) return;
   if (!msg.success) {
     ATLAS_LOG_WARNING("MachinedClient: listener subscription was rejected");
   }
 }
 
-void MachinedClient::OnWatcherResponse(const Address& /*src*/, Channel* /*ch*/,
+void MachinedClient::OnWatcherResponse(const Address& /*src*/, Channel* ch,
                                        const machined::WatcherResponse& msg) {
+  if (!IsMachinedChannel(ch)) return;
   auto it = pending_watchers_.find(msg.request_id);
   if (it == pending_watchers_.end()) {
     ATLAS_LOG_DEBUG("MachinedClient: watcher response rid={} has no pending callback",

@@ -43,6 +43,7 @@ class MachinedClient {
   [[nodiscard]] auto Connect(const Address& machined_addr) -> bool;
 
   [[nodiscard]] auto IsConnected() const -> bool;
+  [[nodiscard]] auto IsMachinedChannel(const Channel* channel) const -> bool;
 
   // Caches the registration so we can replay it after a reconnect.
   void SendRegister(const ServerConfig& cfg);

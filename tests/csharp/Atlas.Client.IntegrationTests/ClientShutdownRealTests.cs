@@ -29,7 +29,9 @@ public sealed class ClientShutdownRealTests
         Atlas.Def.DefBootstrap.RegisterInto(firstSession);
         Atlas.Def.DefBootstrap.RegisterInto(secondSession);
         using var first = new LoginClient(firstSession);
+        cluster.ConfigureClient(first);
         using var second = new LoginClient(secondSession);
+        cluster.ConfigureClient(second);
         var username = "shutdown_" + Guid.NewGuid().ToString("N");
         try
         {

@@ -29,6 +29,30 @@ TEST(LoginMessages, LoginRequest_RoundTrip) {
   EXPECT_EQ(out.password_hash, msg.password_hash);
 }
 
+TEST(LoginMessages, InvalidCredentialsAreRejectedAtBothLoginBoundaries) {
+  const std::pair<std::string, std::string> cases[] = {{"", "credential"},
+                                                       {"account", ""},
+                                                       {std::string("a\0b", 3), "credential"},
+                                                       {"account", std::string("p\0q", 3)}};
+  for (const auto& [username, password] : cases) {
+    LoginRequest request;
+    request.username = username;
+    request.password_hash = password;
+    BinaryWriter writer;
+    request.Serialize(writer);
+    BinaryReader reader(writer.Data());
+    EXPECT_FALSE(LoginRequest::Deserialize(reader).HasValue());
+
+    AuthLogin auth;
+    auth.username = username;
+    auth.password_hash = password;
+    BinaryWriter auth_writer;
+    auth.Serialize(auth_writer);
+    BinaryReader auth_reader(auth_writer.Data());
+    EXPECT_FALSE(AuthLogin::Deserialize(auth_reader).HasValue());
+  }
+}
+
 TEST(LoginMessages, LoginResult_Success_RoundTrip) {
   LoginResult msg;
   msg.status = LoginStatus::kSuccess;

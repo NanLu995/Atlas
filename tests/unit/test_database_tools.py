@@ -61,6 +61,10 @@ class DatabaseToolsTest(unittest.TestCase):
     def test_cluster_log_level_is_explicit_and_validated(self):
         with patch.object(sys, 'argv', ['test_cluster.py']):
             self.assertEqual(test_cluster.parse_args().log_level, 'info')
+        with patch.object(sys, 'argv', ['test_cluster.py', '--dtls-certificate', 'missing.pem']), \
+                patch.object(sys, 'stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                test_cluster.parse_args()
         with patch.object(sys, 'argv', ['test_cluster.py', '--log-level', 'debug']):
             self.assertEqual(test_cluster.parse_args().log_level, 'debug')
         with patch.object(sys, 'argv', ['test_cluster.py', '--log-level', 'invalid']), \

@@ -12,8 +12,8 @@ extern "C" {
 #endif
 
 // ABI layout: [MAJOR:8][MINOR:8][PATCH:16]; Create rejects major mismatch or newer caller minor.
-// 0x03000000 adds client handoff state and process-bound authentication replies.
-#define ATLAS_NET_ABI_VERSION 0x03000000u
+// 3.1 adds explicit DTLS configuration for public RUDP.
+#define ATLAS_NET_ABI_VERSION 0x03010000u
 
 #define ATLAS_NET_OK 0
 #define ATLAS_NET_ERR_BUSY -16
@@ -42,6 +42,8 @@ ATLAS_NET_API void AtlasNetDestroy(AtlasNetContext* ctx);
 
 // Callbacks fire synchronously. Reentrant Poll returns BUSY.
 ATLAS_NET_API int32_t AtlasNetPoll(AtlasNetContext* ctx);
+ATLAS_NET_API int32_t AtlasNetConfigureDtls(AtlasNetContext* ctx, const char* trust_file,
+                                            const char* peer_identity);
 
 typedef enum AtlasNetState {
   ATLAS_NET_STATE_DISCONNECTED = 0,

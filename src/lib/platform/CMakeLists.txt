@@ -6,6 +6,7 @@ add_library(atlas_platform STATIC
   filesystem.cc
   io_poller.cc
   io_poller_select.cc
+  password_hash.cc
   signal_handler.cc
   threading.cc
 )
@@ -47,10 +48,11 @@ target_link_libraries(atlas_platform
   PUBLIC atlas_foundation atlas_compiler_options
 )
 
+include(AtlasOpenSSL)
+target_link_libraries(atlas_platform PUBLIC OpenSSL::Crypto)
+
 if(WIN32)
   target_link_libraries(atlas_platform PUBLIC ws2_32 dbghelp bcrypt)
 elseif(UNIX)
-  find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
-  target_link_libraries(atlas_platform PUBLIC OpenSSL::Crypto)
   target_link_libraries(atlas_platform PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 endif()

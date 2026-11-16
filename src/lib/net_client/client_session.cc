@@ -67,6 +67,7 @@ ClientSession::ClientSession() {
       return;
     }
     if (&channel != loginapp_channel_ && &channel != baseapp_channel_) return;
+    ClearTransportSend(&channel);
     if (&channel == loginapp_channel_) loginapp_channel_ = nullptr;
     if (&channel == baseapp_channel_) baseapp_channel_ = nullptr;
     connection_lost_ = true;
@@ -86,6 +87,22 @@ auto ClientSession::Poll() -> int32_t {
   if (polling_) return ATLAS_NET_ERR_BUSY;
   polling_ = true;
   dispatcher_.ProcessOnce();
+  if (pending_transport_send_ && !pending_disconnect_) {
+    auto* channel = network_.FindChannel(pending_transport_channel_);
+    if (!channel) {
+      pending_transport_send_ = {};
+      pending_transport_channel_ = 0;
+      connection_lost_ = true;
+      pending_disconnect_ = ATLAS_DISCONNECT_INTERNAL;
+    } else if (network_.IsRudpReady(channel->RemoteAddress())) {
+      auto send = std::exchange(pending_transport_send_, {});
+      pending_transport_channel_ = 0;
+      if (!send()) {
+        connection_lost_ = true;
+        pending_disconnect_ = ATLAS_DISCONNECT_INTERNAL;
+      }
+    }
+  }
   polling_ = false;
   if (auto reason = std::exchange(pending_disconnect_, std::nullopt)) {
     const bool lost = std::exchange(connection_lost_, false);
@@ -102,6 +119,8 @@ auto ClientSession::Poll() -> int32_t {
 }
 
 void ClientSession::PrepareForDestroy() {
+  pending_transport_send_ = {};
+  pending_transport_channel_ = 0;
   (void)SetCallbacks(AtlasNetCallbacks{});
   login_callback_ = nullptr;
   login_user_data_ = nullptr;
@@ -118,9 +137,14 @@ auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp
     last_error_ = "AtlasNetLogin requires Disconnected state";
     return ATLAS_NET_ERR_BUSY;
   }
-  if (loginapp_host.empty() || loginapp_port == 0 || !callback) {
+  if (loginapp_host.empty() || loginapp_port == 0 || !callback ||
+      !login::AreCredentialsValid(username, password_hash)) {
     last_error_ = "AtlasNetLogin: invalid args";
     return ATLAS_NET_ERR_INVAL;
+  }
+  if (dtls_required_ && !dtls_configured_) {
+    last_error_ = "DTLS configuration failed; plaintext login is prohibited";
+    return ATLAS_NET_ERR_NOCONN;
   }
 
   Address login_addr(loginapp_host, loginapp_port);
@@ -147,7 +171,8 @@ auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp
   req.username = std::string(username);
   req.password_hash = std::string(password_hash);
   req.entity_def_digest = entity_def_digest_;
-  auto sent = loginapp_channel_->SendMessage(req);
+  auto sent = SendAfterHandshake(
+      loginapp_channel_, [channel = loginapp_channel_, req] { return channel->SendMessage(req); });
   if (!sent) {
     last_error_ = std::format("Send(LoginRequest) failed: {}", sent.Error().Message());
     (void)Disconnect(ATLAS_DISCONNECT_USER);
@@ -254,7 +279,9 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
   ::atlas::baseapp::Authenticate auth_msg;
   auth_msg.supports_handoff = true;
   std::memcpy(auth_msg.session_key.bytes, session_key_.data(), session_key_.size());
-  auto send_result = baseapp_channel_->SendMessage(auth_msg);
+  auto send_result = SendAfterHandshake(baseapp_channel_, [channel = baseapp_channel_, auth_msg] {
+    return channel->SendMessage(auth_msg);
+  });
   ATLAS_LOG_INFO("ClientSession: sent Authenticate to {} (send_ok={})",
                  baseapp_addr_.ToString(), static_cast<bool>(send_result));
   if (!send_result) {
@@ -357,7 +384,11 @@ void ClientSession::OnClientHandoff(const ::atlas::baseapp::ClientHandoff& msg) 
   ::atlas::baseapp::Authenticate authenticate;
   authenticate.supports_handoff = true;
   authenticate.session_key = msg.credential;
-  if (auto sent = baseapp_channel_->SendMessage(authenticate); !sent) {
+  if (auto sent = SendAfterHandshake(baseapp_channel_,
+                                     [channel = baseapp_channel_, authenticate] {
+                                       return channel->SendMessage(authenticate);
+                                     });
+      !sent) {
     FailClientHandoff("Client handoff authentication send failed");
     return;
   }
@@ -485,6 +516,8 @@ auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
     return ATLAS_NET_OK;
   }
   const bool was_connected = state_ != ATLAS_NET_STATE_DISCONNECTED;
+  pending_transport_send_ = {};
+  pending_transport_channel_ = 0;
 
   CancelLoginTimeout();
   CancelAuthTimeout();
@@ -509,6 +542,42 @@ auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
     callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_LoggedOff);
   }
   return ATLAS_NET_OK;
+}
+
+auto ClientSession::ConfigureDtls(const char* trust_file, const char* peer_identity) -> int32_t {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_DISCONNECTED) return ATLAS_NET_ERR_BUSY;
+  dtls_required_ = true;
+  dtls_configured_ = false;
+  if (!trust_file || !peer_identity || !*trust_file || !*peer_identity) return ATLAS_NET_ERR_INVAL;
+  auto context = TlsContext::Client(trust_file, TlsTransport::kDatagram);
+  if (!context) {
+    last_error_ = std::string(context.Error().Message());
+    return ATLAS_NET_ERR_INVAL;
+  }
+  auto configured = network_.ConfigureDtls(*context, peer_identity);
+  if (!configured) {
+    last_error_ = std::string(configured.Error().Message());
+    return ATLAS_NET_ERR_INVAL;
+  }
+  dtls_configured_ = true;
+  return ATLAS_NET_OK;
+}
+
+auto ClientSession::SendAfterHandshake(Channel* channel, std::function<Result<void>()> send)
+    -> Result<void> {
+  if (network_.IsRudpReady(channel->RemoteAddress())) return send();
+  if (pending_transport_send_)
+    return Error{ErrorCode::kWouldBlock, "A transport send is already awaiting handshake"};
+  pending_transport_channel_ = channel->ChannelId();
+  pending_transport_send_ = std::move(send);
+  return {};
+}
+
+void ClientSession::ClearTransportSend(Channel* channel) {
+  if (channel && pending_transport_channel_ == channel->ChannelId()) {
+    pending_transport_send_ = {};
+    pending_transport_channel_ = 0;
+  }
 }
 
 auto ClientSession::SetTransportImpairment(uint32_t one_way_latency_ms, uint32_t loss_permyriad,
@@ -689,6 +758,7 @@ void ClientSession::SetEntityDefDigest(const uint8_t* data, int32_t len) {
 }
 
 void ClientSession::CloseLoginAppChannel() {
+  ClearTransportSend(loginapp_channel_);
   if (loginapp_channel_) {
     // CondemnChannel removes the entry from NetworkInterface.channels_; without
     // it a subsequent ConnectRudp(login_addr) would reuse this dead channel.
@@ -698,6 +768,7 @@ void ClientSession::CloseLoginAppChannel() {
 }
 
 void ClientSession::CloseBaseAppChannel() {
+  ClearTransportSend(baseapp_channel_);
   if (baseapp_channel_) {
     network_.DisconnectChannel(baseapp_channel_->RemoteAddress());
     baseapp_channel_ = nullptr;

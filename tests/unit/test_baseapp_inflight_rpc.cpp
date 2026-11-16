@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -7,6 +8,7 @@
 
 #include "baseapp/baseapp.h"
 #include "baseapp/baseapp_messages.h"
+#include "baseapp/baseapp_native_provider.h"
 #include "cellapp/cellapp_messages.h"
 #include "coro/entity_rpc_reply.h"
 #include "entitydef/entity_def_registry.h"
@@ -36,7 +38,12 @@ class RecordingChannel final : public Channel {
 };
 
 // Cell-direction (bits 22-23 == 0b10), exposed to the owning client.
-constexpr uint32_t kCellRpcId = 0x00800001u;
+constexpr uint32_t kCellRpcId = 0x00800701u;
+uint32_t dispatched_rpcs = 0;
+
+void RecordRpc(uint32_t, uint32_t, intptr_t, const uint8_t*, int32_t, uint64_t) {
+  ++dispatched_rpcs;
+}
 
 auto ForwardedRpcs(const RecordingChannel& ch) -> std::vector<cellapp::ClientCellRpcForward> {
   std::vector<cellapp::ClientCellRpcForward> out;
@@ -94,7 +101,27 @@ class BaseAppInflightRpcTest : public ::testing::Test {
     client_ch_ = make_intrusive<RecordingChannel>(dispatcher_, table_, client_addr_);
   }
 
-  void TearDown() override { EntityDefRegistry::Instance().clear(); }
+  void TearDown() override {
+    dispatched_rpcs = 0;
+    EntityDefRegistry::Instance().clear();
+  }
+
+  void EnableRpcDispatch() {
+    native_provider_holder_ = app_.CreateNativeProvider();
+    const struct {
+      RestoreEntityFn restore;
+      GetEntityDataFn get_data;
+      EntityDestroyedFn destroyed;
+      DispatchRpcFn dispatch;
+    } callbacks{nullptr, nullptr, nullptr, &RecordRpc};
+    app_.GetNativeProvider().SetNativeCallbacks(&callbacks, sizeof(callbacks));
+  }
+
+  void SendBaseRpc(uint32_t rpc_id) {
+    baseapp::ClientBaseRpc msg;
+    msg.rpc_id = rpc_id;
+    app_.OnClientBaseRpc(*client_ch_, msg);
+  }
 
   // Seed a client-bound entity that has NOT been placed on a cell yet, so
   // CellAddr().Port() == 0 and incoming cell RPCs buffer.
@@ -109,10 +136,10 @@ class BaseAppInflightRpcTest : public ::testing::Test {
     return entity->EntityId();
   }
 
-  void SendCellRpc(EntityID target, std::byte tag) {
+  void SendCellRpc(EntityID target, std::byte tag, uint32_t rpc_id = kCellRpcId) {
     baseapp::ClientCellRpc msg;
     msg.target_entity_id = target;
-    msg.rpc_id = kCellRpcId;
+    msg.rpc_id = rpc_id;
     msg.payload = {tag};
     app_.OnClientCellRpc(*client_ch_, msg);
   }
@@ -151,6 +178,7 @@ class BaseAppInflightRpcTest : public ::testing::Test {
   Address client_addr_{0x7F000001u, 0};
   Address cell_addr_;
   BaseApp app_;
+  std::unique_ptr<INativeApiProvider> native_provider_holder_;
   IntrusivePtr<RecordingChannel> cell_ch_;
   IntrusivePtr<RecordingChannel> client_ch_;
 
@@ -158,6 +186,7 @@ class BaseAppInflightRpcTest : public ::testing::Test {
   static void RegisterCellRpc() {
     auto& reg = EntityDefRegistry::Instance();
     EntityTypeDescriptor type;
+    type.type_id = 7;
     RpcDescriptor rpc;
     rpc.rpc_id = kCellRpcId;
     rpc.exposed = ExposedScope::kOwnClient;
@@ -166,6 +195,54 @@ class BaseAppInflightRpcTest : public ::testing::Test {
     reg.rpc_to_type[kCellRpcId] = reg.types.size() - 1;
   }
 };
+
+TEST_F(BaseAppInflightRpcTest, CellRpcRejectsAnExposedComponentMethodFromAnotherEntityType) {
+  const auto id = SeedClientEntityWithoutCell();
+  DeliverCurrentCell(id);
+  auto& registry = EntityDefRegistry::Instance();
+  constexpr uint32_t kForeignRpc = (1u << 24) | 0x00800801u;
+  EntityTypeDescriptor other;
+  other.type_id = 8;
+  RpcDescriptor rpc;
+  rpc.rpc_id = kForeignRpc;
+  rpc.exposed = ExposedScope::kOwnClient;
+  other.rpcs.push_back(rpc);
+  registry.rpc_to_type[kForeignRpc] = registry.types.size();
+  registry.types.push_back(std::move(other));
+
+  SendCellRpc(id, std::byte{0}, kForeignRpc);
+  EXPECT_TRUE(ForwardedRpcs(*cell_ch_).empty());
+  SendCellRpc(id, std::byte{1});
+  EXPECT_EQ(ForwardedRpcs(*cell_ch_).size(), 1u);
+}
+
+TEST_F(BaseAppInflightRpcTest, BaseRpcRejectsAnExposedComponentMethodFromAnotherEntityType) {
+  SeedClientEntityWithoutCell();
+  EnableRpcDispatch();
+  auto& registry = EntityDefRegistry::Instance();
+  constexpr uint32_t kOwnRpc = (1u << 24) | 0x00C00701u;
+  constexpr uint32_t kForeignRpc = (1u << 24) | 0x00C00801u;
+  RpcDescriptor rpc;
+  rpc.rpc_id = kOwnRpc;
+  rpc.exposed = ExposedScope::kNone;
+  registry.types[0].rpcs.push_back(rpc);
+  registry.rpc_to_type[kOwnRpc] = 0;
+  rpc.rpc_id = kForeignRpc;
+  rpc.exposed = ExposedScope::kOwnClient;
+  EntityTypeDescriptor other;
+  other.type_id = 8;
+  other.rpcs.push_back(rpc);
+  registry.rpc_to_type[kForeignRpc] = registry.types.size();
+  registry.types.push_back(std::move(other));
+
+  SendBaseRpc(kForeignRpc);
+  EXPECT_EQ(dispatched_rpcs, 0u);
+  SendBaseRpc(kOwnRpc);
+  EXPECT_EQ(dispatched_rpcs, 0u);
+  registry.types[0].rpcs.back().exposed = ExposedScope::kOwnClient;
+  SendBaseRpc(kOwnRpc);
+  EXPECT_EQ(dispatched_rpcs, 1u);
+}
 
 TEST_F(BaseAppInflightRpcTest, BuffersDuringNoCellThenDrainsInOrderOnCurrentCell) {
   const EntityID eid = SeedClientEntityWithoutCell();

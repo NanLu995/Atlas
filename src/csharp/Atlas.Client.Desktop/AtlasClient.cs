@@ -38,6 +38,12 @@ public sealed class AtlasClient : IDisposable
 
     public event Action<AtlasNetState>? StateChanged;
 
+    public void ConfigureDtls(string trustFile, string serverIdentity)
+    {
+        ThrowIfDisposed();
+        _login.ConfigureDtls(trustFile, serverIdentity);
+    }
+
     public async AtlasTask ConnectAsync(string loginAppHost, ushort loginAppPort,
         string username, string passwordHash, AtlasCancellationToken ct = default)
     {

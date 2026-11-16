@@ -141,7 +141,7 @@ Linux:
 - GCC 13+ or Clang with C++20 support
 - CMake 3.28+
 - Ninja for the debug preset
-- OpenSSL 3.0+ Crypto development files (`libssl-dev` on Ubuntu)
+- Pinned OpenSSL 3.5.9 SDK built with the command below (requires Perl and make)
 - .NET SDK satisfying `global.json` (10.0.202 or a later stable feature band);
   Ubuntu 26.04's 10.0.1xx SDK does not satisfy this requirement.
 - Python 3.9+
@@ -181,12 +181,96 @@ tools\bin\build.bat debug --build-only
 tools\bin\build.bat debug --build-dir build/verify-windows
 ```
 
+The standalone OpenSSL SDK builder pins the official 3.5.9 archive and SHA-256,
+builds static libraries, runs upstream tests, and preserves the license, authors and source
+receipt under `build/openssl/3.5.9/Debug`. Use `tools\bin\build_openssl.bat --config Debug`
+on Windows or `bash tools/bin/build_openssl.sh --config Debug` on Linux x64. Native Perl and
+NASM are required on Windows; `--perl` / `--nasm` select existing tools. `--archive` supports
+offline builds, and `--help` describes the isolated prefix and Release build options.
+Prepare the SDK before configuring Atlas: Debug builds select Debug, other build types select
+Release (an unset build type selects Debug). `-DOPENSSL_ROOT_DIR=<SDK directory>` overrides
+the location. Missing or wrong-version SDKs fail configuration without a system-library fallback.
+The builder requires Python 3.11.8+; output binaries retain OpenSSL notices in `licenses/OpenSSL`.
+Building this SDK alone does not enable encryption on running listeners.
+
+The native `TlsContext` / `TlsStream` transport primitive fixes TLS 1.3, requires an explicit
+client trust file and target DNS/IP identity, and validates certificate subject alternative names.
+Server setup rejects missing certificates or mismatched keys. Each stream bounds each ciphertext
+direction to 64 KiB and reports backpressure; incomplete or tampered records never reach application
+reads. The stream primitive is not connected to `TcpChannel`; public RUDP uses DTLS below.
+`test_tls_stream` generates isolated test
+certificates with the pinned SDK and does not install trust roots in the operating system.
+`TlsTransport::kDatagram` reuses the certificate contract with DTLS 1.2 and preserves datagram
+boundaries in bounded BIO queues. Ciphertext MTU is 1200 bytes; `DatagramPayloadMtu()` reports
+the usable application size after handshake. Oversized writes and truncating reads are rejected.
+OpenSSL rejects replayed or invalid authenticated records; valid later datagrams remain usable.
+The retransmission timeout API is available for dispatcher timers.
+`NetworkInterface.ConfigureDtls` now provides explicit native shared-UDP integration before socket
+creation. The configured interface rejects plaintext, decrypts before RUDP parsing, and encrypts
+RUDP headers, ACKs, fragments and retransmissions. Callers must wait for `IsRudpReady` before sending;
+early sends return `WouldBlock`. The dispatcher drives handshake retransmissions, allows at most
+128 unfinished handshakes and expires them after 10 seconds. Draining peers retain their own DTLS
+session; closed sessions are not reused for a fresh RUDP channel. Socket backpressure retains one
+pending ciphertext datagram alongside the bounded BIO queue.
+Unknown peers first pass OpenSSL's stateless DTLS Cookie exchange.
+The Cookie binds source IPv4 address, UDP port and a 60-second timestamp to a context-local random
+HMAC key. Invalid, expired or cross-context Cookies do not admit a persistent handshake. Unverified
+requests receive at most one challenge no larger than their incoming datagram; they consume no
+persistent session slots. The 128-handshake limit applies after address verification.
+
+
+LoginApp and BaseApp public RUDP accept `--external-dtls-certificate <chain.pem>` and
+`--external-dtls-private-key <key.pem>` (JSON keys `external_dtls_certificate` and
+`external_dtls_private_key`). Both files are required together; invalid credentials reject startup.
+`--production true` / JSON `is_production: true` requires DTLS when a public listener is enabled.
+Invalid production boolean values are rejected. Development plaintext is available when DTLS is
+not selected and production is false. The isolated cluster launcher accepts `--dtls-certificate`
+and `--dtls-private-key` and starts public processes in production mode.
+SDK ABI 3.1 adds `AtlasNetConfigureDtls`; desktop C# calls
+`LoginClient.ConfigureDtls(trustFile, serverIdentity)` before login. Login, authentication and
+handoff wait for DTLS. Explicit configuration failure prevents plaintext login; cancellation and
+disconnect clear pending sends. Build the CMake `_deploy` targets before copying matching SDK DLLs.
+The desktop `AtlasClient` facade forwards the same `ConfigureDtls` method before `ConnectAsync`.
+Real-cluster C# integration tests select encryption with all four environment variables:
+`ATLAS_TEST_DTLS_CERTIFICATE`, `ATLAS_TEST_DTLS_PRIVATE_KEY`, `ATLAS_TEST_DTLS_CA` and
+`ATLAS_TEST_DTLS_SERVER_IDENTITY`. Partial configuration rejects before launching the cluster;
+`ATLAS_TEST_BASE_ASSEMBLY` supplies the default fixture assembly. These tests use MySQL by default.
+
+RUDP rejects datagrams exceeding the channel MTU before buffering or processing ACKs. Fragments
+require a sequence number, a nonempty payload no larger than `MaxUdpPayload()`, and a valid index
+and count before their sequence is recorded. Reassembly keeps the existing group cap and timeout.
+The optional `CompressionFilter` limits application payloads to 16 MiB on send and receive;
+compressed packets must contain exactly one complete zlib stream with the declared output length.
+Malformed, trailing and oversized input returns an error. This filter is not installed on public
+listeners by default.
+Public Base/Cell RPCs must belong to the target entity type as well as satisfy direction and
+exposure checks. CellApp repeats this validation after forwarding; another entity type's exposed
+component method cannot authorize dispatch on the target's component slot.
+Cross-entity `AllClients` calls require the receiving CellApp to confirm the caller's active Real
+Witness has already published the target's Enter and has not observed Leave. Missing authority,
+another space, a Ghost caller or an unseen target is rejected; reply RPCs receive `ReceiverGone`.
+Cross-Cell visibility authorization is not implemented; Ghost coordinates are not proof of access.
+Own-entity calls retain their existing behavior.
+
+Keep cluster TCP/RUDP and machined management ports on a trusted private network, restricted by
+deployment firewall rules. Internal transport is not encrypted. Workers accept machined query,
+notification, Watcher and shutdown control messages only on their current machined TCP connection.
+CellApp binds registered BaseApp trust to the current channel instance, clears it on disconnect,
+and rejects stale or other-channel client RPC/movement forwards. Process-instance notifications
+from machined invalidate replaced peer channels. Administrative tools must forward worker commands
+through machined; directly sending management messages to a worker is rejected.
+
 Direct CMake remains supported:
 
 ```bash
 cmake --preset debug
 cmake --build build/debug --config Debug
 ```
+
+Native tests also support `-DATLAS_BUILD_CSHARP=OFF -DATLAS_BUILD_NET_CLIENT=OFF` in an isolated
+build directory. Managed host/hot-reload tests follow the C# build option; native SDK tests follow
+the client-library option. TLS/DTLS transport tests remain enabled. The default build includes all
+managed and SDK tests.
 
 | Preset | Purpose |
 |---|---|
@@ -434,9 +518,9 @@ both backends. SQLite stores the SHA-256 request digest and result in `atlas_wri
 in the modification's transaction.
 Backups must retain these receipts. Receipts do not expire automatically.
 Request digests use [Windows CNG](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcrypthash)
-or the system [OpenSSL EVP API](https://docs.openssl.org/3.5/man3/EVP_DigestInit/).
+or the pinned [OpenSSL EVP API](https://docs.openssl.org/3.5/man3/EVP_DigestInit/).
 OpenSSL 3.0+ uses [Apache-2.0](https://openssl-library.org/source/license/index.html);
-the Linux setup and CI install its distribution development package.
+the pinned SDK and output binaries retain its license and source receipt.
 Write replays return the original DBID and any originally issued lease without executing
 again or releasing a newer owner. Checkout retries retain their random operation ID across
 DBApp changes and confirm the original entity and ownership version. Database receipts reject
@@ -697,6 +781,18 @@ output before the next serialization callback or runtime reset can release its p
 its time scale; it is zero before the first tick, while paused, and after a clock reset.
 `Time.ServerTime` is monotonic time in seconds with an unspecified epoch, not a UTC timestamp.
 `SpaceMaster.Register` is a BaseApp operation; unsupported providers log an explicit error.
+Login credentials must have nonempty usernames and credentials without embedded NUL bytes.
+The desktop client rejects these inputs before native string conversion; native clients,
+login message parsers and DBApp also reject them before account lookup or creation.
+DBApp derives account credentials with Argon2id v19 (64 MiB, 3 iterations, 4 lanes,
+16-byte random salt, 32-byte output) on background workers. Both database backends store
+the resulting PHC record; raw legacy records and unsupported parameters cannot authenticate.
+No credential migration is provided. The existing login credential argument remains the input;
+clients do not send the server's stored PHC record. Authentication allows two active requests
+through lookup, derivation and commit confirmation, plus 128 queued requests. A full queue returns
+`ServerBusy`; shutdown rejects waiters with `ServerNotReady` and drains in-flight work.
+`dbapp/auth_active` and `dbapp/auth_queued` expose these counts. Password storage hardening is
+independent of transport encryption; configure the public DTLS listeners described above.
 Pending RPC registrations reject duplicate keys without replacing the original waiter.
 Replies must arrive on the registered channel; duplicate, late and wrong-channel replies
 cannot complete that waiter. Cancellation stops waiting and prevents generated calls that

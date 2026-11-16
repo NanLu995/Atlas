@@ -129,7 +129,7 @@ Linux：
 - GCC 13+ 或支持 C++20 的 Clang
 - CMake 3.28+
 - debug 预设需要 Ninja
-- OpenSSL 3.0+ Crypto 开发文件（Ubuntu 包名 `libssl-dev`）
+- 使用下方命令构建的固定 OpenSSL 3.5.9 SDK（需要 Perl 与 make）
 - .NET SDK 必须满足 `global.json`（10.0.202 或更新的稳定 feature band）；
   Ubuntu 26.04 提供的 10.0.1xx SDK 不满足此要求。
 - Python 3.9+
@@ -168,12 +168,79 @@ tools\bin\build.bat debug --build-only
 tools\bin\build.bat debug --build-dir build/verify-windows
 ```
 
+独立 OpenSSL SDK 工具固定官方 3.5.9 发布包及 SHA-256，构建静态库、执行上游测试，
+并在 `build/openssl/3.5.9/Debug` 保留许可证、作者和来源记录。Windows 使用
+`tools\bin\build_openssl.bat --config Debug`，Linux x64 使用
+`bash tools/bin/build_openssl.sh --config Debug`。Windows 需要原生 Perl 和 NASM，
+可通过 `--perl` / `--nasm` 指定现有工具；`--archive` 支持离线构建，`--help` 说明
+隔离安装目录与 Release 选项。须先准备 SDK，再配置 Atlas：Debug 构建选择 Debug，
+其他构建类型选择 Release；未设置构建类型时选择 Debug。可用 `-DOPENSSL_ROOT_DIR=<SDK 目录>`
+指定位置。SDK 缺失或版本不符时配置失败，不回退系统库。构建工具需要 Python 3.11.8+，
+产物目录的 `licenses/OpenSSL` 保留许可证与来源。仅构建此 SDK 不会为正在运行的监听端启用加密。
+
+原生 `TlsContext` / `TlsStream` 传输原语固定 TLS 1.3，客户端必须明确提供信任文件和
+目标 DNS/IP 身份，并校验证书 SAN。服务端拒绝证书缺失或私钥不匹配；每个流的两个
+密文方向各限制为 64 KiB，缓冲区满时返回背压，不完整或篡改的记录不会交给应用读取。
+流原语尚未连接 `TcpChannel`；公网 RUDP 使用下述 DTLS 接入。
+`test_tls_stream` 使用固定 SDK 生成隔离测试证书，不向操作系统安装信任根。
+`TlsTransport::kDatagram` 复用证书契约，使用 DTLS 1.2，并在有界 BIO 队列中保留数据报边界。
+密文 MTU 为 1200 字节，握手后通过 `DatagramPayloadMtu()` 获取扣除加密开销的应用上限，
+拒绝超大写入及会截断的读取。OpenSSL 丢弃重放或认证失败的记录，后续有效数据报仍可接收。
+重传超时接口已提供，可接入事件循环计时器。
+原生 `NetworkInterface.ConfigureDtls` 已提供共享 UDP 接入，必须在创建 socket 前配置；
+配置后拒绝明文，先解密再解析 RUDP，并加密 RUDP 包头、ACK、分片与重传。
+调用方须等待 `IsRudpReady` 后发送，提前发送返回 `WouldBlock`。事件循环驱动握手重传，
+最多保留 128 项未完成握手，10 秒到期清理。排空中的通道保留自己的 DTLS 会话，关闭后
+不把旧会话复用于新 RUDP 通道。socket 背压保留一个待发密文数据报，BIO 队列仍有界。
+未知来源先经过 OpenSSL 无状态 DTLS Cookie 往返，Cookie 使用上下文独立安全随机密钥，
+以 HMAC 绑定来源 IPv4、UDP 端口及有效期 60 秒的时间戳。错误、过期或跨上下文 Cookie
+不能进入持久握手；未验证请求至多收到一个不大于输入数据报的挑战，不占用持久会话名额。
+128 项握手上限在来源地址验证通过后生效。
+
+
+LoginApp、BaseApp 公网 RUDP 支持 `--external-dtls-certificate <chain.pem>` 与
+`--external-dtls-private-key <key.pem>`，JSON 对应 `external_dtls_certificate`、
+`external_dtls_private_key`。两项须同时提供，证书错误拒绝启动；`--production true` 或
+JSON `is_production: true` 在启用公网监听时强制 DTLS，错误布尔值明确拒绝。
+未选择 DTLS 且非生产时可运行明文开发模式。隔离集群工具接受 `--dtls-certificate`、
+`--dtls-private-key`，提供后以生产模式启动公网进程。
+SDK ABI 3.1 新增 `AtlasNetConfigureDtls`；桌面 C# 在登录前调用
+`LoginClient.ConfigureDtls(trustFile, serverIdentity)`。登录、认证及移交等待 DTLS 握手，
+显式配置失败后禁止明文登录，取消或断线清理待发工作。分发 SDK 前须构建 CMake 的
+`_deploy` 目标并复制配套 DLL，不需要安装系统信任根。
+桌面 `AtlasClient` 门面在 `ConnectAsync` 前提供相同的 `ConfigureDtls` 转发方法。
+真实集群 C# 集成测试须同时设置四个环境变量以选择加密：`ATLAS_TEST_DTLS_CERTIFICATE`、
+`ATLAS_TEST_DTLS_PRIVATE_KEY`、`ATLAS_TEST_DTLS_CA`、`ATLAS_TEST_DTLS_SERVER_IDENTITY`；
+缺少任何一项时在启动集群前拒绝。`ATLAS_TEST_BASE_ASSEMBLY` 提供默认夹具程序集，测试默认使用 MySQL。
+
+RUDP 在缓冲或处理 ACK 前拒绝超过通道 MTU 的数据报。分片须携带序号、有效的索引和片数，
+且负载非空、不超过 `MaxUdpPayload()`，通过后才记录接收序号；保留现有重组表上限和超时。
+可选 `CompressionFilter` 的发送及接收应用负载均限制为 16 MiB；压缩包必须恰好包含一个
+完整 zlib 流，实际解压长度须与声明一致，损坏、尾随及超限输入返回错误。
+公网监听器默认未安装此压缩过滤器。
+公网 Base/Cell RPC 除方向及暴露权限外，还须属于目标实体类型；CellApp 转发后再次校验，
+不能借用另一实体类型的公开组件方法，进入目标实体的组件槽位分发。
+跨实体 `AllClients` 调用要求接收 CellApp 能确认调用者的有效 Real Witness 已发布目标的 Enter，
+且尚未观察到 Leave。缺少权威可见范围、不同空间、Ghost 调用者或不可见目标均拒绝，
+有回复 RPC 返回 `ReceiverGone`。尚未实现跨 Cell 可见性授权，不用 Ghost 坐标作为访问凭证；
+调用自身实体保留原有行为。
+
+集群 TCP/RUDP 与 machined 管理端口须部署在可信专网，并以部署防火墙规则限制访问；
+内部传输未加密。Worker 只接受当前 machined TCP 连接上的查询回复、通知、Watcher 及停服命令。
+CellApp 将已登记 BaseApp 的信任绑定到当前通道实例，断线时清理，拒绝旧通道或其他通道的
+客户端 RPC/移动转发；machined 进程实例通知使被替换的旧连接失效。
+管理工具须通过 machined 转发 Worker 命令，直接向 Worker 发送管理消息会被拒绝。
+
 也支持直接调用 CMake：
 
 ```bash
 cmake --preset debug
 cmake --build build/debug --config Debug
 ```
+
+可在独立构建目录使用 `-DATLAS_BUILD_CSHARP=OFF -DATLAS_BUILD_NET_CLIENT=OFF` 运行原生测试。
+托管宿主及热重载测试跟随 C# 构建开关，原生 SDK 测试跟随客户端库开关；TLS/DTLS 传输测试仍保留。
+默认构建继续包含全部托管及 SDK 测试。
 
 | 预设 | 用途 |
 |---|---|
@@ -389,9 +456,9 @@ checkout 和首次保存，包括其他 DBApp 中已排队的请求。该表须�
 SQLite 将请求的 SHA-256 摘要和结果与数据修改一同保存到 `atlas_write_receipts`。
 备份必须保留回执，回执不自动过期。
 请求摘要使用 [Windows CNG](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcrypthash)
-或系统 [OpenSSL EVP 接口](https://docs.openssl.org/3.5/man3/EVP_DigestInit/)。
+或固定版本的 [OpenSSL EVP 接口](https://docs.openssl.org/3.5/man3/EVP_DigestInit/)。
 OpenSSL 3.0+ 使用 [Apache-2.0](https://openssl-library.org/source/license/index.html)，
-Linux 配置工具及 CI 安装发行版提供的开发包。
+固定 SDK 与二进制产物保留其许可证及来源记录。
 写入重放返回原 DBID 及首次保存时发放的租约，不会再次执行或释放新持有者。checkout 跨 DBApp
 重试保留同一随机操作标识，确认原实体和原所有权版本；数据库回执在租约已释放或被替代时返回
 `checkout_lease_expired`，不会重新获取。DBApp 也可能先根据本地状态拒绝持有者冲突。
@@ -617,6 +684,15 @@ Cell 脚本通过 `AddProximity(range, userArg)` 创建邻近控制器，并重�
 时间缩放；首个 tick 前、暂停和时钟重置后为零。`Time.ServerTime` 为起点未指定的单调
 时钟秒数，不是 UTC 时间戳。
 `SpaceMaster.Register` 属于 BaseApp 操作；不支持的 Provider 会明确记录错误。
+登录用户名和凭据均须非空，且不能包含嵌入的 NUL 字节。桌面客户端在原生字符串转换前
+拒绝这些输入；原生客户端、登录消息解析及 DBApp 也在账号查询或创建前拒绝。
+DBApp 在后台线程使用 Argon2id v19（64 MiB、3 次迭代、4 lanes、16 字节随机盐、
+32 字节输出）派生账号凭据，两个数据库后端均保存生成的 PHC 记录；旧的原始凭据记录
+及不支持的参数无法认证，不提供凭据迁移。客户端继续传入现有登录参数，不能把服务端
+存储的 PHC 记录作为登录凭据发送。认证最多处理 2 项完整请求（查询、派生、提交确认），
+另有 128 项等待队列；队列满返回 `ServerBusy`，停服以 `ServerNotReady` 拒绝等待者，
+并排空在途工作。`dbapp/auth_active`、`dbapp/auth_queued` 可查询数量。
+密码存储加固与传输加密独立；公网接入须配置上文的 DTLS 监听参数。
 等待注册遇到重复键时明确拒绝，不替换原等待者。回复必须来自注册的通道，重复、晚到及
 错误通道的回复不能完成该等待者。取消表示停止等待，并阻止发送前已取消的生成调用；
 不承诺撤销远端已经执行的工作。

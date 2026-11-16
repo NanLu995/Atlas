@@ -527,7 +527,7 @@ class CellApp : public EntityApp, public CellMovementHost {
 
   // Inbound ClientCellRpcForward must come from this trusted set.
   // Otherwise the sender could bypass BaseApp validation.
-  std::unordered_set<Address> trusted_baseapps_;
+  std::unordered_map<Address, IntrusivePtr<Channel>> trusted_baseapps_;
 
   // Per-source spoofing audit; source != target on own-client paths
   // means desync or forgery. Aggregated by source entity.
@@ -554,7 +554,9 @@ class CellApp : public EntityApp, public CellMovementHost {
  public:
   // Test-only - production callers don't touch this; the machined
   // Subscribe callback in Init is the only writer.
-  void InsertTrustedBaseAppForTest(const Address& addr) { trusted_baseapps_.insert(addr); }
+  void InsertTrustedBaseAppForTest(const Address& addr, Channel* channel) {
+    trusted_baseapps_.insert_or_assign(addr, IntrusivePtr<Channel>{channel});
+  }
 
   [[nodiscard]] auto MovementSystemForTest() -> CellMovementSystem& { return movement_system_; }
   [[nodiscard]] auto MovementPhysicsQueryForTest(SpaceID space_id)

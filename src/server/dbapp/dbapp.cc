@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <utility>
 
 #include "db/entity_blob.h"
 #include "db/write_operation.h"
@@ -12,6 +13,7 @@
 #include "network/channel.h"
 #include "network/machined_types.h"
 #include "network/reliable_udp.h"
+#include "platform/password_hash.h"
 #include "server/db_shard_routing.h"
 #include "server/watcher.h"
 
@@ -29,6 +31,11 @@ auto SameCheckoutRequest(const dbapp::CheckoutEntity& a, const dbapp::CheckoutEn
 }
 
 }  // namespace
+
+DBApp::~DBApp() {
+  StopAuthentication();
+  authentication_tasks_.reset();
+}
 
 auto DBApp::Run(int argc, char* argv[]) -> int {
   EventDispatcher dispatcher;
@@ -172,6 +179,7 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
 
 void DBApp::BeginShutdown() {
   ManagerApp::BeginShutdown();
+  StopAuthentication();
   if (database_) database_->BeginDrain();
 }
 
@@ -183,16 +191,20 @@ auto DBApp::PendingShutdownOperations() const -> std::size_t {
   return ManagerApp::PendingShutdownOperations() +
          (database_ ? database_->PendingOperations() : 0) + pending_write_requests_.size() +
          pending_checkout_requests_.size() + account_session_requests_ +
-         process_retirements_.size();
+         process_retirements_.size() + active_authentications_ + pending_authentications_.size();
 }
 
 void DBApp::LogShutdownPending() const {
   ManagerApp::LogShutdownPending();
-  ATLAS_LOG_ERROR("DBApp: shutdown database_operations={} retirements={}",
-                  database_ ? database_->PendingOperations() : 0, process_retirements_.size());
+  ATLAS_LOG_ERROR(
+      "DBApp: shutdown database_operations={} retirements={} auth_active={} auth_queued={}",
+      database_ ? database_->PendingOperations() : 0, process_retirements_.size(),
+      active_authentications_, pending_authentications_.size());
 }
 
 void DBApp::Fini() {
+  StopAuthentication();
+  authentication_tasks_.reset();
   if (database_) {
     database_->EndBatch();
     database_->ProcessResults();
@@ -222,6 +234,9 @@ void DBApp::OnTickComplete() {
 void DBApp::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& reg = GetWatcherRegistry();
+
+  reg.Add<std::size_t>("dbapp/auth_active", [this] { return active_authentications_; });
+  reg.Add<std::size_t>("dbapp/auth_queued", [this] { return pending_authentications_.size(); });
 
   reg.Add<std::string>("dbapp/entity_defs_loaded", std::function<std::string()>{[this]() {
                          return (entity_defs_.has_value() && entity_defs_->TypeCount() > 0) ? "yes"
@@ -1237,7 +1252,14 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
     if (ch != nullptr) (void)ch->SendMessage(reply);
     return;
   }
-  if (!database_ || msg.username.empty() || msg.password_hash.empty()) {
+  if (authentication_stopping_ || IsShuttingDown()) {
+    login::AuthLoginResult reply;
+    reply.request_id = msg.request_id;
+    reply.status = login::LoginStatus::kServerNotReady;
+    SendAuthenticationResult(src, reply);
+    return;
+  }
+  if (!database_ || !login::AreCredentialsValid(msg.username, msg.password_hash)) {
     login::AuthLoginResult reply;
     reply.request_id = msg.request_id;
     reply.success = false;
@@ -1249,124 +1271,198 @@ void DBApp::OnAuthLogin(const Address& src, Channel* ch, const login::AuthLogin&
     return;
   }
 
+  if (pending_authentications_.size() >= kMaxQueuedAuthentications) {
+    login::AuthLoginResult reply;
+    reply.request_id = msg.request_id;
+    reply.status = login::LoginStatus::kServerBusy;
+    SendAuthenticationResult(src, reply);
+    return;
+  }
+  pending_authentications_.push_back(
+      {src, msg.request_id, [this, src, msg] { StartAuthentication(src, msg); }});
+  PumpAuthentication();
+}
+
+void DBApp::SendAuthenticationResult(const Address& src, const login::AuthLoginResult& reply) {
+  if (auto* channel = ResolveReplyChannel(src)) (void)channel->SendMessage(reply);
+}
+
+void DBApp::PumpAuthentication() {
+  while (!authentication_stopping_ && active_authentications_ < kMaxActiveAuthentications &&
+         !pending_authentications_.empty()) {
+    auto pending = std::move(pending_authentications_.front());
+    pending_authentications_.pop_front();
+    ++active_authentications_;
+    pending.start();
+  }
+}
+
+void DBApp::StopAuthentication() {
+  authentication_stopping_ = true;
+  if (authentication_tasks_) authentication_tasks_->StopAccepting();
+  while (!pending_authentications_.empty()) {
+    auto pending = std::move(pending_authentications_.front());
+    pending_authentications_.pop_front();
+    login::AuthLoginResult reply;
+    reply.request_id = pending.request_id;
+    reply.status = login::LoginStatus::kServerNotReady;
+    SendAuthenticationResult(pending.reply_addr, reply);
+  }
+}
+
+void DBApp::StartAuthentication(const Address& src, const login::AuthLogin& msg) {
+  if (!authentication_tasks_)
+    authentication_tasks_ =
+        std::make_unique<BgTaskManager>(Dispatcher(), kMaxActiveAuthentications);
+  auto finished = std::make_shared<bool>(false);
+  auto complete = [this, src, finished](const login::AuthLoginResult& reply) {
+    if (std::exchange(*finished, true)) return;
+    --active_authentications_;
+    SendAuthenticationResult(src, reply);
+    PumpAuthentication();
+  };
   database_->LookupByName(
       account_type_id_, msg.username,
       [this, request_id = msg.request_id, password_hash = msg.password_hash,
-       auto_create = msg.auto_create, username = msg.username,
-       reply_addr = src](LookupResult result) {
+       auto_create = msg.auto_create, username = msg.username, complete](LookupResult result) {
         login::AuthLoginResult reply;
         reply.request_id = request_id;
-
-        auto complete_lookup = [this, reply_addr, request_id, password_hash,
+        reply.status = login::LoginStatus::kInternalError;
+        if (authentication_stopping_) {
+          reply.status = login::LoginStatus::kServerNotReady;
+          complete(reply);
+          return;
+        }
+        auto complete_lookup = [this, request_id, password_hash, complete,
                                 type_id = account_type_id_](LookupResult account) {
           login::AuthLoginResult response;
           response.request_id = request_id;
           response.status = login::LoginStatus::kInternalError;
-          if (account.error.empty() && account.found && account.dbid != kInvalidDBID) {
-            if (!account.password_hash.empty() && account.password_hash == password_hash) {
-              response.success = true;
-              response.status = login::LoginStatus::kSuccess;
-              response.dbid = account.dbid;
-              response.type_id = type_id;
-            } else {
-              response.status = login::LoginStatus::kInvalidCredentials;
-            }
-          }
-          if (auto* reply_ch = ResolveReplyChannel(reply_addr)) {
-            (void)reply_ch->SendMessage(response);
-          }
-        };
-
-        // A backend error (e.g. transient SQLite failure) must not be
-        // mistaken for "account does not exist" - surface it immediately.
-        if (!result.error.empty()) {
-          ATLAS_LOG_ERROR("DBApp: auth lookup failed for '{}': {}", username, result.error);
-          reply.success = false;
-          reply.status = login::LoginStatus::kInternalError;
-          if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-            (void)reply_ch->SendMessage(reply);
-          }
-          return;
-        }
-
-        if (!result.found) {
-          if (auto_create && auto_create_accounts_) {
-            EntityData data;
-            data.type_id = account_type_id_;
-            data.identifier = username;
-            auto encoded = EncodeDbBlob({}, {});
-            if (!encoded) {
-              ATLAS_LOG_ERROR("DBApp: cannot encode initial account snapshot: {}",
-                              encoded.Error().Message());
-              reply.success = false;
-              reply.status = login::LoginStatus::kInternalError;
-              if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-                (void)reply_ch->SendMessage(reply);
-              }
-              return;
-            }
-            data.blob = std::move(*encoded);
-            DatabaseID create_dbid = kInvalidDBID;
-            WriteFlags create_flags = WriteFlags::kCreateNew;
-            std::optional<dbappmgr::ShardEntry> create_shard;
-            if (HasAuthoritativeShardTable()) {
-              create_dbid = AllocateCreateDbidForRoute(DbShardRouteKey(username));
-              if (create_dbid == kInvalidDBID) {
-                ATLAS_LOG_ERROR("DBApp: no owned shard range for account '{}'", username);
-                reply.success = false;
-                reply.status = login::LoginStatus::kInternalError;
-                if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-                  (void)reply_ch->SendMessage(reply);
-                }
-                return;
-              }
-              create_flags = create_flags | WriteFlags::kExplicitDbid;
-              if (const auto* shard = FindShard(create_dbid); shard != nullptr) {
-                create_shard = *shard;
-              }
-            }
-            auto on_put = [this, reply_addr, request_id, username, complete_lookup,
-                           type_id = account_type_id_](PutResult put) {
-              if (!put.success && (put.error_kind == DatabaseErrorKind::kDuplicateIdentifier ||
-                                   put.error_kind == DatabaseErrorKind::kCommitUnknown)) {
-                database_->LookupByName(type_id, username, complete_lookup);
-                return;
-              }
-              login::AuthLoginResult r;
-              r.request_id = request_id;
-              if (put.success) {
-                r.success = true;
-                r.status = login::LoginStatus::kSuccess;
-                r.dbid = put.dbid;
-                r.type_id = type_id;
-              } else {
-                r.success = false;
-                r.status = login::LoginStatus::kInternalError;
-              }
-              if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-                (void)reply_ch->SendMessage(r);
-              }
-            };
-            if (create_shard.has_value()) {
-              PutCreateEntityWithRetry(*create_shard, create_dbid, account_type_id_, create_flags,
-                                       std::move(data.blob), std::move(data.identifier),
-                                       password_hash, std::move(on_put));
-            } else {
-              database_->PutEntityWithPassword(create_dbid, account_type_id_, create_flags,
-                                               data.blob, data.identifier, password_hash,
-                                               std::move(on_put));
-            }
+          if (authentication_stopping_) {
+            response.status = login::LoginStatus::kServerNotReady;
+            complete(response);
             return;
           }
-          reply.success = false;
-          reply.status = login::LoginStatus::kInvalidCredentials;
-        } else {
+          if (!account.error.empty() || !account.found || account.dbid == kInvalidDBID) {
+            complete(response);
+            return;
+          }
+          auto verified = std::make_shared<Result<bool>>(Error{ErrorCode::kInternalError});
+          auto submitted = authentication_tasks_->AddTask(
+              [password_hash, record = std::move(account.password_hash),
+               verified]() -> Result<void> {
+                *verified = VerifyPassword(password_hash, record);
+                return {};
+              },
+              [this, complete, response, verified, dbid = account.dbid,
+               type_id](Result<void> task) mutable {
+                if (authentication_stopping_) {
+                  response.status = login::LoginStatus::kServerNotReady;
+                } else if (task && verified->HasValue() && **verified) {
+                  response.success = true;
+                  response.status = login::LoginStatus::kSuccess;
+                  response.dbid = dbid;
+                  response.type_id = type_id;
+                } else if (task && (verified->HasValue() ||
+                                    verified->Error().Code() == ErrorCode::kInvalidArgument)) {
+                  response.status = login::LoginStatus::kInvalidCredentials;
+                }
+                complete(response);
+              });
+          if (!submitted) complete(response);
+        };
+        if (!result.error.empty()) {
+          ATLAS_LOG_ERROR("DBApp: auth lookup failed for '{}': {}", username, result.error);
+          complete(reply);
+          return;
+        }
+        if (result.found) {
           complete_lookup(std::move(result));
           return;
         }
-        if (auto* reply_ch = this->ResolveReplyChannel(reply_addr)) {
-          (void)reply_ch->SendMessage(reply);
+        if (!auto_create || !auto_create_accounts_) {
+          reply.status = login::LoginStatus::kInvalidCredentials;
+          complete(reply);
+          return;
         }
+        auto hashed = std::make_shared<Result<std::string>>(Error{ErrorCode::kInternalError});
+        auto submitted = authentication_tasks_->AddTask(
+            [password_hash, hashed]() -> Result<void> {
+              *hashed = HashPassword(password_hash);
+              return {};
+            },
+            [this, username, request_id, complete_lookup, complete, reply,
+             hashed](Result<void> task) mutable {
+              if (authentication_stopping_) {
+                reply.status = login::LoginStatus::kServerNotReady;
+                complete(reply);
+                return;
+              }
+              if (!task || !hashed->HasValue()) {
+                complete(reply);
+                return;
+              }
+              EntityData data;
+              data.type_id = account_type_id_;
+              data.identifier = username;
+              auto encoded = EncodeDbBlob({}, {});
+              if (!encoded) {
+                ATLAS_LOG_ERROR("DBApp: cannot encode initial account snapshot: {}",
+                                encoded.Error().Message());
+                reply.success = false;
+                reply.status = login::LoginStatus::kInternalError;
+                complete(reply);
+                return;
+              }
+              data.blob = std::move(*encoded);
+              DatabaseID create_dbid = kInvalidDBID;
+              WriteFlags create_flags = WriteFlags::kCreateNew;
+              std::optional<dbappmgr::ShardEntry> create_shard;
+              if (HasAuthoritativeShardTable()) {
+                create_dbid = AllocateCreateDbidForRoute(DbShardRouteKey(username));
+                if (create_dbid == kInvalidDBID) {
+                  ATLAS_LOG_ERROR("DBApp: no owned shard range for account '{}'", username);
+                  reply.success = false;
+                  reply.status = login::LoginStatus::kInternalError;
+                  complete(reply);
+                  return;
+                }
+                create_flags = create_flags | WriteFlags::kExplicitDbid;
+                if (const auto* shard = FindShard(create_dbid); shard != nullptr) {
+                  create_shard = *shard;
+                }
+              }
+              auto on_put = [this, request_id, username, complete_lookup, complete,
+                             type_id = account_type_id_](PutResult put) {
+                if (!put.success && (put.error_kind == DatabaseErrorKind::kDuplicateIdentifier ||
+                                     put.error_kind == DatabaseErrorKind::kCommitUnknown)) {
+                  database_->LookupByName(type_id, username, complete_lookup);
+                  return;
+                }
+                login::AuthLoginResult r;
+                r.request_id = request_id;
+                if (put.success) {
+                  r.success = true;
+                  r.status = login::LoginStatus::kSuccess;
+                  r.dbid = put.dbid;
+                  r.type_id = type_id;
+                } else {
+                  r.success = false;
+                  r.status = login::LoginStatus::kInternalError;
+                }
+                complete(r);
+              };
+              if (create_shard.has_value()) {
+                PutCreateEntityWithRetry(*create_shard, create_dbid, account_type_id_, create_flags,
+                                         std::move(data.blob), std::move(data.identifier), **hashed,
+                                         std::move(on_put));
+              } else {
+                database_->PutEntityWithPassword(create_dbid, account_type_id_, create_flags,
+                                                 data.blob, data.identifier, **hashed,
+                                                 std::move(on_put));
+              }
+            });
+        if (!submitted) complete(reply);
       });
 }
 

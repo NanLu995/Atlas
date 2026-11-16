@@ -4,12 +4,13 @@
 
 #include <zlib.h>
 
-#include "foundation/log.h"
 #include "serialization/binary_stream.h"
 
 namespace atlas {
 
 namespace {
+
+constexpr std::size_t kMaxPayloadSize = 16 * 1024 * 1024;
 
 // memcpy(dst, nullptr, 0) is UB even when n == 0, and span::data() may
 // return null for an empty range — guard the source pointer here.
@@ -29,6 +30,9 @@ CompressionFilter::CompressionFilter(std::size_t threshold, CompressionType type
 
 auto CompressionFilter::SendFilter(std::span<const std::byte> data)
     -> Result<std::vector<std::byte>> {
+  if (data.size() > kMaxPayloadSize) {
+    return Error(ErrorCode::kInvalidArgument, "CompressionFilter: payload exceeds 16 MiB limit");
+  }
   if (data.size() < threshold_ || type_ == CompressionType::kNone) {
     return WrapUncompressed(data);
   }
@@ -66,6 +70,9 @@ auto CompressionFilter::RecvFilter(std::span<const std::byte> data)
   if (data.size() < 1) {
     return Error(ErrorCode::kInvalidArgument, "CompressionFilter: empty packet");
   }
+  if (data.size() > kMaxPayloadSize + 1) {
+    return Error(ErrorCode::kInvalidArgument, "CompressionFilter: packet exceeds 16 MiB limit");
+  }
 
   auto tag = static_cast<CompressionType>(data[0]);
 
@@ -83,23 +90,22 @@ auto CompressionFilter::RecvFilter(std::span<const std::byte> data)
     std::memcpy(&original_len_le, data.data() + 1, sizeof(uint32_t));
     auto original_len = endian::FromLittle(original_len_le);
 
-    if (original_len > 16 * 1024 * 1024) {
+    if (original_len > kMaxPayloadSize) {
       return Error(ErrorCode::kInvalidArgument,
-                   "CompressionFilter: decompressed size exceeds 16 MB limit");
+                   "CompressionFilter: decompressed size exceeds 16 MiB limit");
     }
 
     std::vector<std::byte> output(original_len);
     uLongf dest_len = original_len;
+    uLong source_len = static_cast<uLong>(data.size() - kHeaderSize);
 
-    int ret = uncompress(reinterpret_cast<Bytef*>(output.data()), &dest_len,
-                         reinterpret_cast<const Bytef*>(data.data() + kHeaderSize),
-                         static_cast<uLong>(data.size() - kHeaderSize));
+    int ret = uncompress2(reinterpret_cast<Bytef*>(output.data()), &dest_len,
+                          reinterpret_cast<const Bytef*>(data.data() + kHeaderSize), &source_len);
 
-    if (ret != Z_OK) {
-      return Error(ErrorCode::kInternalError, "zlib uncompress failed");
+    if (ret != Z_OK || dest_len != original_len || source_len != data.size() - kHeaderSize) {
+      return Error(ErrorCode::kInvalidArgument, "CompressionFilter: invalid deflate payload");
     }
 
-    output.resize(dest_len);
     return output;
   }
 

@@ -18,7 +18,11 @@ public sealed class AtlasClientRealTests
 {
     private readonly RealClusterFixture _cluster;
 
-    public AtlasClientRealTests(RealClusterFixture cluster) { _cluster = cluster; }
+    public AtlasClientRealTests(RealClusterFixture cluster)
+    {
+        _cluster = cluster;
+        Atlas.Def.DefBootstrap.RegisterInto(ClientCallbacks.DefaultSession);
+    }
 
     // Each test uses a unique username so LoginApp's pending_by_username_
     // dedup never rejects parallel / sequential cases.
@@ -42,8 +46,10 @@ public sealed class AtlasClientRealTests
     public async Task ConnectAsync_AgainstRealCluster_ReachesConnected()
     {
         using var client = new AtlasClient();
+        _cluster.ConfigureClient(client);
         var task = client.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, FreshUser(), "pwd-hash");
         DriveUntil(client, () => task.Status != AtlasTaskStatus.Pending);
+        if (task.Status == AtlasTaskStatus.Faulted) await task;
         Assert.Equal(AtlasTaskStatus.Succeeded, task.Status);
         await task;
         Assert.Equal(AtlasNetState.Connected, client.State);
@@ -55,6 +61,7 @@ public sealed class AtlasClientRealTests
     public void StateChanged_FiresMonotonicallyToConnected()
     {
         using var client = new AtlasClient();
+        _cluster.ConfigureClient(client);
         var seen = new List<AtlasNetState>();
         client.StateChanged += s => seen.Add(s);
 
@@ -78,6 +85,7 @@ public sealed class AtlasClientRealTests
     public void Disconnect_AfterConnect_StateReturnsToDisconnected()
     {
         using var client = new AtlasClient();
+        _cluster.ConfigureClient(client);
         var task = client.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, FreshUser(), "pwd-hash");
         DriveUntil(client, () => task.Status != AtlasTaskStatus.Pending);
         Assert.Equal(AtlasNetState.Connected, client.State);
@@ -91,6 +99,7 @@ public sealed class AtlasClientRealTests
     public void Reconnect_OnSameClient_AfterDisconnect_Succeeds()
     {
         using var client = new AtlasClient();
+        _cluster.ConfigureClient(client);
         var user = FreshUser();
         var first = client.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, user, "pwd-hash");
         DriveUntil(client, () => first.Status != AtlasTaskStatus.Pending);
@@ -117,6 +126,7 @@ public sealed class AtlasClientRealTests
         try
         {
             using var a = new AtlasClient(installCoroLoop: false);
+            _cluster.ConfigureClient(a);
             var user = FreshUser("relogin");
 
             var ta = a.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, user, "pwd-hash");
@@ -144,6 +154,7 @@ public sealed class AtlasClientRealTests
             Assert.Equal(AtlasNetState.Disconnected, a.State);
 
             using var b = new AtlasClient(installCoroLoop: false);
+            _cluster.ConfigureClient(b);
             var tb = b.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, user, "pwd-hash");
             deadline = DateTime.UtcNow.AddSeconds(15);
             while (DateTime.UtcNow < deadline && tb.Status == AtlasTaskStatus.Pending)
@@ -179,7 +190,9 @@ public sealed class AtlasClientRealTests
         try
         {
             using var a = new AtlasClient(installCoroLoop: false);
+            _cluster.ConfigureClient(a);
             using var b = new AtlasClient(installCoroLoop: false);
+            _cluster.ConfigureClient(b);
 
             var ta = a.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, FreshUser("a"), "pwd-hash");
             var tb = b.ConnectAsync("127.0.0.1", _cluster.LoginAppPort, FreshUser("b"), "pwd-hash");

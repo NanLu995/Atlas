@@ -52,6 +52,27 @@ endfunction()
 add_subdirectory(unit)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_executable(test_tls_stream unit/test_tls_stream.cpp)
+target_link_libraries(test_tls_stream PRIVATE GTest::gtest_main atlas_network atlas_server)
+target_compile_definitions(test_tls_stream PRIVATE
+  ATLAS_BUILD_NET_CLIENT=$<BOOL:${ATLAS_BUILD_NET_CLIENT}>)
+if(ATLAS_BUILD_NET_CLIENT)
+  target_link_libraries(test_tls_stream PRIVATE atlas_net_client_core)
+endif()
+atlas_set_output_dir("" test_tls_stream)
+set(_openssl_program "${OPENSSL_ROOT_DIR}/bin/openssl")
+if(WIN32)
+  string(APPEND _openssl_program ".exe")
+  add_custom_command(TARGET test_tls_stream POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+      "-DTARGET_DLLS=$<TARGET_RUNTIME_DLLS:test_tls_stream>"
+      "-DTARGET_DIR=$<TARGET_FILE_DIR:test_tls_stream>"
+      -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDLLs.cmake" VERBATIM)
+endif()
+add_test(NAME test_tls_stream COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_tls_stream.py"
+  "${_openssl_program}" "$<TARGET_FILE:test_tls_stream>")
+set_tests_properties(test_tls_stream PROPERTIES LABELS "unit" TIMEOUT 120)
 add_test(NAME test_build_tool
   COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_build.py)
@@ -61,6 +82,11 @@ add_test(NAME test_database_tools
   COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_database_tools.py)
 set_tests_properties(test_database_tools PROPERTIES LABELS "unit")
+
+add_test(NAME test_build_openssl
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_build_openssl.py)
+set_tests_properties(test_build_openssl PROPERTIES LABELS "unit")
 add_subdirectory(integration)
 if(TARGET atlas_tool AND TARGET machined AND TARGET atlas_baseappmgr)
   add_test(NAME test_atlas_tool_output

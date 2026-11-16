@@ -151,6 +151,10 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
   RegisterInternalHandlers();
 
   if (cfg.external_port > 0) {
+    if (auto secured = cfg.ConfigureExternalTransport(external_network_); !secured) {
+      ATLAS_LOG_ERROR("Public transport configuration failed: {}", secured.Error().Message());
+      return false;
+    }
     Address ext_addr(0, cfg.external_port);
     auto listen_result =
         external_network_.StartRudpServer(ext_addr, NetworkInterface::InternetRudpProfile());
@@ -4357,6 +4361,12 @@ void BaseApp::OnClientBaseRpc(Channel& ch, const baseapp::ClientBaseRpc& msg) {
   }
 
   auto& registry = EntityDefRegistry::Instance();
+  const auto* entity = entity_mgr_.Find(entity_id);
+  if (!entity || !registry.ValidateRpc(entity->TypeId(), msg.rpc_id)) {
+    ++client_rpc_dropped_unauthorized_total_;
+    ATLAS_LOG_WARNING("BaseApp: ClientBaseRpc method does not belong to target entity type");
+    return;
+  }
   auto* rpc_desc = registry.FindRpc(msg.rpc_id);
   if (!rpc_desc || rpc_desc->exposed == ExposedScope::kNone) {
     ++client_rpc_dropped_unauthorized_total_;
@@ -4467,6 +4477,11 @@ void BaseApp::OnClientCellRpc(Channel& ch, const baseapp::ClientCellRpc& msg) {
   auto* target = entity_mgr_.Find(msg.target_entity_id);
   if (target == nullptr) {
     entity_rpc_reply::RejectRequest(&ch, msg.rpc_id, msg.payload, -4, "Cell target unavailable");
+    return;
+  }
+  if (!registry.ValidateRpc(target->TypeId(), msg.rpc_id)) {
+    ++client_rpc_dropped_unauthorized_total_;
+    ATLAS_LOG_WARNING("BaseApp: ClientCellRpc method does not belong to target entity type");
     return;
   }
   auto* ch_out =

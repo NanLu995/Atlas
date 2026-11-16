@@ -41,7 +41,9 @@ public sealed class ClientHandoffRealTests
         foreach (var session in new[] { sourceSession, reloginSession })
             Atlas.Def.DefBootstrap.RegisterInto(session);
         using var source = new LoginClient(sourceSession);
+        cluster.ConfigureClient(source);
         using var relogin = new LoginClient(reloginSession);
+        cluster.ConfigureClient(relogin);
         var clients = new[] { source, relogin };
         var username = "handoff_" + Guid.NewGuid().ToString("N");
         try

@@ -41,6 +41,9 @@ jobs:
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100
 
+      - name: Build pinned OpenSSL SDK
+        run: python tools/build_openssl.py --config Debug
+
       - name: Configure
         # ATLAS_BUILD_NET_CLIENT=ON builds libatlas_net_client, the P/Invoke
         # target the real-cluster client tests load at runtime.

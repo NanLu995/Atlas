@@ -6,6 +6,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "network/address.h"
@@ -14,6 +15,12 @@
 #include "server/entity_types.h"
 
 namespace atlas::login {
+
+inline auto AreCredentialsValid(std::string_view username, std::string_view credential) -> bool {
+  return !username.empty() && !credential.empty() &&
+         username.find('\0') == std::string_view::npos &&
+         credential.find('\0') == std::string_view::npos;
+}
 
 enum class LoginStatus : uint8_t {
   kSuccess = 0,
@@ -30,10 +37,8 @@ enum class LoginStatus : uint8_t {
 
 struct LoginRequest {
   std::string username;
-  std::string password_hash;  // SHA-256 hex of password
-  // SHA-256 of the client's entity-def surface; compared at BaseApp against
-  // its own digest so mismatched .def builds bounce on the handshake instead
-  // of mis-routing RPCs at runtime. All-zero from pre-handshake clients.
+  std::string password_hash;
+  // Client definition digest, checked by DBApp and BaseApp before account preparation.
   std::array<uint8_t, 32> entity_def_digest{};
 
   static auto Descriptor() -> const MessageDesc& {
@@ -58,6 +63,8 @@ struct LoginRequest {
     auto p = r.ReadString();
     auto d = r.ReadBytes(32);
     if (!u || !p || !d) return Error{ErrorCode::kInvalidArgument, "LoginRequest: truncated"};
+    if (!AreCredentialsValid(*u, *p))
+      return Error{ErrorCode::kInvalidArgument, "LoginRequest: invalid credentials"};
     LoginRequest msg;
     msg.username = std::move(*u);
     msg.password_hash = std::move(*p);
@@ -145,6 +152,8 @@ struct AuthLogin {
     auto p = r.ReadString();
     auto ac = r.Read<uint8_t>();
     if (!rid || !u || !p || !ac) return Error{ErrorCode::kInvalidArgument, "AuthLogin: truncated"};
+    if (!AreCredentialsValid(*u, *p))
+      return Error{ErrorCode::kInvalidArgument, "AuthLogin: invalid credentials"};
     AuthLogin msg;
     msg.request_id = *rid;
     msg.username = std::move(*u);

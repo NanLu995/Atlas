@@ -303,7 +303,7 @@ auto ReliableUdpChannel::BuildPacket(uint8_t flags, SeqNum seq, std::span<const 
 
 void ReliableUdpChannel::OnDatagramReceived(std::span<const std::byte> data,
                                             TimePoint flush_deadline) {
-  if (!HasConnectionProtocolHeader(data)) return;
+  if (data.size() > mtu_ || !HasConnectionProtocolHeader(data)) return;
   data = data.subspan(kConnectionProtocolHeader.size());
   if (data.empty()) return;
 
@@ -337,7 +337,7 @@ auto ReliableUdpChannel::SendWireDatagram(std::span<const std::byte> data)
     QueueOutboundDatagram(data);
     return data.size();
   }
-  return shared_socket_.SendTo(data, remote_);
+  return datagram_sender_ ? datagram_sender_(data) : shared_socket_.SendTo(data, remote_);
 }
 
 auto ReliableUdpChannel::ShouldDropImpairedDatagram(uint32_t& rng_state) -> bool {
@@ -407,7 +407,7 @@ void ReliableUdpChannel::FlushDelayedOutbound() {
     if (delayed_outbound_.front().delivery_time > now || now >= deadline) return;
     auto data = std::move(delayed_outbound_.front().data);
     delayed_outbound_.pop_front();
-    auto result = shared_socket_.SendTo(data, remote_);
+    auto result = datagram_sender_ ? datagram_sender_(data) : shared_socket_.SendTo(data, remote_);
     if (!result) {
       ATLAS_LOG_DEBUG("RUDP delayed send failed to {}: {}", remote_.ToString(),
                       result.Error().Message());
@@ -463,10 +463,15 @@ void ReliableUdpChannel::ProcessDatagramNow(std::span<const std::byte> data,
   FragmentHeader frag_hdr{};
   bool is_fragment = (flags & rudp::kFlagFragment) != 0;
   if (is_fragment) {
+    if ((flags & rudp::kFlagHasSeq) == 0) return;
     auto fid = reader.Read<uint16_t>();
     auto fidx = reader.Read<uint8_t>();
     auto fcnt = reader.Read<uint8_t>();
     if (!fid || !fidx || !fcnt) {
+      return;
+    }
+    if (*fcnt == 0 || *fidx >= *fcnt || reader.Remaining() == 0 ||
+        reader.Remaining() > MaxUdpPayload()) {
       return;
     }
     frag_hdr = {*fid, *fidx, *fcnt};

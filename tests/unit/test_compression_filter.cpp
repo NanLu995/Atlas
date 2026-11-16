@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <numeric>
 #include <vector>
 
@@ -7,6 +8,7 @@
 
 #include "network/compression_filter.h"
 #include "network/packet_filter.h"
+#include "serialization/binary_stream.h"
 
 using namespace atlas;
 
@@ -182,4 +184,80 @@ TEST(CompressionFilterTest, ThresholdBoundary) {
   auto r3 = filter.RecvFilter(*sent_above);
   ASSERT_TRUE(r3.HasValue());
   EXPECT_EQ(*r3, data_above);
+}
+
+TEST(CompressionFilterTest, RejectsIncorrectOriginalLength) {
+  CompressionFilter filter(64);
+  auto data = make_compressible_bytes(1024);
+  auto sent = filter.SendFilter(data);
+  ASSERT_TRUE(sent.HasValue());
+  ASSERT_EQ((*sent)[0], std::byte{1});
+
+  for (uint32_t length : {1023u, 1025u}) {
+    auto packet = *sent;
+    auto encoded = endian::ToLittle(length);
+    std::memcpy(packet.data() + 1, &encoded, sizeof(encoded));
+    EXPECT_FALSE(filter.RecvFilter(packet).HasValue()) << length;
+  }
+}
+
+TEST(CompressionFilterTest, RejectsTrailingCompressedInput) {
+  CompressionFilter filter(64);
+  auto sent = filter.SendFilter(make_compressible_bytes(1024));
+  ASSERT_TRUE(sent.HasValue());
+  ASSERT_EQ((*sent)[0], std::byte{1});
+  auto packet = *sent;
+  packet.push_back(std::byte{0});
+  EXPECT_FALSE(filter.RecvFilter(packet).HasValue());
+  packet = *sent;
+  packet.insert(packet.end(), sent->begin() + 5, sent->end());
+  EXPECT_FALSE(filter.RecvFilter(packet).HasValue());
+}
+
+TEST(CompressionFilterTest, RejectsTruncatedOrCorruptDeflate) {
+  CompressionFilter filter(64);
+  auto sent = filter.SendFilter(make_compressible_bytes(1024));
+  ASSERT_TRUE(sent.HasValue());
+  ASSERT_EQ((*sent)[0], std::byte{1});
+  auto packet = *sent;
+  packet.pop_back();
+  EXPECT_FALSE(filter.RecvFilter(packet).HasValue());
+  packet = *sent;
+  packet.back() ^= std::byte{0xFF};
+  EXPECT_FALSE(filter.RecvFilter(packet).HasValue());
+}
+
+TEST(CompressionFilterTest, PayloadLimitAppliesToSendAndUncompressedReceive) {
+  constexpr std::size_t kLimit = 16 * 1024 * 1024;
+  CompressionFilter filter(64, CompressionType::kNone);
+  auto data = make_bytes(kLimit);
+  auto sent = filter.SendFilter(data);
+  ASSERT_TRUE(sent.HasValue());
+  EXPECT_TRUE(filter.RecvFilter(*sent).HasValue());
+  data.push_back(std::byte{0});
+  EXPECT_FALSE(filter.SendFilter(data).HasValue());
+  CompressionFilter deflate(64);
+  EXPECT_FALSE(deflate.SendFilter(data).HasValue());
+  sent->push_back(std::byte{0});
+  EXPECT_FALSE(filter.RecvFilter(*sent).HasValue());
+}
+
+TEST(CompressionFilterTest, DecompressedPayloadLimit) {
+  constexpr uint32_t kLimit = 16 * 1024 * 1024;
+  CompressionFilter filter(64);
+  auto data = make_compressible_bytes(kLimit);
+  auto sent = filter.SendFilter(data);
+  ASSERT_TRUE(sent.HasValue());
+  auto received = filter.RecvFilter(*sent);
+  ASSERT_TRUE(received.HasValue());
+  EXPECT_EQ(*received, data);
+  auto encoded = endian::ToLittle(kLimit + 1);
+  std::memcpy(sent->data() + 1, &encoded, sizeof(encoded));
+  EXPECT_FALSE(filter.RecvFilter(*sent).HasValue());
+}
+
+TEST(CompressionFilterTest, RejectsUnknownType) {
+  CompressionFilter filter;
+  const std::vector<std::byte> data{std::byte{2}};
+  EXPECT_FALSE(filter.RecvFilter(data).HasValue());
 }

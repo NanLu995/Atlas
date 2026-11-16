@@ -86,10 +86,11 @@ unset(_atlas_valid_heap_allocators)
 # ── CMake modules ────────────────────────────────────────────────────────────
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(AtlasCompilerOptions)
+include(AtlasOutputDirectory)
+include(AtlasOpenSSL)
 include(Dependencies)
 include(FindDotNet)
 include(AtlasRuntimeDeploy)
-include(AtlasOutputDirectory)
 
 if(UNIX AND TARGET TracyClient)
   atlas_set_output_dir("" TracyClient)
