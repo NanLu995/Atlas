@@ -66,6 +66,10 @@ add_test(NAME test_entitydef_export
 set_tests_properties(test_entitydef_export PROPERTIES LABELS "integration" TIMEOUT 150)
 
 if(WIN32)
+  add_dependencies(test_cellapp_integration atlas_rpc_fixture_cell_dll_deploy)
+  target_compile_definitions(test_cellapp_integration PRIVATE
+    "ATLAS_TEST_RUNTIME_CONFIG=\"${CMAKE_BINARY_DIR}/runtime/atlas_server.runtimeconfig.json\""
+    "ATLAS_TEST_CELL_ASSEMBLY=\"$<TARGET_FILE_DIR:atlas_cellapp>/Atlas.RpcFixture.Cell.dll\"")
   add_dependencies(test_login_flow atlas_tools_defdump atlas_rpc_fixture_base_dll_deploy)
   target_compile_definitions(test_login_flow PRIVATE
     "ATLAS_TEST_DOTNET=\"${DOTNET_EXECUTABLE}\""

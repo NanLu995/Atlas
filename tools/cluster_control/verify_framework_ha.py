@@ -38,6 +38,46 @@ def registered_names(output, role):
             if len(fields) >= 2 and fields[0] == role}
 
 
+def collect_diagnostics(control):
+    snapshots = {}
+    for role, names in (('baseapp', ('baseapp', 'baseapp-2')),
+                       ('cellapp', ('cellapp', 'cellapp-2')), ('loginapp', ('loginapp',)),
+                       ('dbapp', ('dbapp',)), ('baseappmgr', ('baseappmgr',)),
+                       ('cellappmgr', ('cellappmgr',)), ('dbappmgr', ('dbappmgr',))):
+        for name in names:
+            target = role + ':' + name
+            paths = ['app/ready', 'app/process_instance', 'machined/registration_generation',
+                     'app/shutdown/state', 'app/shutdown/pending_operations', 'network/pending_sends']
+            if role in ('baseapp', 'cellapp', 'loginapp'):
+                paths += ['rpc/pending', 'rpc/pending_limit', 'rpc/replies', 'rpc/reply_limit',
+                          'rpc/oldest_pending_ms']
+            if role == 'dbapp':
+                paths += ['dbapp/pending_operations', 'dbapp/operation_limit']
+            values = {}
+            for path in paths:
+                parts = control('watch', target, path).strip().split(maxsplit=1)
+                if len(parts) != 2 or parts[0] != name:
+                    raise RuntimeError('Invalid diagnostic response: ' + target + ' ' + path)
+                values[path] = parts[1]
+            if values['app/ready'] != 'true' or values['app/shutdown/state'] != 'running':
+                raise RuntimeError('Process not ready: ' + target)
+            for path in paths:
+                if path in ('app/ready', 'app/shutdown/state'):
+                    continue
+                if int(values[path]) < 0:
+                    raise RuntimeError('Negative diagnostic count: ' + target + ' ' + path)
+            for path in ('app/process_instance', 'machined/registration_generation'):
+                if int(values[path]) == 0:
+                    raise RuntimeError('Unregistered diagnostic identity: ' + target)
+            for count, limit in (('rpc/pending', 'rpc/pending_limit'),
+                                 ('rpc/replies', 'rpc/reply_limit'),
+                                 ('dbapp/pending_operations', 'dbapp/operation_limit')):
+                if count in values and int(values[count]) > int(values[limit]):
+                    raise RuntimeError('Diagnostic capacity exceeded: ' + target + ' ' + count)
+            snapshots[target] = values
+    return snapshots
+
+
 def main():
     args = parse_args()
     database_config(args, Path())
@@ -198,6 +238,8 @@ def main():
                     return
             raise RuntimeError('process control acknowledgement timeout: ' + name)
 
+        (run/'initial-diagnostics.json').write_text(
+            json.dumps(collect_diagnostics(control), indent=2), encoding='utf-8')
         if args.scenario in ('all', 'managers'):
             for manager in manager_types:
                 verify(manager, 'baseline')
@@ -239,6 +281,8 @@ def main():
                     verify(manager, 'baseline', name)
                 print('PASS owned process crash/restart', name, flush=True)
         check_topology('final')
+        (run/'final-diagnostics.json').write_text(
+            json.dumps(collect_diagnostics(control), indent=2), encoding='utf-8')
         print('PASS framework recovery', args.scenario, 'backend=mysql', run, flush=True)
 
     finally:

@@ -18,6 +18,10 @@ using namespace atlas;
 
 namespace atlas {
 struct PendingRpcRegistryTestAccess {
+  static void Age(PendingRpcRegistry& registry, PendingRpcRegistry::PendingHandle handle,
+                  Duration age) {
+    registry.pending_.at(registry.handles_.at(handle.value)).started_at = Clock::now() - age;
+  }
   static void ExhaustAfterNext(PendingRpcRegistry& registry) {
     registry.next_request_id_ = UINT64_MAX;
   }
@@ -41,6 +45,25 @@ class PendingRpcRegistryTest : public ::testing::Test {
     while (!done.load() && Clock::now() < deadline) dispatcher_.ProcessOnce();
   }
 };
+
+TEST_F(PendingRpcRegistryTest, OldestPendingAgeTracksOnlyLiveWaiters) {
+  PendingRpcRegistry registry(dispatcher_);
+  EXPECT_EQ(registry.OldestPendingAge(), Duration::zero());
+  auto first = registry.RegisterPending(
+      42, 1, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero());
+  auto second = registry.RegisterPending(
+      42, 2, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero());
+  PendingRpcRegistryTestAccess::Age(registry, first, Milliseconds(5000));
+  PendingRpcRegistryTestAccess::Age(registry, second, Milliseconds(1000));
+  EXPECT_GE(registry.OldestPendingAge(), Milliseconds(5000));
+  registry.Cancel(first);
+  EXPECT_GE(registry.OldestPendingAge(), Milliseconds(1000));
+  EXPECT_LT(registry.OldestPendingAge(), Milliseconds(5000));
+  EXPECT_TRUE(registry.TryDispatch(42, make_payload(2)));
+  EXPECT_EQ(registry.OldestPendingAge(), Duration::zero());
+  registry.Shutdown();
+  EXPECT_EQ(registry.OldestPendingAge(), Duration::zero());
+}
 
 TEST_F(PendingRpcRegistryTest, NativeRequestIdsRemainMonotoneAcrossCleanupAndRejectExhaustion) {
   PendingRpcRegistry registry(dispatcher_);

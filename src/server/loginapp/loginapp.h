@@ -40,6 +40,7 @@ class LoginApp : public ManagerApp {
   void OnTickComplete() override;
   void FlushTickDirtyChannels() override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
 
  private:
   friend class LoginRollbackTest;

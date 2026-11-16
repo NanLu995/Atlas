@@ -2,13 +2,37 @@
 
 #include <gtest/gtest.h>
 
+#include "coro/pending_rpc_registry.h"
 #include "server/watcher.h"
 
 using namespace atlas;
 
-// ============================================================================
-// Basic get/set
-// ============================================================================
+TEST(WatcherRegistry, RpcMetricsStayBoundedAndReflectCleanup) {
+  EventDispatcher dispatcher("watcher-test");
+  PendingRpcRegistry rpc(dispatcher);
+  WatcherRegistry reg;
+  RegisterRpcWatchers(reg, rpc);
+  EXPECT_EQ(reg.List().size(), 6u);
+  EXPECT_EQ(reg.Get("rpc/pending"), "0");
+  EXPECT_EQ(reg.Get("rpc/oldest_pending_ms"), "0");
+  EXPECT_EQ(reg.Get("rpc/pending_limit"), "4096");
+  EXPECT_EQ(reg.Get("rpc/reply_limit"), "4096");
+  for (uint32_t id = 1; id <= 20; ++id) {
+    ASSERT_TRUE(rpc.RegisterPending(
+                       42, id, [](std::span<const std::byte>) {}, [](Error) {}, Duration::zero())
+                    .IsValid());
+    ASSERT_NE(rpc.RegisterReply(id, id, nullptr), 0);
+  }
+  EXPECT_EQ(reg.Get("rpc/pending"), "20");
+  EXPECT_EQ(reg.Get("rpc/replies"), "20");
+  EXPECT_EQ(reg.List().size(), 6u);
+  rpc.Shutdown();
+  EXPECT_EQ(reg.Get("rpc/stopping"), "true");
+  EXPECT_EQ(reg.Get("rpc/pending"), "0");
+  EXPECT_EQ(reg.Get("rpc/replies"), "0");
+  EXPECT_EQ(reg.Get("rpc/oldest_pending_ms"), "0");
+  EXPECT_EQ(reg.List().size(), 6u);
+}
 
 TEST(WatcherRegistry, AddAndGetInt) {
   WatcherRegistry reg;

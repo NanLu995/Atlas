@@ -15,6 +15,8 @@
 
 namespace atlas {
 
+class PendingRpcRegistry;
+
 enum class WatcherMode : uint8_t {
   kReadOnly,
   kReadWrite,
@@ -230,10 +232,11 @@ class WatcherRegistry {
   std::size_t count_{0};
 };
 
-// Registers count + p50/p95/p99/max watchers (microseconds) for a histogram.
-// `prefix` is the path stem; values become {prefix}/count, {prefix}/p50_us, etc.
-// `hist` must outlive the WatcherRegistry.
+// The histogram must outlive the registry.
 void RegisterLatencyWatchers(WatcherRegistry& wr, std::string_view prefix, LatencyHistogram& hist);
+
+// The RPC registry must outlive the watcher registry.
+void RegisterRpcWatchers(WatcherRegistry& wr, PendingRpcRegistry& rpc);
 
 }  // namespace atlas
 

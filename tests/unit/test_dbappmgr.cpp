@@ -155,10 +155,15 @@ TEST(DBAppMgr, RecoveryWindowWatcherReflectsDeadline) {
   h.mgr.RegisterWatchersForTest();
 
   h.mgr.SetRecoveryDeadlineForTest(Clock::now() + std::chrono::seconds(5));
+  EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("app/ready"), "false");
+  EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("app/not_ready_reason"), "recovering");
   EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("dbappmgr/ha/recovery_window_active"),
             std::optional<std::string>("true"));
 
   h.mgr.SetRecoveryDeadlineForTest(Clock::now() - std::chrono::milliseconds(1));
+  EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("app/not_ready_reason"), "no_database_route");
+  Register(h.mgr, 24020);
+  EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("app/ready"), "true");
   EXPECT_EQ(h.mgr.GetWatcherRegistry().Get("dbappmgr/ha/recovery_window_active"),
             std::optional<std::string>("false"));
 }

@@ -321,6 +321,14 @@ void CellAppMgr::Fini() {
   ManagerApp::Fini();
 }
 
+auto CellAppMgr::AdmissionBlockReason() const -> std::string_view {
+  if (RecoveryWindowActive()) return "recovering";
+  if (recovery_admission_closed_ || BlockedRecoveryCount() != 0) return "recovery_blocked";
+  if (!pending_space_recoveries_.empty()) return "recovery_pending";
+  if (cellapps_.empty()) return "no_cellapp";
+  return {};
+}
+
 void CellAppMgr::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();

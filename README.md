@@ -453,6 +453,32 @@ for cold start on multiple hosts is unsupported. No cross-host fencing or automa
 Linux termination uses a stable pidfd instead of a PID checked earlier; unavailable pidfd support
 prevents automatic termination. Windows uses a retained process handle.
 
+Common Watchers expose `app/process_instance`, `machined/connected` and
+`machined/registration_generation` for process correlation. `network/pending_sends` counts
+the internal network's pending sends. `app/shutdown/state` reports `running`, `draining`,
+`failed`, `timed_out` or `complete`; inspect `pending_operations` and `remaining_ms` under
+the same prefix. A failure can coexist with unfinished work; `complete` requires draining
+and deregistration. Values are local observations, not a database reachability probe.
+BaseApp, CellApp and LoginApp expose `rpc/pending`, `replies`, `pending_limit`, `reply_limit`,
+`oldest_pending_ms` and `stopping`. The oldest age is zero with no waiters and is computed
+when queried. These aggregate paths do not grow with entities or requests and contain no payloads.
+`app/ready` and `app/not_ready_reason` report local prerequisites for new routable work:
+manager registration, EntityID availability, known database routes, queue capacity and recovery
+gates, as applicable to each role. An empty reason means ready. Shutdown always reports
+`shutting_down`. Recovery or a paused space can report a degraded Manager even while unaffected
+spaces continue serving. These fields do not change admission, send probes, guarantee remote
+database reachability or promise that a particular account, entity or space request will succeed.
+BaseAppMgr queries do not consume overload admission slots. RPC failures at debug level include
+reply/request IDs, error code and elapsed milliseconds; correlate these with process logs and
+the existing managed RPC trace ID. They omit RPC payloads and error text.
+DBApp exposes `pending_operations`, `operation_limit`, `pending_write_requests`,
+`account_session_requests`, `process_retirements` and `allocator_recoveries` under `dbapp/`.
+CellApp reports `pending_offloads`, `uncertain_offloads` and `pending_teleports`; uncertain offloads
+remain paused under the existing migration contract. BaseApp reports `incoming_handoffs`,
+`session_revocations` and `pending_persist`. BaseApp and LoginApp also expose
+`external_pending_sends` under their role prefix. Counts may overlap across lifecycle stages;
+they are not a count of unique user requests. Existing per-space recovery Watchers remain available.
+
 For repeatable framework recovery acceptance, supply an isolated MySQL database through
 `ATLAS_DB_MYSQL_*` or `--database-config`, build the RPC Base/Cell fixtures, then run
 `tools\bin\verify_framework_ha.bat --build framework-verify --scenario all` on Windows, or
@@ -460,6 +486,8 @@ For repeatable framework recovery acceptance, supply an isolated MySQL database 
 `managers` runs three Manager restarts and overlapping faults; `workers` runs DBApp, both CellApps
 and machined crash/restart cycles. The tool reuses the existing HA verifiers and launcher, checks
 one two-leaf space and two Real probes, and records per-fault logs under `.tmp/framework-ha-*`.
+Initial and final diagnostic JSON snapshots verify nine processes are registered and locally
+ready, with nonnegative queue counts within their reported limits.
 It rejects SQLite and missing MySQL settings. It creates no database and deletes no data; use an
 empty test database, since DBApp initializes its schema. BaseApp session/crash tests remain in
 the existing `ClientHandoffRealTests` suite. This local topology does not verify cross-host fencing.

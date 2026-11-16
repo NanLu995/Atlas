@@ -13,6 +13,30 @@ from cluster_control import verify_framework_ha as verify
 
 
 class FrameworkHaTest(unittest.TestCase):
+    def test_diagnostics_require_registered_ready_processes_and_bounded_counts(self):
+        def control(verb, target, path):
+            value = '0'
+            if path == 'app/ready':
+                value = 'true'
+            elif path == 'app/shutdown/state':
+                value = 'running'
+            elif path in ('app/process_instance', 'machined/registration_generation'):
+                value = '1'
+            elif path.endswith('_limit'):
+                value = '4096'
+            return target.split(':')[1] + ' ' + value
+
+        self.assertEqual(len(verify.collect_diagnostics(control)), 9)
+        for path, value in (('app/ready', 'false'), ('app/process_instance', '0'),
+                            ('rpc/pending', '4097'), ('rpc/replies', '-1'),
+                            ('app/shutdown/state', 'timed_out')):
+            def invalid(verb, target, query):
+                return target.split(':')[1] + ' ' + value if query == path else control(verb, target, query)
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                verify.collect_diagnostics(invalid)
+        with self.assertRaisesRegex(RuntimeError, 'Invalid diagnostic response'):
+            verify.collect_diagnostics(lambda *args: 'missing')
+
     def test_arguments_require_mysql_and_a_build_directory_name(self):
         args = verify.parse_args(['--build', 'framework-verify', '--scenario', 'workers'])
         self.assertEqual(args.db_backend, 'mysql')

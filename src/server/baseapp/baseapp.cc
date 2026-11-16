@@ -411,9 +411,25 @@ auto BaseApp::CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> {
   return provider;
 }
 
+auto BaseApp::AdmissionBlockReason() const -> std::string_view {
+  if (!baseappmgr_channel_ || baseappmgr_channel_->IsCondemned() || app_id_ == 0)
+    return "baseappmgr_unregistered";
+  if (id_client_.IsCriticallyLow()) return "entity_ids_low";
+  if (dbapp_channel_ == nullptr && dbapp_shard_table_.empty()) return "no_database_route";
+  if (rpc_registry_.PendingCount() >= PendingRpcRegistry::kMaxPendingRpcs) return "rpc_full";
+  return {};
+}
+
 void BaseApp::RegisterWatchers() {
   EntityApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();
+  RegisterRpcWatchers(wr, rpc_registry_);
+  wr.Add<std::size_t>("baseapp/incoming_handoffs",
+                      [this] { return incoming_client_handoffs_.size(); });
+  wr.Add<std::size_t>("baseapp/session_revocations", [this] { return session_revocations_; });
+  wr.Add<std::size_t>("baseapp/pending_persist", [this] { return pending_write_to_db_.size(); });
+  wr.Add<std::size_t>("baseapp/external_pending_sends",
+                      [this] { return external_network_.PendingSendCount(); });
   wr.Add<std::size_t>("baseapp/pending_checkin_count",
                       std::function<std::size_t()>([this] { return pending_checkins_.size(); }));
   wr.Add<std::size_t>("baseapp/rpc_reply_count", [this] { return rpc_registry_.ReplyCount(); });

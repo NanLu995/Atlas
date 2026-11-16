@@ -83,6 +83,12 @@ auto DBAppMgr::Init(int argc, char* argv[]) -> bool {
   return true;
 }
 
+auto DBAppMgr::AdmissionBlockReason() const -> std::string_view {
+  if (RecoveryWindowActive()) return "recovering";
+  if (shard_table_.empty()) return "no_database_route";
+  return {};
+}
+
 void DBAppMgr::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();

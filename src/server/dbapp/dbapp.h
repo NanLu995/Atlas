@@ -47,6 +47,7 @@ class DBApp : public ManagerApp {
   void Fini() override;
   void OnTickComplete() override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
 
  private:
   friend class DBAppRollbackTest;

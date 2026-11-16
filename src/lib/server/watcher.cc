@@ -2,6 +2,8 @@
 
 #include <cassert>
 
+#include "coro/pending_rpc_registry.h"
+
 namespace atlas {
 
 void WatcherRegistry::insert(std::string_view path, std::unique_ptr<WatcherEntry> entry) {
@@ -82,6 +84,17 @@ auto WatcherRegistry::Snapshot() const -> std::vector<std::pair<std::string, std
   std::vector<std::pair<std::string, std::string>> result;
   CollectSnapshot(root_, "", result);
   return result;
+}
+
+void RegisterRpcWatchers(WatcherRegistry& wr, PendingRpcRegistry& rpc) {
+  wr.Add<size_t>("rpc/pending", [&rpc] { return rpc.PendingCount(); });
+  wr.Add<size_t>("rpc/replies", [&rpc] { return rpc.ReplyCount(); });
+  wr.Add<size_t>("rpc/pending_limit", [] { return PendingRpcRegistry::kMaxPendingRpcs; });
+  wr.Add<size_t>("rpc/reply_limit", [] { return PendingRpcRegistry::kMaxReplyContexts; });
+  wr.Add<int64_t>("rpc/oldest_pending_ms", [&rpc] {
+    return std::chrono::duration_cast<Milliseconds>(rpc.OldestPendingAge()).count();
+  });
+  wr.Add<bool>("rpc/stopping", [&rpc] { return rpc.IsStopping(); });
 }
 
 void RegisterLatencyWatchers(WatcherRegistry& wr, std::string_view prefix, LatencyHistogram& hist) {

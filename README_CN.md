@@ -403,6 +403,27 @@ Reviver 只有确认旧本机进程退出后才重新拉起已观察的目标；
 Linux 使用稳定 pidfd 终止进程，避免“先检查 PID、再发信号”的复用竞争；不可用时不自动终止。
 Windows 使用保留的进程句柄。
 
+公共 Watcher 通过 `app/process_instance`、`machined/connected` 和
+`machined/registration_generation` 关联进程实例与登记连接。`network/pending_sends` 统计内部网络
+待发送数量。`app/shutdown/state` 区分 `running`、`draining`、`failed`、`timed_out`、`complete`，
+同前缀的 `pending_operations`、`remaining_ms` 显示未完成任务和剩余排空时间。
+失败时仍可能有未完成任务；排空且完成注销才报告 `complete`。这些值仅为本地观察，不探测数据库可达性。
+BaseApp、CellApp、LoginApp 提供 `rpc/pending`、`replies`、`pending_limit`、`reply_limit`、
+`oldest_pending_ms`、`stopping`。最长等待时间在查询时计算，无等待项时为零；聚合路径数量不随
+实体或请求增加，也不包含请求内容。
+`app/ready`、`app/not_ready_reason` 按进程职责报告新路由工作所需的本地条件：Manager 登记、
+EntityID 余量、已知数据库路由、队列容量及恢复门禁。原因为空表示就绪；停服始终报告
+`shutting_down`。恢复或空间暂停可令 Manager 报告降级，其他空间仍可能正常服务。
+这两个字段不改变接单、不发探测、不保证远端数据库实时可达，也不保证具体账号、实体或空间请求成功。
+查询 BaseAppMgr 不消耗过载接单名额。debug 级别的 RPC 失败日志包含回复/请求 ID、错误码和耗时，
+可与进程日志及现有托管 RPC trace ID 联合排查；不输出 RPC 内容和错误文本。
+DBApp 的 `dbapp/` 前缀新增 `pending_operations`、`operation_limit`、`pending_write_requests`、
+`account_session_requests`、`process_retirements`、`allocator_recoveries`。
+CellApp 提供 `pending_offloads`、`uncertain_offloads`、`pending_teleports`，不确定迁移继续沿用暂停契约。
+BaseApp 提供 `incoming_handoffs`、`session_revocations`、`pending_persist`；BaseApp、LoginApp
+在各自前缀下提供 `external_pending_sends`。不同生命周期层的计数可能重叠，不能相加当作独立用户请求数。
+既有按空间查询的恢复 Watcher 保留。
+
 重复执行框架恢复验收时，通过 `ATLAS_DB_MYSQL_*` 或 `--database-config` 指定隔离 MySQL 库，
 先构建 RPC Base/Cell 夹具，再运行 Windows 的
 `tools\bin\verify_framework_ha.bat --build framework-verify --scenario all`，或 Linux 的
@@ -410,6 +431,7 @@ Windows 使用保留的进程句柄。
 `managers` 验证三个 Manager 重启及重叠故障；`workers` 验证 DBApp、两台 CellApp、machined 崩溃重启。
 工具复用既有 HA verifier 和启动器，检查一个双叶空间、两个 Real Probe，逐故障日志保存在
 `.tmp/framework-ha-*`。SQLite 或缺少 MySQL 设置时明确拒绝。工具不创建数据库、不删除数据；
+初始与最终诊断 JSON 快照验证九个进程均已登记且本地就绪，队列计数非负并且不超过报告的上限。
 DBApp 会初始化表结构，须使用空测试库。BaseApp 会话/崩溃验收保留在既有
 `ClientHandoffRealTests` 中；本机拓扑不验证跨主机 fencing。
 

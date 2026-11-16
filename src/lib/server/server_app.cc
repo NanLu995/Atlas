@@ -1,5 +1,6 @@
 #include "server/server_app.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -275,9 +276,34 @@ void ServerApp::RegisterWatchers() {
   w.Add<std::string>("app/type",
                      [this]() { return std::string(ProcessTypeName(config_.process_type)); });
   w.Add("app/name", config_.process_name);
+  w.Add("app/process_instance", config_.process_instance);
+  w.Add<bool>("app/ready", [this] { return !IsShuttingDown() && AdmissionBlockReason().empty(); });
+  w.Add<std::string>("app/not_ready_reason", [this] {
+    return std::string(IsShuttingDown() ? "shutting_down" : AdmissionBlockReason());
+  });
   w.Add<double>("app/uptime_seconds", [this]() { return UptimeSeconds(); });
   w.Add<uint64_t>("app/game_time", [this]() { return GameTime(); });
   w.Add("app/update_hertz", config_.update_hertz);
+  w.Add<std::string>("app/shutdown/state", [this]() -> std::string {
+    if (shutdown_timed_out_) return "timed_out";
+    if (shutdown_error_) return "failed";
+    if (!shutdown_requested_) return "running";
+    if (shutdown_deregistered_ && PendingShutdownOperations() == 0) return "complete";
+    return "draining";
+  });
+  w.Add<std::size_t>("app/shutdown/pending_operations",
+                     [this] { return PendingShutdownOperations(); });
+  w.Add<int64_t>("app/shutdown/remaining_ms", [this]() -> int64_t {
+    if (!shutdown_requested_ || shutdown_timed_out_ ||
+        (shutdown_deregistered_ && PendingShutdownOperations() == 0))
+      return 0;
+    return std::max<int64_t>(
+        0, std::chrono::duration_cast<Milliseconds>(shutdown_deadline_ - Clock::now()).count());
+  });
+  w.Add<bool>("machined/connected", [this] { return machined_client_.IsConnected(); });
+  w.Add<uint64_t>("machined/registration_generation",
+                  [this] { return machined_client_.RegistrationGeneration(); });
+  w.Add<std::size_t>("network/pending_sends", [this] { return network_.PendingSendCount(); });
 
   w.Add<double>("tick/duration_ms", [this]() {
     using namespace std::chrono;

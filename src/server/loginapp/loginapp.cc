@@ -206,9 +206,20 @@ void LoginApp::FlushTickDirtyChannels() {
   external_network_.FlushDirtySendChannels();
 }
 
+auto LoginApp::AdmissionBlockReason() const -> std::string_view {
+  if (pending_by_username_.size() >= kMaxPendingLogins) return "login_queue_full";
+  if (dbapp_channel_ == nullptr && dbapp_shard_table_.empty()) return "no_database_route";
+  if (!baseappmgr_channel_ || baseappmgr_channel_->IsCondemned()) return "no_baseappmgr";
+  if (rpc_registry_.PendingCount() >= PendingRpcRegistry::kMaxPendingRpcs) return "rpc_full";
+  return {};
+}
+
 void LoginApp::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();
+  RegisterRpcWatchers(wr, rpc_registry_);
+  wr.Add<std::size_t>("loginapp/external_pending_sends",
+                      [this] { return external_network_.PendingSendCount(); });
   wr.Add<uint64_t>("loginapp/login_requests_total",
                    std::function<uint64_t()>([this] { return login_requests_total_; }));
   wr.Add<uint64_t>("loginapp/login_success_total",

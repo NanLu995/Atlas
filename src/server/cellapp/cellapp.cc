@@ -577,9 +577,24 @@ void CellApp::OnTickComplete() {
   MaybeRequestMoreIds();
 }
 
+auto CellApp::AdmissionBlockReason() const -> std::string_view {
+  if (!cellappmgr_channel_ || cellappmgr_channel_->IsCondemned() || app_id_ == 0)
+    return "cellappmgr_unregistered";
+  if (id_client_.IsCriticallyLow()) return "entity_ids_low";
+  if (rpc_registry_.PendingCount() >= PendingRpcRegistry::kMaxPendingRpcs) return "rpc_full";
+  return {};
+}
+
 void CellApp::RegisterWatchers() {
   EntityApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();
+  RegisterRpcWatchers(wr, rpc_registry_);
+  wr.Add<std::size_t>("cellapp/pending_offloads", [this] { return pending_offloads_.size(); });
+  wr.Add<std::size_t>("cellapp/pending_teleports", [this] { return pending_teleports_.size(); });
+  wr.Add<std::size_t>("cellapp/uncertain_offloads", [this] {
+    return std::count_if(pending_offloads_.begin(), pending_offloads_.end(),
+                         [](const auto& entry) { return entry.second.outcome_unknown; });
+  });
   wr.Add<uint64_t>("cellapp/ha/cellappmgr_stale_drops",
                    std::function<uint64_t()>([this] { return cellappmgr_stale_drops_; }));
   wr.Add<float>("cellapp/load", std::function<float()>([this] { return persistent_load_; }));

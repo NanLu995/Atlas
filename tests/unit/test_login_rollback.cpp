@@ -132,6 +132,7 @@ class LoginRollbackTest : public ::testing::Test {
     return app_.GetWatcherRegistry().Get(path);
   }
   void set_legacy_dbapp_channel(Channel* ch) { app_.dbapp_channel_ = ch; }
+  void set_baseappmgr_channel(Channel* ch) { app_.baseappmgr_channel_ = ch; }
   void cache_dbapp_channel(const Address& addr, Channel* ch) { app_.dbapp_channels_[addr] = ch; }
   auto cached_dbapp_channel_count() const -> std::size_t { return app_.dbapp_channels_.size(); }
   void apply_dbapp_shards(uint32_t version, std::vector<dbappmgr::ShardEntry> entries) {
@@ -195,6 +196,26 @@ class LoginRollbackTest : public ::testing::Test {
   NetworkInterface external_network_;
   LoginApp app_;
 };
+
+TEST_F(LoginRollbackTest, ReadinessReportsLocalDependenciesWithoutIssuingWork) {
+  register_watchers();
+  EXPECT_EQ(watcher("app/ready"), "false");
+  EXPECT_EQ(watcher("app/not_ready_reason"), "no_database_route");
+  InterfaceTable table;
+  CapturingChannel db_channel(dispatcher_, table, Address("127.0.0.1", 24001));
+  CapturingChannel manager_channel(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(&db_channel);
+  EXPECT_EQ(watcher("app/not_ready_reason"), "no_baseappmgr");
+  set_baseappmgr_channel(&manager_channel);
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_EQ(watcher("app/ready"), "true");
+    EXPECT_EQ(watcher("app/not_ready_reason"), "");
+  }
+  EXPECT_EQ(db_channel.send_count(), 0u);
+  EXPECT_EQ(manager_channel.send_count(), 0u);
+  set_legacy_dbapp_channel(nullptr);
+  set_baseappmgr_channel(nullptr);
+}
 
 TEST_F(LoginRollbackTest, ClientDisconnectCancelsActiveLogin) {
   register_watchers();
@@ -3492,7 +3513,8 @@ class FakeDatabase final : public IDatabase {
   Result<void> Startup(const DatabaseConfig&, const EntityDefRegistry&) override { return {}; }
   void Shutdown() override {}
   void BeginDrain() override {}
-  auto PendingOperations() const -> std::size_t override { return 0; }
+  std::size_t pending_operations{0};
+  auto PendingOperations() const -> std::size_t override { return pending_operations; }
 
   void ReadAccountSession(DatabaseID, uint16_t,
                           std::function<void(Result<AccountSession>)> callback) override {
@@ -4582,6 +4604,8 @@ TEST_F(DBAppRollbackTest, AbortCheckoutIsIdempotentWhileRequestIsPending) {
 
 TEST_F(DBAppRollbackTest, RegisterDbAppAckStoresShardState) {
   register_watchers();
+  EXPECT_EQ(watcher("app/not_ready_reason"), "shards_unregistered");
+  EXPECT_EQ(watcher("dbapp/pending_operations"), "0");
 
   dbappmgr::RegisterDbAppAck ack;
   ack.success = true;
@@ -4596,6 +4620,15 @@ TEST_F(DBAppRollbackTest, RegisterDbAppAckStoresShardState) {
   EXPECT_EQ(shard_count(), 1u);
   EXPECT_EQ(watcher("dbapp/dbapp_id").value_or(""), "7");
   EXPECT_EQ(watcher("dbapp/shard_table_version").value_or(""), "3");
+  EXPECT_EQ(watcher("app/ready"), "true");
+  const auto path_count = app_.GetWatcherRegistry().List().size();
+  db().pending_operations = IDatabase::kMaxPendingOperations;
+  EXPECT_EQ(watcher("app/ready"), "false");
+  EXPECT_EQ(watcher("app/not_ready_reason"), "database_queue_full");
+  EXPECT_EQ(watcher("dbapp/pending_operations"), "4096");
+  EXPECT_EQ(app_.GetWatcherRegistry().List().size(), path_count);
+  db().pending_operations = 0;
+  EXPECT_EQ(watcher("app/ready"), "true");
 }
 
 TEST_F(DBAppRollbackTest, RegisterDbAppAckKeepsLocalShardStateForRecoveryAck) {

@@ -314,6 +314,7 @@ class CellApp : public EntityApp, public CellMovementHost {
   void OnEndOfTick() override;
   void OnTickComplete() override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
 
   [[nodiscard]] auto CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> override;
 

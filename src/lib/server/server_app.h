@@ -2,6 +2,7 @@
 #define ATLAS_LIB_SERVER_SERVER_APP_H_
 
 #include <cstdint>
+#include <string_view>
 
 #include "foundation/clock.h"
 #include "network/event_dispatcher.h"
@@ -95,6 +96,7 @@ class ServerApp {
   virtual void OnSignal(Signal sig);
 
   virtual void RegisterWatchers();
+  [[nodiscard]] virtual auto AdmissionBlockReason() const -> std::string_view { return {}; }
 
  private:
   friend struct ServerAppShutdownTestAccess;

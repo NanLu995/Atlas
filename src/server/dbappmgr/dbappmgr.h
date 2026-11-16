@@ -60,6 +60,7 @@ class DBAppMgr : public ManagerApp {
  protected:
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
 
  private:
   [[nodiscard]] auto FindDbAppByAppId(uint32_t app_id) -> DBAppInfo*;

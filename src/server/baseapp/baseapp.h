@@ -136,6 +136,7 @@ class BaseApp : public EntityApp {
   void OnTickComplete() override;
   void FlushTickDirtyChannels() override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
 
   [[nodiscard]] auto CreateNativeProvider() -> std::unique_ptr<INativeApiProvider> override;
 

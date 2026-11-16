@@ -217,6 +217,16 @@ void BaseAppMgr::OnTickComplete() {
   ManagerApp::OnTickComplete();
 }
 
+auto BaseAppMgr::AdmissionBlockReason() const -> std::string_view {
+  const auto* best = FindLeastLoaded();
+  if (!best) return "no_ready_baseapp";
+  if (best->IsHardOverloaded(kOverloadThreshold) && overload_start_ != TimePoint{} &&
+      (Clock::now() - overload_start_ > std::chrono::seconds(5) ||
+       logins_since_overload_ >= kOverloadLoginLimit))
+    return "baseapps_overloaded";
+  return {};
+}
+
 void BaseAppMgr::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& wr = GetWatcherRegistry();

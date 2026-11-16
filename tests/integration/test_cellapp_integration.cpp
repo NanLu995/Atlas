@@ -700,6 +700,10 @@ TEST(CellAppIntegration, AllProcessesStartAndRegister) {
   }
   ASSERT_NE(cellappmgr_port, 0u) << "cellappmgr failed to start\n" << machined.Diagnostic();
 
+  const auto runtime_config = std::filesystem::path(ATLAS_TEST_RUNTIME_CONFIG);
+  const auto cell_assembly = std::filesystem::path(ATLAS_TEST_CELL_ASSEMBLY);
+  ASSERT_TRUE(std::filesystem::is_regular_file(runtime_config)) << runtime_config;
+  ASSERT_TRUE(std::filesystem::is_regular_file(cell_assembly)) << cell_assembly;
   uint16_t cellapp_port = 0;
   ChildProcess cellapp;
   for (int attempt = 0; attempt < kRetryCount; ++attempt) {
@@ -708,7 +712,8 @@ TEST(CellAppIntegration, AllProcessesStartAndRegister) {
     auto child = ChildProcess::Launch(
         cellapp_exe,
         {L"--type", L"cellapp", L"--name", L"cellapp_all_procs", L"--update-hertz", L"100",
-         L"--internal-port", std::to_wstring(port), L"--machined", machined_addr},
+         L"--internal-port", std::to_wstring(port), L"--machined", machined_addr,
+         L"--runtime-config", runtime_config.wstring(), L"--assembly", cell_assembly.wstring()},
         "cellapp");
     if (child.IsRunning() && WaitForUdpBoundInteg(port, std::chrono::seconds(2))) {
       cellapp_port = port;

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "coro/entity_rpc_reply.h"
+#include "foundation/log.h"
 #include "network/message_ids.h"
 #include "serialization/binary_stream.h"
 
@@ -54,8 +55,8 @@ auto PendingRpcRegistry::RegisterPending(MessageID reply_id, uint64_t request_id
       CompleteError(handle, Error{ErrorCode::kTimeout, "RPC timed out"});
     });
   }
-  pending_.emplace(key,
-                   PendingEntry{std::move(on_reply), std::move(on_error), timer, channel, handle});
+  pending_.emplace(key, PendingEntry{std::move(on_reply), std::move(on_error), timer, channel,
+                                     handle, Clock::now()});
   handles_.emplace(handle.value, key);
   return handle;
 }
@@ -162,6 +163,11 @@ void PendingRpcRegistry::CompleteError(PendingHandle handle, Error error) {
   if (found == handles_.end()) return;
   auto it = pending_.find(found->second);
 
+  ATLAS_LOG_DEBUG(
+      "RPC failed reply_id={} request_id={} error={} elapsed_ms={}", it->first.reply_id,
+      it->first.request_id, static_cast<int>(error.Code()),
+      std::chrono::duration_cast<Milliseconds>(Clock::now() - it->second.started_at).count());
+
   dispatcher_.CancelTimer(it->second.timeout_timer);
 
   auto error_cb = std::move(it->second.on_error);
@@ -209,6 +215,15 @@ void PendingRpcRegistry::CancelAll() {
 void PendingRpcRegistry::Shutdown() {
   stopping_ = true;
   CancelAll();
+}
+
+auto PendingRpcRegistry::OldestPendingAge() const -> Duration {
+  const auto now = Clock::now();
+  auto oldest = now;
+  for (const auto& [key, entry] : pending_) {
+    if (entry.started_at < oldest) oldest = entry.started_at;
+  }
+  return now - oldest;
 }
 
 auto PendingRpcRegistry::PendingCount() const -> size_t {

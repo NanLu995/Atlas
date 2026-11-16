@@ -368,6 +368,49 @@ TEST(ServerApp, WatcherRegisteredAfterInit) {
   EXPECT_TRUE(app.GetWatcherRegistry().Get("app/name").has_value());
   EXPECT_TRUE(app.GetWatcherRegistry().Get("tick/slow_count").has_value());
   EXPECT_TRUE(app.GetWatcherRegistry().Get("tick/total_count").has_value());
+  EXPECT_EQ(app.GetWatcherRegistry().Get("app/shutdown/state"), "complete");
+  EXPECT_EQ(app.GetWatcherRegistry().Get("app/shutdown/pending_operations"), "0");
+  EXPECT_EQ(app.GetWatcherRegistry().Get("app/shutdown/remaining_ms"), "0");
+}
+
+TEST(ServerApp, ShutdownDiagnosticsReflectPendingFailureAndDeadline) {
+  class DiagnosticApp : public ServerApp {
+   public:
+    using ServerApp::MarkShutdownFailed;
+    using ServerApp::RegisterWatchers;
+    using ServerApp::ServerApp;
+    std::size_t pending{0};
+    auto PendingShutdownOperations() const -> std::size_t override { return pending; }
+  };
+  EventDispatcher dispatcher{"shutdown_diagnostics"};
+  dispatcher.SetMaxPollWait(Milliseconds(1));
+  NetworkInterface network{dispatcher};
+  DiagnosticApp app{dispatcher, network};
+  app.RegisterWatchers();
+  auto& watchers = app.GetWatcherRegistry();
+  EXPECT_EQ(watchers.Get("app/shutdown/state"), "running");
+  EXPECT_EQ(watchers.Get("app/ready"), "true");
+  EXPECT_EQ(watchers.Get("app/not_ready_reason"), "");
+  EXPECT_EQ(watchers.Get("app/shutdown/remaining_ms"), "0");
+  app.pending = 2;
+  app.Shutdown();
+  EXPECT_EQ(watchers.Get("app/shutdown/state"), "draining");
+  EXPECT_EQ(watchers.Get("app/ready"), "false");
+  EXPECT_EQ(watchers.Get("app/not_ready_reason"), "shutting_down");
+  EXPECT_EQ(watchers.Get("app/shutdown/pending_operations"), "2");
+  const auto remaining = watchers.Get("app/shutdown/remaining_ms");
+  ASSERT_TRUE(remaining);
+  EXPECT_GT(std::stoll(*remaining), 0);
+  EXPECT_LE(std::stoll(*remaining), 30000);
+  app.MarkShutdownFailed(Error{ErrorCode::kIoError, "save failed"});
+  EXPECT_EQ(watchers.Get("app/shutdown/state"), "failed");
+  ServerAppShutdownTestAccess::Expire(app);
+  const auto deadline = Clock::now() + std::chrono::seconds(1);
+  while (Clock::now() < deadline && watchers.Get("app/shutdown/state") != "timed_out")
+    dispatcher.ProcessOnce();
+  EXPECT_EQ(watchers.Get("app/shutdown/state"), "timed_out");
+  EXPECT_EQ(watchers.Get("app/shutdown/remaining_ms"), "0");
+  EXPECT_EQ(watchers.Get("app/shutdown/pending_operations"), "2");
 }
 
 TEST(ServerApp, ConfigLoadedFromArgs) {

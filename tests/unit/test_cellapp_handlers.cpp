@@ -485,6 +485,29 @@ TEST_F(CellAppHandlersTest, CreateCellEntityGhostOnlyRestoreRejectsGhostWithoutB
   EXPECT_EQ(failures[0].reason, baseapp::CellEntityCreateFailureReason::kGhostBackupMissing);
 }
 
+TEST(CellAppWatchers, MigrationMetricsRemainBoundedAndTrackUncertainOutcomes) {
+  EventDispatcher dispatcher{"migration_watchers"};
+  NetworkInterface network{dispatcher};
+  WatcherCellApp app{dispatcher, network};
+  app.RegisterWatchersForTest();
+  auto& watchers = app.GetWatcherRegistry();
+  const auto count = watchers.List().size();
+  EXPECT_EQ(watchers.Get("app/ready"), "false");
+  EXPECT_EQ(watchers.Get("app/not_ready_reason"), "cellappmgr_unregistered");
+  EXPECT_EQ(watchers.Get("cellapp/pending_offloads"), "0");
+  app.PendingOffloadsForTest()[1].outcome_unknown = true;
+  app.PendingOffloadsForTest()[2].outcome_unknown = false;
+  app.PendingTeleportsForTest()[3] = {};
+  EXPECT_EQ(watchers.Get("cellapp/pending_offloads"), "2");
+  EXPECT_EQ(watchers.Get("cellapp/uncertain_offloads"), "1");
+  EXPECT_EQ(watchers.Get("cellapp/pending_teleports"), "1");
+  EXPECT_EQ(watchers.List().size(), count);
+  app.PendingOffloadsForTest().clear();
+  app.PendingTeleportsForTest().clear();
+  EXPECT_EQ(watchers.Get("cellapp/uncertain_offloads"), "0");
+  EXPECT_EQ(watchers.Get("cellapp/pending_teleports"), "0");
+}
+
 TEST(CellAppWatchers, GhostPromoteCounterTracksCreateCellEntityRestore) {
   EventDispatcher dispatcher{"test_cellapp_ghost_promote_watcher"};
   NetworkInterface network{dispatcher};

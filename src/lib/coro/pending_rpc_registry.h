@@ -67,6 +67,7 @@ class PendingRpcRegistry {
   [[nodiscard]] auto IsStopping() const -> bool { return stopping_; }
 
   [[nodiscard]] auto PendingCount() const -> size_t;
+  [[nodiscard]] auto OldestPendingAge() const -> Duration;
 
  private:
   friend struct PendingRpcRegistryTestAccess;
@@ -90,6 +91,7 @@ class PendingRpcRegistry {
     TimerHandle timeout_timer;
     Channel* channel{nullptr};
     PendingHandle handle;
+    TimePoint started_at;
   };
 
   static auto ExtractRequestId(MessageID id, std::span<const std::byte> payload) -> uint64_t;

@@ -99,6 +99,7 @@ class CellAppMgr : public ManagerApp {
   [[nodiscard]] auto Init(int argc, char* argv[]) -> bool override;
   void Fini() override;
   void RegisterWatchers() override;
+  [[nodiscard]] auto AdmissionBlockReason() const -> std::string_view override;
   void OnTickComplete() override;
 
  private:

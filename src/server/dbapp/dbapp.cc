@@ -231,10 +231,29 @@ void DBApp::OnTickComplete() {
   ReportLoadToDbAppMgr();
 }
 
+auto DBApp::AdmissionBlockReason() const -> std::string_view {
+  if (!database_ || !entity_defs_) return "database_uninitialized";
+  if (!HasAuthoritativeShardTable()) return "shards_unregistered";
+  if (!create_dbid_recovery_pending_.empty()) return "allocator_recovering";
+  if (database_->PendingOperations() >= IDatabase::kMaxPendingOperations)
+    return "database_queue_full";
+  return {};
+}
+
 void DBApp::RegisterWatchers() {
   ManagerApp::RegisterWatchers();
   auto& reg = GetWatcherRegistry();
 
+  reg.Add<std::size_t>("dbapp/pending_operations",
+                       [this] { return database_ ? database_->PendingOperations() : 0; });
+  reg.Add<std::size_t>("dbapp/operation_limit", [] { return IDatabase::kMaxPendingOperations; });
+  reg.Add<std::size_t>("dbapp/pending_write_requests",
+                       [this] { return pending_write_requests_.size(); });
+  reg.Add<std::size_t>("dbapp/account_session_requests",
+                       [this] { return account_session_requests_; });
+  reg.Add<std::size_t>("dbapp/process_retirements", [this] { return process_retirements_.size(); });
+  reg.Add<std::size_t>("dbapp/allocator_recoveries",
+                       [this] { return create_dbid_recovery_pending_.size(); });
   reg.Add<std::size_t>("dbapp/auth_active", [this] { return active_authentications_; });
   reg.Add<std::size_t>("dbapp/auth_queued", [this] { return pending_authentications_.size(); });
 
