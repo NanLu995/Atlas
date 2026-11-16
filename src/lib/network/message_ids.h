@@ -86,6 +86,9 @@ enum class BaseApp : uint16_t {
   kPrepareClientHandoff = 2041,
   kPrepareClientHandoffReply = 2042,
   kClientHandoff = 2043,
+  kRecoveryCredentialUpdate = 2044,
+  kClientLogout = 2045,
+  kClientLogoutResult = 2046,
 };
 
 // CellApp outbound traffic to BaseApp reuses BaseApp IDs.
@@ -197,6 +200,9 @@ enum class Login : uint16_t {
   kPrepareLogin = 5006,
   kPrepareLoginResult = 5007,
   kCancelPrepareLogin = 5008,
+  kResumeRequest = 5009,
+  kPrepareResume = 5010,
+  kPrepareResumeResult = 5011,
 };
 
 enum class BaseAppMgr : uint16_t {
@@ -264,6 +270,9 @@ ATLAS_ASSERT_ID_RANGE(BaseApp::kRevokeAccountSessionReply, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kPrepareClientHandoff, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kPrepareClientHandoffReply, 2000, 2999);
 ATLAS_ASSERT_ID_RANGE(BaseApp::kClientHandoff, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kRecoveryCredentialUpdate, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kClientLogout, 2000, 2999);
+ATLAS_ASSERT_ID_RANGE(BaseApp::kClientLogoutResult, 2000, 2999);
 
 ATLAS_ASSERT_ID_RANGE(CellApp::kCreateCellEntity, 3000, 3999);
 ATLAS_ASSERT_ID_RANGE(CellApp::kSpawnLocalEntity, 3000, 3999);
@@ -348,6 +357,9 @@ ATLAS_ASSERT_ID_RANGE(Login::kAllocateBaseAppResult, 5000, 5999);
 ATLAS_ASSERT_ID_RANGE(Login::kPrepareLogin, 5000, 5999);
 ATLAS_ASSERT_ID_RANGE(Login::kPrepareLoginResult, 5000, 5999);
 ATLAS_ASSERT_ID_RANGE(Login::kCancelPrepareLogin, 5000, 5999);
+ATLAS_ASSERT_ID_RANGE(Login::kResumeRequest, 5000, 5999);
+ATLAS_ASSERT_ID_RANGE(Login::kPrepareResume, 5000, 5999);
+ATLAS_ASSERT_ID_RANGE(Login::kPrepareResumeResult, 5000, 5999);
 
 ATLAS_ASSERT_ID_RANGE(BaseAppMgr::kRegisterBaseApp, 6000, 6999);
 ATLAS_ASSERT_ID_RANGE(BaseAppMgr::kRegisterBaseAppAck, 6000, 6999);

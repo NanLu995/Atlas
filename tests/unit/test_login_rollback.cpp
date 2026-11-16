@@ -174,6 +174,13 @@ class LoginRollbackTest : public ::testing::Test {
     return external_network_.FindChannel(id) != nullptr;
   }
   auto pending_rpc_count() const -> std::size_t { return app_.rpc_registry_.PendingCount(); }
+  void request_resume(Channel& channel, DatabaseID dbid) {
+    login::ResumeRequest request;
+    request.credential = {dbid, 7, {}, 601000};
+    request.credential.value[0] = std::byte{1};
+    app_.OnResumeRequest(channel.RemoteAddress(), &channel, request);
+  }
+  auto pending_recoveries() const -> std::size_t { return app_.pending_recoveries_.size(); }
   auto handle_auth_result(Channel* channel, const login::AuthLoginResult& result) -> bool {
     BinaryWriter writer;
     result.Serialize(writer);
@@ -215,6 +222,33 @@ TEST_F(LoginRollbackTest, ReadinessReportsLocalDependenciesWithoutIssuingWork) {
   EXPECT_EQ(manager_channel.send_count(), 0u);
   set_legacy_dbapp_channel(nullptr);
   set_baseappmgr_channel(nullptr);
+}
+
+TEST_F(LoginRollbackTest, RecoverySharesAdmissionMetricsAndCancelsOnDisconnect) {
+  register_watchers();
+  NetworkInterface client(dispatcher_);
+  ASSERT_TRUE(client.StartRudpServer(Address("127.0.0.1", 0)));
+  auto connected = connect_login_client(Address("127.0.0.1", client.RudpAddress().Port()));
+  ASSERT_TRUE(connected);
+  IntrusivePtr<Channel> channel{*connected};
+  InterfaceTable table;
+  auto manager = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_baseappmgr_channel(manager.get());
+  request_resume(*channel, 42);
+  EXPECT_EQ(pending_recoveries(), 1u);
+  EXPECT_EQ(active_login_count(), 1u);
+  EXPECT_EQ(watcher("loginapp/pending_logins"), "1");
+  const auto allocations = DecodeSentMessages<login::AllocateBaseApp>(*manager);
+  ASSERT_EQ(allocations.size(), 1u);
+  EXPECT_EQ(allocations.front().dbid, 42);
+  EXPECT_EQ(allocations.front().type_id, 7);
+  request_resume(*channel, 42);
+  EXPECT_EQ(manager->send_count(), 1u);
+  disconnect_login_client(*channel);
+  EXPECT_EQ(pending_recoveries(), 0u);
+  EXPECT_EQ(pending_rpc_count(), 0u);
+  EXPECT_EQ(active_login_count(), 0u);
+  EXPECT_EQ(watcher("loginapp/pending_logins"), "0");
 }
 
 TEST_F(LoginRollbackTest, ClientDisconnectCancelsActiveLogin) {
@@ -509,10 +543,12 @@ class BaseAppRollbackTest : public ::testing::Test {
     app_.prepared_login_requests_by_entity_[proxy->EntityId()] = request_id;
     return proxy;
   }
-  void authenticate(Channel& channel, const SessionKey& key, bool supports_handoff = false) {
+  void authenticate(Channel& channel, const SessionKey& key, bool supports_handoff = false,
+                    bool supports_recovery = false) {
     baseapp::Authenticate request;
     request.session_key = key;
     request.supports_handoff = supports_handoff;
+    request.supports_recovery = supports_recovery;
     app_.OnClientAuthenticate(channel, request);
   }
   auto handoff_request(Proxy& target, const SessionKey& credential)
@@ -566,7 +602,7 @@ class BaseAppRollbackTest : public ::testing::Test {
       ADD_FAILURE() << "expected session mutation";
       return current;
     }
-    auto next = ApplySessionOperation(current, *requests.back().operation);
+    auto next = ApplySessionOperation(current, *requests.back().operation, 1000);
     EXPECT_TRUE(next.HasValue());
     return next ? *next : current;
   }
@@ -593,6 +629,65 @@ class BaseAppRollbackTest : public ::testing::Test {
     const auto& checkout = *proxy.CheckoutOwner();
     record.owner = {checkout.base_addr, proxy.EntityId(), checkout.process_instance};
     return record;
+  }
+  auto prepare_resume(login::PrepareResume request,
+                      std::shared_ptr<std::optional<Result<login::PrepareResumeResult>>> result)
+      -> FireAndForget {
+    *result = co_await app_.PrepareSessionRecovery(std::move(request));
+  }
+  void logout(Channel& channel, EntityID entity_id, uint64_t request_id) {
+    app_.OnClientLogout(IntrusivePtr<Channel>{&channel},
+                        baseapp::ClientLogout{request_id, entity_id});
+  }
+  void refresh_recovery_after_save(EntityID entity_id, DatabaseID dbid) {
+    ASSERT_TRUE(app_.entity_mgr_.AssignDbid(entity_id, dbid));
+    app_.RefreshPersistedRecoveryCredential(entity_id);
+  }
+  auto recovery_target(EntityID entity_id) const -> DatabaseID {
+    return app_.client_sessions_.at(entity_id)->record.recovery.entity_dbid;
+  }
+  auto retained_client_channel(const Address& address) -> Channel* {
+    auto channel = external_network_.ConnectRudp(address);
+    return channel ? static_cast<Channel*>(*channel) : nullptr;
+  }
+  void prepare_crash_recovery() {
+    install_checkout_type();
+    app_.entity_mgr_.SetIdClient(&app_.id_client_);
+    app_.id_client_.AddIds(1000, 1100);
+    app_.app_id_ = 7;
+    register_base_peer(Address("127.0.0.1", 25001), 111);
+    app_.baseapp_peers_.at(Address("127.0.0.1", 25001)).external_addr = Address("127.0.0.1", 26001);
+  }
+  void answer_recovery_checkout(CapturingChannel& database) {
+    const auto requests = DecodeSentMessages<dbapp::CheckoutEntity>(database);
+    ASSERT_FALSE(requests.empty());
+    const auto& request = requests.back();
+    dbapp::CheckoutEntityAck reply;
+    reply.request_id = request.request_id;
+    reply.operation_id = request.operation_id;
+    reply.dbid = request.dbid;
+    reply.checkout_version = 19;
+    reply.holder_addr = Address("127.0.0.1", 25001);
+    reply.holder_app_id = request.owner_app_id;
+    reply.holder_entity_id = request.entity_id;
+    reply.holder_process_instance = request.owner_process_instance;
+    reply.blob = DatabaseBlob({std::byte{0x11}}, {std::byte{0x22}});
+    handle_checkout_ack(database.RemoteAddress(), reply);
+  }
+  auto resume_request(const AccountSession& record) -> login::PrepareResume {
+    register_base_peer(record.owner.base_addr, record.owner.process_instance);
+    app_.baseapp_peers_.at(record.owner.base_addr).external_addr = Address("127.0.0.1", 26001);
+    login::PrepareResume request;
+    request.request_id = 700;
+    request.requester_instance = 333;
+    request.account_dbid = 42;
+    request.account_type_id = 7;
+    request.proof = record.recovery.credential_hash;
+    request.session_key = *SessionKey::Generate();
+    std::ranges::copy(EntityDefRegistry::Instance().Digest(), request.entity_def_digest.begin());
+    register_base_peer(record.owner.base_addr, record.owner.process_instance);
+    app_.baseapp_peers_.at(record.owner.base_addr).external_addr = Address("127.0.0.1", 26001);
+    return request;
   }
   void retain_client_channel(const Address& address) {
     ASSERT_TRUE(external_network_.ConnectRudp(address).HasValue());
@@ -806,8 +901,8 @@ class BaseAppRollbackTest : public ::testing::Test {
     EXPECT_EQ(app_.rpc_registry_.PendingCount(), 0u);
     EXPECT_EQ(remote.rpc_registry_.PendingCount(), 0u);
   }
-  void check_outgoing_handoff(bool occupied = false, bool unknown = false,
-                              bool unsupported = false) {
+  void check_outgoing_handoff(bool occupied = false, bool unknown = false, bool unsupported = false,
+                              bool recovery = false) {
     ASSERT_TRUE(internal_network_.StartRudpServer(Address("127.0.0.1", 0)));
     ASSERT_TRUE(external_network_.StartRudpServer(Address("127.0.0.1", 0)));
     NetworkInterface remote_network(dispatcher_);
@@ -916,7 +1011,9 @@ class BaseAppRollbackTest : public ::testing::Test {
     EXPECT_EQ(redirect->target.process_instance, 222u);
     EXPECT_TRUE(source->HasClient());
     EXPECT_FALSE(target->HasClient());
-    remote.OnClientAuthenticate(*client, baseapp::Authenticate{redirect->credential});
+    baseapp::Authenticate authentication{redirect->credential};
+    authentication.supports_recovery = recovery;
+    remote.OnClientAuthenticate(*client, authentication);
     answer_remote(awaiting);
     const auto completed = apply_latest(*remote_database, awaiting);
     if (unknown) {
@@ -932,6 +1029,12 @@ class BaseAppRollbackTest : public ::testing::Test {
       return;
     }
     answer_remote(completed);
+    if (recovery) {
+      EXPECT_TRUE(source->HasClient());
+      EXPECT_FALSE(target->HasClient());
+      const auto issued = apply_latest(*remote_database, completed);
+      answer_remote(issued);
+    }
     EXPECT_TRUE(source->HasClient());
     ASSERT_TRUE(pump([&] { return result->has_value(); }));
     EXPECT_TRUE((*result)->HasValue());
@@ -1765,6 +1868,10 @@ TEST_F(BaseAppRollbackTest, RemoteHandoffKeepsSourceBoundUntilTargetAuthenticati
   check_outgoing_handoff();
 }
 
+TEST_F(BaseAppRollbackTest, RemoteHandoffReleasesSourceAfterRecoveryGrantAdvancesVersion) {
+  check_outgoing_handoff(false, false, false, true);
+}
+
 TEST_F(BaseAppRollbackTest, RejectedRemoteHandoffRestoresOnlyConfirmedSourceOwnership) {
   check_outgoing_handoff(true);
 }
@@ -1937,6 +2044,268 @@ TEST_F(BaseAppRollbackTest, LoginDoesNotGuessThatAnUnavailableOwnerIsOffline) {
   EXPECT_EQ(login_session_check_count(), 0u);
   EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
   EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, RecoveryCredentialIsDeliveredOnlyAfterDatabaseConfirmation) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey(), true, true);
+  answer_session(*database, {});
+  auto active = active_session(*proxy);
+  answer_session(*database, active);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_TRUE(DecodeSentMessages<baseapp::AuthenticateResult>(*client).empty());
+  const auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*database);
+  ASSERT_TRUE(requests.back().operation);
+  EXPECT_EQ(requests.back().operation->action, AccountSessionAction::kIssueRecovery);
+  auto issued = apply_latest(*database, active);
+  answer_session(*database, issued);
+  ASSERT_TRUE(proxy->HasClient());
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client);
+  ASSERT_EQ(replies.size(), 1u);
+  ASSERT_TRUE(replies.back().success);
+  EXPECT_EQ(replies.back().recovery.account_dbid, 42);
+  EXPECT_EQ(replies.back().recovery.expires_at_ms, 601000);
+  const auto hash = Sha256(replies.back().recovery.value);
+  ASSERT_TRUE(hash.HasValue());
+  EXPECT_EQ(*hash, issued.recovery.credential_hash);
+  EXPECT_EQ(session_pending_count(), 0u);
+}
+
+TEST_F(BaseAppRollbackTest, LiveRecoveryConsumesOnceBeforeReplacingTheBoundConnection) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey(), true, true);
+  answer_session(*database, {});
+  auto active = active_session(*proxy);
+  answer_session(*database, active);
+  auto issued = apply_latest(*database, active);
+  answer_session(*database, issued);
+  ASSERT_TRUE(proxy->HasClient());
+  const auto old_key = proxy->GetSessionKey();
+  auto request = resume_request(issued);
+  auto result = std::make_shared<std::optional<Result<login::PrepareResumeResult>>>();
+  prepare_resume(request, result);
+  answer_session(*database, issued);
+  EXPECT_TRUE(proxy->HasClient());
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  EXPECT_FALSE(result->has_value());
+  auto consumed = apply_latest(*database, issued);
+  EXPECT_NE(consumed.recovery.credential_hash, issued.recovery.credential_hash);
+  answer_session(*database, consumed);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_TRUE(**result);
+  EXPECT_TRUE((**result)->success);
+  EXPECT_EQ((**result)->entity_id, proxy->EntityId());
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_NE(proxy->GetSessionKey(), old_key);
+  EXPECT_EQ(proxy->GetSessionKey(), request.session_key);
+  auto replacement =
+      make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27002));
+  authenticate(*replacement, request.session_key, true, true);
+  EXPECT_TRUE(proxy->HasClient());
+  auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*replacement);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_TRUE(replies.front().success);
+  auto digest = Sha256(replies.front().recovery.value);
+  ASSERT_TRUE(digest);
+  EXPECT_EQ(*digest, consumed.recovery.credential_hash);
+  result->reset();
+  prepare_resume(request, result);
+  answer_session(*database, consumed);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_FALSE(**result);
+  EXPECT_TRUE(proxy->HasClient());
+  EXPECT_FALSE(session_frozen(proxy->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, RecoveryCommitUnknownKeepsOldConnectionFencedAndWithholdsSuccess) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  authenticate(*client, proxy->GetSessionKey(), true, true);
+  answer_session(*database, {});
+  auto active = active_session(*proxy);
+  answer_session(*database, active);
+  auto issued = apply_latest(*database, active);
+  answer_session(*database, issued);
+  const auto old_key = proxy->GetSessionKey();
+  auto request = resume_request(issued);
+  auto result = std::make_shared<std::optional<Result<login::PrepareResumeResult>>>();
+  prepare_resume(request, result);
+  answer_session(*database, issued);
+  answer_session(*database, issued, ErrorCode::kCommitUnknown);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_FALSE(**result);
+  EXPECT_EQ((**result).Error().Code(), ErrorCode::kCommitUnknown);
+  EXPECT_EQ(proxy->GetSessionKey(), old_key);
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+}
+
+TEST_F(BaseAppRollbackTest, CrashRecoveryRestoresPersistentIdentityAndWaitsForOwnershipCommit) {
+  prepare_crash_recovery();
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(database.get());
+  AccountSession old;
+  old.version = 3;
+  old.phase = AccountSessionPhase::kActive;
+  old.owner = {Address("127.0.0.1", 25002), 999, 222};
+  old.recovery = {{}, 42, 7, 601000};
+  old.recovery.credential_hash[0] = std::byte{1};
+  auto request = resume_request(old);
+  retire_base_peer(old.owner.base_addr, 222);
+  auto result = std::make_shared<std::optional<Result<login::PrepareResumeResult>>>();
+  prepare_resume(request, result);
+  answer_session(*database, old);
+  EXPECT_FALSE(result->has_value());
+  answer_recovery_checkout(*database);
+  auto* entity = find_db_entity(42);
+  ASSERT_NE(entity, nullptr);
+  EXPECT_NE(entity->EntityId(), old.owner.entity_id);
+  EXPECT_EQ(entity->EntityData(), (std::vector<std::byte>{std::byte{0x11}}));
+  EXPECT_EQ(entity->CellBackupData(), (std::vector<std::byte>{std::byte{0x22}}));
+  EXPECT_TRUE(session_frozen(entity->EntityId()));
+  auto mutations = DecodeSentMessages<dbapp::AccountSessionRequest>(*database);
+  ASSERT_TRUE(mutations.back().operation);
+  const auto& operation = *mutations.back().operation;
+  EXPECT_EQ(operation.action, AccountSessionAction::kClaimRecovery);
+  EXPECT_EQ(operation.claim_checkout, entity->CheckoutOwner());
+  EXPECT_EQ(operation.recovery_checkout, entity->CheckoutOwner());
+  EXPECT_FALSE(result->has_value());
+  auto claimed = apply_latest(*database, old);
+  answer_session(*database, claimed);
+  ASSERT_TRUE(result->has_value());
+  ASSERT_TRUE(**result);
+  EXPECT_TRUE((**result)->success);
+  EXPECT_EQ((**result)->entity_id, entity->EntityId());
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  authenticate(*client, request.session_key, true, true);
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_TRUE(replies.front().success);
+}
+
+TEST_F(BaseAppRollbackTest, LogoutRejectsForeignChannelAndWaitsForConfirmedRevocation) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto foreign = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27002));
+  set_legacy_dbapp_channel(database.get());
+  auto* client = retained_client_channel(Address("127.0.0.1", 27001));
+  ASSERT_NE(client, nullptr);
+  auto* proxy = prepare_auth_proxy();
+  const auto entity_id = proxy->EntityId();
+  authenticate(*client, proxy->GetSessionKey(), true, true);
+  answer_session(*database, {});
+  auto active = active_session(*proxy);
+  answer_session(*database, active);
+  auto issued = apply_latest(*database, active);
+  answer_session(*database, issued);
+  const auto before = database->send_count();
+  logout(*foreign, entity_id, 91);
+  EXPECT_EQ(database->send_count(), before);
+  auto rejected = DecodeSentMessages<baseapp::ClientLogoutResult>(*foreign);
+  ASSERT_EQ(rejected.size(), 1u);
+  EXPECT_EQ(rejected.front().status, ErrorCode::kPermissionDenied);
+  EXPECT_TRUE(proxy->HasClient());
+  logout(*client, entity_id, 92);
+  EXPECT_TRUE(session_frozen(entity_id));
+  EXPECT_TRUE(proxy->HasClient());
+  answer_session(*database, issued);
+  auto released = apply_latest(*database, issued);
+  EXPECT_EQ(released.phase, AccountSessionPhase::kOffline);
+  EXPECT_EQ(released.recovery, AccountRecoveryGrant{});
+  answer_session(*database, released);
+  EXPECT_EQ(session_pending_count(), 0u);
+  EXPECT_FALSE(proxy->HasClient());
+}
+
+TEST_F(BaseAppRollbackTest, CrashRecoveryRejectsTemporaryEntitiesBeforeCheckout) {
+  prepare_crash_recovery();
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  set_legacy_dbapp_channel(database.get());
+  AccountSession old;
+  old.version = 3;
+  old.phase = AccountSessionPhase::kActive;
+  old.owner = {Address("127.0.0.1", 25002), 999, 222};
+  old.recovery = {{}, 0, 7, 601000};
+  old.recovery.credential_hash[0] = std::byte{1};
+  auto request = resume_request(old);
+  retire_base_peer(old.owner.base_addr, 222);
+  auto result = std::make_shared<std::optional<Result<login::PrepareResumeResult>>>();
+  prepare_resume(request, result);
+  answer_session(*database, old);
+  ASSERT_TRUE(result->has_value());
+  EXPECT_FALSE(**result);
+  EXPECT_TRUE(DecodeSentMessages<dbapp::CheckoutEntity>(*database).empty());
+}
+
+TEST_F(BaseAppRollbackTest, PersistedRecoveryIdentityChangesOnlyAfterConfirmedGrant) {
+  for (const bool fail : {false, true}) {
+    InterfaceTable table;
+    auto database =
+        make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+    auto client = make_intrusive<CapturingChannel>(dispatcher_, table,
+                                                   Address("127.0.0.1", fail ? 27002 : 27001));
+    set_legacy_dbapp_channel(database.get());
+    auto* proxy = prepare_auth_proxy(fail ? 43 : 42);
+    const auto entity_id = proxy->EntityId();
+    authenticate(*client, proxy->GetSessionKey(), true, true);
+    answer_session(*database, {});
+    auto active = active_session(*proxy);
+    answer_session(*database, active);
+    auto issued = apply_latest(*database, active);
+    answer_session(*database, issued);
+    const auto old_dbid = proxy->Dbid();
+    refresh_recovery_after_save(entity_id, fail ? 85 : 84);
+    EXPECT_EQ(recovery_target(entity_id), old_dbid);
+    auto requests = DecodeSentMessages<dbapp::AccountSessionRequest>(*database);
+    ASSERT_TRUE(requests.back().operation);
+    EXPECT_EQ(requests.back().operation->action, AccountSessionAction::kIssueRecovery);
+    EXPECT_EQ(requests.back().operation->recovery.entity_dbid, proxy->Dbid());
+    if (fail) {
+      answer_session(*database, issued, ErrorCode::kCommitUnknown);
+      EXPECT_EQ(recovery_target(entity_id), old_dbid);
+    } else {
+      auto refreshed = apply_latest(*database, issued);
+      answer_session(*database, refreshed);
+      EXPECT_EQ(recovery_target(entity_id), proxy->Dbid());
+      const auto sent = database->send_count();
+      refresh_recovery_after_save(entity_id, proxy->Dbid());
+      EXPECT_EQ(database->send_count(), sent);
+    }
+  }
+}
+
+TEST_F(BaseAppRollbackTest, UnknownRecoveryGrantCommitCannotExposeCredentialsOrBind) {
+  InterfaceTable table;
+  auto database = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 24002));
+  auto client = make_intrusive<CapturingChannel>(dispatcher_, table, Address("127.0.0.1", 27001));
+  set_legacy_dbapp_channel(database.get());
+  auto* proxy = prepare_auth_proxy();
+  ASSERT_NE(proxy, nullptr);
+  authenticate(*client, proxy->GetSessionKey(), true, true);
+  answer_session(*database, {});
+  auto active = active_session(*proxy);
+  answer_session(*database, active);
+  answer_session(*database, active, ErrorCode::kCommitUnknown);
+  EXPECT_FALSE(proxy->HasClient());
+  EXPECT_TRUE(session_frozen(proxy->EntityId()));
+  const auto replies = DecodeSentMessages<baseapp::AuthenticateResult>(*client);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_FALSE(replies.back().success);
+  EXPECT_FALSE(replies.back().recovery.IsPresent());
 }
 
 TEST_F(BaseAppRollbackTest, AuthenticationWaitsForConfirmedSessionGrant) {
@@ -3840,7 +4209,8 @@ class DBAppRollbackTest : public ::testing::Test {
 
   void drain_authentication_tasks() {
     dispatcher_.SetMaxPollWait(Milliseconds(1));
-    const auto deadline = Clock::now() + Seconds(3);
+    // Argon2 completion is the contract; VM scheduling is not a three-second latency guarantee.
+    const auto deadline = Clock::now() + Seconds(30);
     while (app_.authentication_tasks_ && app_.authentication_tasks_->InFlightCount() != 0 &&
            Clock::now() < deadline)
       dispatcher_.ProcessOnce();

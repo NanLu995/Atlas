@@ -336,6 +336,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             working_directory=repo_root, log_directory=log_dir,
             arguments=["--type", "loginapp", "--name", "loginapp",
                        "--machined", machined_address,
+                       "--internal-port", str(port_base + 14),
                        "--external-port", str(loginapp_port),
                        "--auto-create-accounts", "true",
                        # Effectively-off; the prod 5/min would rate-limit

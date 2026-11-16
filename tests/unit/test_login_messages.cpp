@@ -29,6 +29,53 @@ TEST(LoginMessages, LoginRequest_RoundTrip) {
   EXPECT_EQ(out.password_hash, msg.password_hash);
 }
 
+TEST(LoginMessages, RecoveryRequestsRejectMissingCredentialsTruncationAndTrailingBytes) {
+  ResumeRequest request;
+  request.credential = RecoveryCredential{42, 7, {}, 601000};
+  request.credential.value[0] = std::byte{1};
+  auto decoded = round_trip(request);
+  EXPECT_EQ(decoded.credential, request.credential);
+  BinaryWriter writer;
+  request.Serialize(writer);
+  for (size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader reader(writer.Data().first(length));
+    EXPECT_FALSE(ResumeRequest::Deserialize(reader));
+  }
+  writer.Write(uint8_t{0});
+  BinaryReader trailing(writer.Data());
+  EXPECT_FALSE(ResumeRequest::Deserialize(trailing));
+  request.credential = {};
+  BinaryWriter empty;
+  request.Serialize(empty);
+  BinaryReader reader(empty.Data());
+  EXPECT_FALSE(ResumeRequest::Deserialize(reader));
+}
+
+TEST(LoginMessages, PrepareResumeRequiresIdentityProofAndFreshSessionKey) {
+  PrepareResume request;
+  request.request_id = (uint64_t{1} << 40) + 9;
+  request.requester_instance = 111;
+  request.account_dbid = 42;
+  request.account_type_id = 7;
+  request.proof[0] = std::byte{1};
+  request.session_key = *SessionKey::Generate();
+  const auto decoded = round_trip(request);
+  EXPECT_EQ(decoded.request_id, request.request_id);
+  EXPECT_EQ(decoded.proof, request.proof);
+  EXPECT_EQ(decoded.session_key, request.session_key);
+  BinaryWriter writer;
+  request.Serialize(writer);
+  for (size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader reader(writer.Data().first(length));
+    EXPECT_FALSE(PrepareResume::Deserialize(reader));
+  }
+  request.proof = {};
+  BinaryWriter empty;
+  request.Serialize(empty);
+  BinaryReader reader(empty.Data());
+  EXPECT_FALSE(PrepareResume::Deserialize(reader));
+}
+
 TEST(LoginMessages, InvalidCredentialsAreRejectedAtBothLoginBoundaries) {
   const std::pair<std::string, std::string> cases[] = {{"", "credential"},
                                                        {"account", ""},

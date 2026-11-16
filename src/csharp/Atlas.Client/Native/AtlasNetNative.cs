@@ -6,7 +6,7 @@ namespace Atlas.Client.Native;
 // netstandard2.1 + DllImport so Unity Mono / IL2CPP shares this source.
 public static unsafe class AtlasNetNative
 {
-    public const uint AbiVersion = 0x03010000u;
+    public const uint AbiVersion = 0x03020000u;
 
 #if UNITY_IOS && !UNITY_EDITOR
     private const string LibName = "__Internal";
@@ -61,6 +61,42 @@ public static unsafe class AtlasNetNative
 
     [DllImport(LibName)]
     public static extern int AtlasNetAuthenticate(IntPtr ctx, IntPtr callback, IntPtr userData);
+
+    [DllImport(LibName)]
+    public static extern int AtlasNetGetRecoveryCredential(IntPtr ctx, AtlasRecoveryCredential* credential);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void LogoutResultDelegate(IntPtr userData, byte success, IntPtr errorUtf8);
+
+    [DllImport(LibName)]
+    public static extern int AtlasNetLogout(IntPtr ctx, IntPtr callback, IntPtr userData);
+
+    [DllImport(LibName)]
+    public static extern int AtlasNetResume(IntPtr ctx,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string host, ushort port,
+        AtlasRecoveryCredential* credential, IntPtr callback, IntPtr userData);
+
+    public static int Resume(IntPtr ctx, string host, ushort port,
+        SessionRecoveryCredential credential, IntPtr callback, IntPtr userData)
+    {
+        AtlasRecoveryCredential native = default;
+        native.AccountDbId = credential.AccountDbId;
+        native.AccountTypeId = credential.AccountTypeId;
+        native.ExpiresAtMs = credential.ExpiresAtMs;
+        credential.Value.Span.CopyTo(new Span<byte>(native.Value, 32));
+        return AtlasNetResume(ctx, host, port, &native, callback, userData);
+    }
+
+    public static SessionRecoveryCredential? GetRecoveryCredential(IntPtr ctx)
+    {
+        AtlasRecoveryCredential credential = default;
+        var result = AtlasNetGetRecoveryCredential(ctx, &credential);
+        if (result == AtlasNetReturnCode.ErrNoconn) return null;
+        if (result != AtlasNetReturnCode.Ok)
+            throw new InvalidOperationException($"AtlasNetGetRecoveryCredential failed: {result}");
+        return new SessionRecoveryCredential(credential.AccountDbId, credential.AccountTypeId,
+            new ReadOnlySpan<byte>(credential.Value, 32), credential.ExpiresAtMs);
+    }
 
     [DllImport(LibName)]
     public static extern int AtlasNetSetEntityDefDigest(IntPtr ctx, byte* data, int len);

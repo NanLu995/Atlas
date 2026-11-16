@@ -8,6 +8,30 @@
 
 namespace atlas {
 
+inline constexpr int64_t kSessionRecoveryLifetimeMs = 10 * 60 * 1000;
+
+inline void WriteRecoveryGrant(BinaryWriter& writer, const AccountRecoveryGrant& grant) {
+  writer.WriteBytes(grant.credential_hash);
+  writer.Write(grant.entity_dbid);
+  writer.Write(grant.entity_type_id);
+  writer.Write(grant.expires_at_ms);
+}
+
+[[nodiscard]] inline auto ReadRecoveryGrant(BinaryReader& reader) -> Result<AccountRecoveryGrant> {
+  auto hash = reader.ReadBytes(32);
+  auto dbid = reader.Read<DatabaseID>();
+  auto type = reader.Read<uint16_t>();
+  auto expires = reader.Read<int64_t>();
+  if (!hash || !dbid || !type || !expires)
+    return Error{ErrorCode::kInvalidArgument, "truncated recovery grant"};
+  AccountRecoveryGrant grant;
+  std::ranges::copy(*hash, grant.credential_hash.begin());
+  grant.entity_dbid = *dbid;
+  grant.entity_type_id = *type;
+  grant.expires_at_ms = *expires;
+  return grant;
+}
+
 [[nodiscard]] inline auto IsValidSessionOwner(const AccountSessionOwner& owner) -> bool {
   return owner.base_addr.Ip() != 0 && owner.base_addr.Port() != 0 &&
          owner.entity_id != kInvalidEntityID && owner.process_instance != 0 &&
@@ -36,6 +60,13 @@ inline void WriteSessionOwner(BinaryWriter& writer, const AccountSessionOwner& o
 }
 
 [[nodiscard]] inline auto ValidateAccountSession(const AccountSession& session) -> Result<void> {
+  if (HasSessionValue(session.recovery.credential_hash)) {
+    if (session.version == 0 || session.recovery.entity_dbid < kInvalidDBID ||
+        session.recovery.entity_type_id == 0 || session.recovery.expires_at_ms <= 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid recovery grant"};
+  } else if (session.recovery != AccountRecoveryGrant{}) {
+    return Error{ErrorCode::kInvalidArgument, "recovery grant without credential"};
+  }
   if (session.version > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
       session.phase > AccountSessionPhase::kAwaitingClient)
     return Error{ErrorCode::kInvalidArgument, "invalid account session version or phase"};
@@ -58,13 +89,14 @@ inline void WriteSessionOwner(BinaryWriter& writer, const AccountSessionOwner& o
 }
 
 inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& session) {
-  writer.Write(uint8_t{1});
+  writer.Write(uint8_t{2});
   writer.Write(session.version);
   writer.Write(static_cast<uint8_t>(session.phase));
   WriteSessionOwner(writer, session.owner);
   WriteSessionOwner(writer, session.target);
   writer.WriteBytes(session.handoff_id);
   writer.WriteBytes(session.credential_hash);
+  WriteRecoveryGrant(writer, session.recovery);
 }
 
 [[nodiscard]] inline auto ReadAccountSession(BinaryReader& reader) -> Result<AccountSession> {
@@ -75,7 +107,9 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
   auto target = ReadSessionOwner(reader);
   auto handoff = reader.ReadBytes(16);
   auto hash = reader.ReadBytes(32);
-  if (!format || *format != 1 || !version || !phase || !owner || !target || !handoff || !hash)
+  auto recovery = ReadRecoveryGrant(reader);
+  if (!format || *format != 2 || !version || !phase || !owner || !target || !handoff || !hash ||
+      !recovery)
     return Error{ErrorCode::kInvalidArgument, "invalid or truncated account session"};
   AccountSession session;
   session.version = *version;
@@ -84,6 +118,7 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
   session.target = *target;
   std::ranges::copy(*handoff, session.handoff_id.begin());
   std::ranges::copy(*hash, session.credential_hash.begin());
+  session.recovery = *recovery;
   if (auto valid = ValidateAccountSession(session); !valid) return valid.Error();
   return session;
 }
@@ -93,12 +128,14 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
   if (op.expected_version >= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
     return Error{ErrorCode::kOutOfRange, "account session ownership version exhausted"};
   if (!HasSessionValue(op.id) || op.account_dbid <= kInvalidDBID || op.account_type_id == 0 ||
-      !IsValidSessionOwner(op.actor) || op.action > AccountSessionAction::kMoveLocal)
+      !IsValidSessionOwner(op.actor) || op.action > AccountSessionAction::kClaimRecovery)
     return Error{ErrorCode::kInvalidArgument, "invalid account session operation"};
-  if (op.action == AccountSessionAction::kClaim) {
+  if (op.action == AccountSessionAction::kClaim ||
+      op.action == AccountSessionAction::kClaimRecovery) {
     if (!op.claim_checkout || op.claim_checkout->ownership_version == 0 ||
         op.claim_checkout->base_addr != op.actor.base_addr ||
-        (op.claim_checkout->entity_id != 0 && op.claim_checkout->entity_id != op.actor.entity_id) ||
+        (op.action == AccountSessionAction::kClaim && op.claim_checkout->entity_id != 0 &&
+         op.claim_checkout->entity_id != op.actor.entity_id) ||
         op.claim_checkout->process_instance != op.actor.process_instance)
       return Error{ErrorCode::kPermissionDenied, "session claim requires account checkout"};
   } else if (op.claim_checkout) {
@@ -112,12 +149,35 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
       (!IsValidSessionOwner(op.target) || op.target.base_addr != op.actor.base_addr ||
        op.target.process_instance != op.actor.process_instance || op.target == op.actor))
     return Error{ErrorCode::kInvalidArgument, "local session move cannot change process"};
+  if (op.action == AccountSessionAction::kIssueRecovery ||
+      op.action == AccountSessionAction::kConsumeRecovery ||
+      op.action == AccountSessionAction::kClaimRecovery) {
+    if (!HasSessionValue(op.recovery.credential_hash) || op.recovery.entity_dbid < kInvalidDBID ||
+        op.recovery.entity_type_id == 0 || op.recovery.expires_at_ms != 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid recovery issuance"};
+  } else if (op.recovery != AccountRecoveryGrant{}) {
+    return Error{ErrorCode::kInvalidArgument, "unexpected recovery grant"};
+  }
+  if ((op.action == AccountSessionAction::kConsumeRecovery ||
+       op.action == AccountSessionAction::kClaimRecovery) != HasSessionValue(op.recovery_proof))
+    return Error{ErrorCode::kInvalidArgument, "invalid recovery proof"};
+  if (op.action == AccountSessionAction::kClaimRecovery) {
+    if (op.recovery.entity_dbid <= kInvalidDBID || !op.recovery_checkout ||
+        op.recovery_checkout->ownership_version == 0 ||
+        op.recovery_checkout->base_addr != op.actor.base_addr ||
+        (op.recovery_checkout->entity_id != 0 &&
+         op.recovery_checkout->entity_id != op.actor.entity_id) ||
+        op.recovery_checkout->process_instance != op.actor.process_instance)
+      return Error{ErrorCode::kPermissionDenied, "recovery requires persistent target checkout"};
+  } else if (op.recovery_checkout) {
+    return Error{ErrorCode::kInvalidArgument, "unexpected recovery checkout"};
+  }
   return {};
 }
 
 [[nodiscard]] inline auto ApplySessionOperation(const AccountSession& current,
-                                                const AccountSessionOperation& op)
-    -> Result<AccountSession> {
+                                                const AccountSessionOperation& op,
+                                                int64_t now_ms = 0) -> Result<AccountSession> {
   if (auto valid = ValidateSessionOperation(op); !valid) return valid.Error();
   if (auto valid = ValidateAccountSession(current); !valid) return valid.Error();
   if (current.version != op.expected_version)
@@ -132,6 +192,7 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
     case AccountSessionAction::kClaim:
       if (current.phase != AccountSessionPhase::kOffline) return conflict();
       next.owner = op.actor;
+      next.recovery = {};
       next.phase = AccountSessionPhase::kActive;
       break;
     case AccountSessionAction::kPrepare:
@@ -159,6 +220,7 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
         return conflict();
       next.phase = AccountSessionPhase::kActive;
       next.owner = current.target;
+      next.recovery = {};
       next.target = {};
       next.credential_hash = {};
       break;
@@ -178,12 +240,66 @@ inline void WriteAccountSession(BinaryWriter& writer, const AccountSession& sess
     case AccountSessionAction::kMoveLocal:
       if (!owner || current.phase != AccountSessionPhase::kActive) return conflict();
       next.owner = op.target;
+      next.recovery = {};
       next.handoff_id = {};
+      break;
+    case AccountSessionAction::kIssueRecovery:
+    case AccountSessionAction::kConsumeRecovery:
+    case AccountSessionAction::kClaimRecovery:
+      if ((!owner && op.action != AccountSessionAction::kClaimRecovery) ||
+          current.phase != AccountSessionPhase::kActive)
+        return conflict();
+      if (op.action != AccountSessionAction::kIssueRecovery &&
+          (now_ms >= current.recovery.expires_at_ms ||
+           !Sha256DigestEquals(current.recovery.credential_hash, op.recovery_proof) ||
+           current.recovery.entity_dbid != op.recovery.entity_dbid ||
+           current.recovery.entity_type_id != op.recovery.entity_type_id))
+        return Error{ErrorCode::kPermissionDenied, "recovery credential invalid or expired"};
+      if (Sha256DigestEquals(current.recovery.credential_hash, op.recovery.credential_hash))
+        return Error{ErrorCode::kInvalidArgument, "recovery credential must change"};
+      if (now_ms <= 0 || now_ms > std::numeric_limits<int64_t>::max() - kSessionRecoveryLifetimeMs)
+        return Error{ErrorCode::kOutOfRange, "recovery expiry unavailable"};
+      next.recovery = op.recovery;
+      next.recovery.expires_at_ms = now_ms + kSessionRecoveryLifetimeMs;
+      if (op.action == AccountSessionAction::kClaimRecovery) next.owner = op.actor;
+      break;
+    case AccountSessionAction::kRevokeRecovery:
+      if (!owner || current.phase == AccountSessionPhase::kOffline) return conflict();
+      next.recovery = {};
       break;
   }
   next.version = current.version + 1;
   if (auto valid = ValidateAccountSession(next); !valid) return valid.Error();
   return next;
+}
+
+inline void WriteSessionCheckout(BinaryWriter& writer, const std::optional<CheckoutInfo>& proof) {
+  writer.Write(static_cast<uint8_t>(proof.has_value()));
+  if (!proof) return;
+  writer.Write(proof->base_addr.Ip());
+  writer.Write(proof->base_addr.Port());
+  writer.Write(proof->app_id);
+  writer.Write(proof->entity_id);
+  writer.Write(proof->ownership_version);
+  writer.Write(proof->process_instance);
+}
+
+[[nodiscard]] inline auto ReadSessionCheckout(BinaryReader& reader)
+    -> Result<std::optional<CheckoutInfo>> {
+  auto present = reader.Read<uint8_t>();
+  if (!present || *present > 1)
+    return Error{ErrorCode::kInvalidArgument, "invalid account session checkout flag"};
+  if (*present == 0) return std::optional<CheckoutInfo>{};
+  auto ip = reader.Read<uint32_t>();
+  auto port = reader.Read<uint16_t>();
+  auto app = reader.Read<uint32_t>();
+  auto entity = reader.Read<uint32_t>();
+  auto ownership = reader.Read<uint64_t>();
+  auto instance = reader.Read<uint64_t>();
+  if (!ip || !port || !app || !entity || !ownership || !instance)
+    return Error{ErrorCode::kInvalidArgument, "truncated account session checkout proof"};
+  return std::optional<CheckoutInfo>{
+      CheckoutInfo{Address(*ip, *port), *app, *entity, *ownership, *instance}};
 }
 
 inline void WriteSessionOperation(BinaryWriter& writer, const AccountSessionOperation& op) {
@@ -196,16 +312,10 @@ inline void WriteSessionOperation(BinaryWriter& writer, const AccountSessionOper
   WriteSessionOwner(writer, op.target);
   writer.WriteBytes(op.handoff_id);
   writer.WriteBytes(op.credential_hash);
-  writer.Write(static_cast<uint8_t>(op.claim_checkout.has_value()));
-  if (op.claim_checkout) {
-    const auto& checkout = *op.claim_checkout;
-    writer.Write(checkout.base_addr.Ip());
-    writer.Write(checkout.base_addr.Port());
-    writer.Write(checkout.app_id);
-    writer.Write(checkout.entity_id);
-    writer.Write(checkout.ownership_version);
-    writer.Write(checkout.process_instance);
-  }
+  WriteSessionCheckout(writer, op.claim_checkout);
+  WriteRecoveryGrant(writer, op.recovery);
+  writer.WriteBytes(op.recovery_proof);
+  WriteSessionCheckout(writer, op.recovery_checkout);
 }
 
 [[nodiscard]] inline auto ReadSessionOperation(BinaryReader& reader)
@@ -219,9 +329,9 @@ inline void WriteSessionOperation(BinaryWriter& writer, const AccountSessionOper
   auto target = ReadSessionOwner(reader);
   auto handoff = reader.ReadBytes(16);
   auto credential = reader.ReadBytes(32);
-  auto has_checkout = reader.Read<uint8_t>();
+  auto checkout = ReadSessionCheckout(reader);
   if (!id || !dbid || !type || !version || !action || !actor || !target || !handoff ||
-      !credential || !has_checkout || *has_checkout > 1)
+      !credential || !checkout)
     return Error{ErrorCode::kInvalidArgument, "truncated account session operation"};
   AccountSessionOperation op;
   std::ranges::copy(*id, op.id.begin());
@@ -233,17 +343,16 @@ inline void WriteSessionOperation(BinaryWriter& writer, const AccountSessionOper
   op.target = *target;
   std::ranges::copy(*handoff, op.handoff_id.begin());
   std::ranges::copy(*credential, op.credential_hash.begin());
-  if (*has_checkout != 0) {
-    auto ip = reader.Read<uint32_t>();
-    auto port = reader.Read<uint16_t>();
-    auto app = reader.Read<uint32_t>();
-    auto entity = reader.Read<uint32_t>();
-    auto ownership = reader.Read<uint64_t>();
-    auto instance = reader.Read<uint64_t>();
-    if (!ip || !port || !app || !entity || !ownership || !instance)
-      return Error{ErrorCode::kInvalidArgument, "truncated account session checkout proof"};
-    op.claim_checkout = CheckoutInfo{Address(*ip, *port), *app, *entity, *ownership, *instance};
-  }
+  op.claim_checkout = *checkout;
+  auto recovery = ReadRecoveryGrant(reader);
+  if (!recovery) return recovery.Error();
+  op.recovery = *recovery;
+  auto proof = reader.ReadBytes(32);
+  if (!proof) return proof.Error();
+  std::ranges::copy(*proof, op.recovery_proof.begin());
+  auto recovery_checkout = ReadSessionCheckout(reader);
+  if (!recovery_checkout) return recovery_checkout.Error();
+  op.recovery_checkout = *recovery_checkout;
   return op;
 }
 

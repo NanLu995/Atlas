@@ -9,6 +9,7 @@
 #include "network/channel.h"
 #include "network/machined_types.h"
 #include "network/reliable_udp.h"
+#include "platform/sha256.h"
 #include "server/db_shard_routing.h"
 #include "server/watcher.h"
 
@@ -69,6 +70,10 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
       [this](const Address& src, Channel* ch, const login::LoginRequest& msg) {
         OnLoginRequest(src, ch, msg);
       });
+  (void)client_table.RegisterTypedHandler<login::ResumeRequest>(
+      [this](const Address& src, Channel* channel, const login::ResumeRequest& request) {
+        OnResumeRequest(src, channel, request);
+      });
 
   auto& table = Network().InterfaceTable();
   (void)table.RegisterTypedHandler<login::AuthLoginResult>(
@@ -77,6 +82,8 @@ auto LoginApp::Init(int argc, char* argv[]) -> bool {
       [](const Address&, Channel*, const login::AllocateBaseAppResult&) {});
   (void)table.RegisterTypedHandler<login::PrepareLoginResult>(
       [](const Address&, Channel*, const login::PrepareLoginResult&) {});
+  (void)table.RegisterTypedHandler<login::PrepareResumeResult>(
+      [](const Address&, Channel*, const login::PrepareResumeResult&) {});
   (void)table.RegisterTypedHandler<dbappmgr::ShardTableResponse>(
       [this](const Address&, Channel*, const dbappmgr::ShardTableResponse& msg) {
         OnShardTableResponse(msg);
@@ -189,7 +196,7 @@ void LoginApp::BeginShutdown() {
 
 auto LoginApp::PendingShutdownOperations() const -> std::size_t {
   return ManagerApp::PendingShutdownOperations() + external_network_.PendingSendCount() +
-         rpc_registry_.PendingCount() + pending_by_username_.size();
+         rpc_registry_.PendingCount() + pending_by_username_.size() + pending_recoveries_.size();
 }
 
 void LoginApp::Fini() {
@@ -207,7 +214,8 @@ void LoginApp::FlushTickDirtyChannels() {
 }
 
 auto LoginApp::AdmissionBlockReason() const -> std::string_view {
-  if (pending_by_username_.size() >= kMaxPendingLogins) return "login_queue_full";
+  if (pending_by_username_.size() + pending_recoveries_.size() >= kMaxPendingLogins)
+    return "login_queue_full";
   if (dbapp_channel_ == nullptr && dbapp_shard_table_.empty()) return "no_database_route";
   if (!baseappmgr_channel_ || baseappmgr_channel_->IsCondemned()) return "no_baseappmgr";
   if (rpc_registry_.PendingCount() >= PendingRpcRegistry::kMaxPendingRpcs) return "rpc_full";
@@ -237,7 +245,7 @@ void LoginApp::RegisterWatchers() {
   wr.Add<uint64_t>("loginapp/abandoned_login_total",
                    std::function<uint64_t()>([this] { return abandoned_login_total_; }));
   wr.Add<int>("loginapp/pending_logins", std::function<int()>([this] {
-                return static_cast<int>(pending_by_username_.size());
+                return static_cast<int>(pending_by_username_.size() + pending_recoveries_.size());
               }));
   wr.Add<bool>("loginapp/dbapp_connected",
                std::function<bool()>([this] { return dbapp_channel_ != nullptr; }));
@@ -416,7 +424,7 @@ void LoginApp::OnLoginRequest(const Address& src, Channel* ch, const login::Logi
     return;
   }
 
-  if (pending_by_username_.size() >= kMaxPendingLogins) {
+  if (pending_by_username_.size() + pending_recoveries_.size() >= kMaxPendingLogins) {
     ++login_busy_total_;
     ATLAS_LOG_DEBUG("LoginApp: admission control, pending={} from {}:{}",
                     pending_by_username_.size(), src.Ip(), src.Port());

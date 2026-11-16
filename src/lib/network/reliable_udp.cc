@@ -239,6 +239,7 @@ auto ReliableUdpChannel::DoSend(std::span<const std::byte> data) -> Result<size_
 }
 
 void ReliableUdpChannel::OnCondemned() {
+  SendAck();
   CancelDelayedAck();
   if (inbound_impairment_timer_.IsValid()) {
     dispatcher_.CancelTimer(inbound_impairment_timer_);
@@ -848,6 +849,7 @@ void ReliableUdpChannel::SendAck() {
 }
 
 void ReliableUdpChannel::ScheduleDelayedAck() {
+  if (state_ == ChannelState::kCondemned) return;
   ack_pending_ = true;
   if (delayed_ack_timer_.IsValid()) {
     return;

@@ -159,8 +159,12 @@ auto BaseApp::MoveRemoteClientSession(EntityID source, AccountSessionOwner targe
   expected.target = {};
   expected.credential_hash = {};
   ++expected.version;
+  auto ownership_confirmation = *confirmed;
+  ownership_confirmation.version = expected.version;
+  ownership_confirmation.recovery = expected.recovery;
   const auto current = client_sessions_.find(source);
-  if (*confirmed != expected || current == client_sessions_.end() || current->second != session ||
+  if (confirmed->version < expected.version || ownership_confirmation != expected ||
+      current == client_sessions_.end() || current->second != session ||
       session->wait_cancel.Token().IsCancelled())
     co_return Error{ErrorCode::kCommitUnknown, "client handoff final confirmation mismatch"};
   (void)entity_mgr_.ClearSessionKey(source);

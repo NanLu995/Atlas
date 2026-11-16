@@ -15,12 +15,19 @@ namespace Atlas.Client.Unity
         private GCHandle _selfHandle;
         private LoginSource? _loginInflight;
         private AuthSource? _authInflight;
+        private LogoutSource? _logoutInflight;
         private bool _disposed;
 
         public LoginClient()
         {
             _ctx = AtlasNetNative.Create();
             _selfHandle = GCHandle.Alloc(this, GCHandleType.Normal);
+        }
+
+        public SessionRecoveryCredential? GetRecoveryCredential()
+        {
+            ThrowIfDisposed();
+            return AtlasNetNative.GetRecoveryCredential(_ctx);
         }
 
         public int Poll()
@@ -36,6 +43,18 @@ namespace Atlas.Client.Unity
 
         public AtlasTask<LoginResult> LoginAsync(string loginAppHost, ushort loginAppPort,
             string username, string passwordHash, AtlasCancellationToken ct = default)
+            => BeginLogin(loginAppHost, loginAppPort, username, passwordHash, null, ct);
+
+        public AtlasTask<LoginResult> ResumeAsync(string loginAppHost, ushort loginAppPort,
+            SessionRecoveryCredential credential, AtlasCancellationToken ct = default)
+        {
+            if (credential is null) throw new ArgumentNullException(nameof(credential));
+            return BeginLogin(loginAppHost, loginAppPort, "", "", credential, ct);
+        }
+
+        private AtlasTask<LoginResult> BeginLogin(string loginAppHost, ushort loginAppPort,
+            string username, string passwordHash, SessionRecoveryCredential? recovery,
+            AtlasCancellationToken ct)
         {
             ThrowIfDisposed();
             if (_loginInflight != null)
@@ -59,13 +78,16 @@ namespace Atlas.Client.Unity
                     static s => ((LoginSource)s).OnCancellationRequested(), src));
             }
 
-            var rc = AtlasNetNative.AtlasNetLogin(_ctx, loginAppHost, loginAppPort, username,
-                passwordHash, s_loginCallbackPtr, GCHandle.ToIntPtr(_selfHandle));
+            var rc = recovery is null
+                ? AtlasNetNative.AtlasNetLogin(_ctx, loginAppHost, loginAppPort, username,
+                    passwordHash, s_loginCallbackPtr, GCHandle.ToIntPtr(_selfHandle))
+                : AtlasNetNative.Resume(_ctx, loginAppHost, loginAppPort, recovery,
+                    s_loginCallbackPtr, GCHandle.ToIntPtr(_selfHandle));
             if (rc != AtlasNetReturnCode.Ok)
             {
                 _loginInflight = null;
-                return AtlasTask<LoginResult>.FromException(
-                    NativeRcException("AtlasNetLogin", rc));
+                src.SetException(NativeRcException(recovery is null ? "AtlasNetLogin" : "AtlasNetResume", rc));
+                return src.Task;
             }
             return src.Task;
         }
@@ -105,6 +127,23 @@ namespace Atlas.Client.Unity
             return src.Task;
         }
 
+        public AtlasTask<bool> LogoutAsync()
+        {
+            ThrowIfDisposed();
+            if (_logoutInflight is not null)
+                return AtlasTask<bool>.FromException(new InvalidOperationException("Logout already pending"));
+            var source = new LogoutSource();
+            _logoutInflight = source;
+            var result = AtlasNetNative.AtlasNetLogout(_ctx, s_logoutCallbackPtr,
+                GCHandle.ToIntPtr(_selfHandle));
+            if (result != AtlasNetReturnCode.Ok)
+            {
+                _logoutInflight = null;
+                source.SetException(NativeRcException("AtlasNetLogout", result));
+            }
+            return source.Task;
+        }
+
         public void Disconnect(AtlasDisconnectReason reason = AtlasDisconnectReason.User)
         {
             if (_disposed) return;
@@ -125,6 +164,7 @@ namespace Atlas.Client.Unity
             AtlasNetNative.AtlasNetDestroy(_ctx);
             _loginInflight?.OnNativeShutdown(); _loginInflight = null;
             _authInflight?.OnNativeShutdown(); _authInflight = null;
+        _logoutInflight?.SetException(new OperationCanceledException()); _logoutInflight = null;
             if (_selfHandle.IsAllocated) _selfHandle.Free();
         }
 
@@ -197,6 +237,39 @@ namespace Atlas.Client.Unity
             {
                 UnityEngine.Debug.LogException(ex);
             }
+        }
+
+        private static readonly AtlasNetNative.LogoutResultDelegate s_logoutCallback = OnLogoutResult;
+        private static readonly IntPtr s_logoutCallbackPtr =
+            Marshal.GetFunctionPointerForDelegate(s_logoutCallback);
+
+        [MonoPInvokeCallback(typeof(AtlasNetNative.LogoutResultDelegate))]
+        private static void OnLogoutResult(IntPtr userData, byte success, IntPtr errorUtf8)
+        {
+            try
+            {
+                if (userData == IntPtr.Zero) return;
+                var self = GCHandle.FromIntPtr(userData).Target as LoginClient;
+                var source = self?._logoutInflight;
+                if (self is null || source is null) return;
+                self._logoutInflight = null;
+                if (success != 0) source.SetResult();
+                else source.SetException(new InvalidOperationException(ReadUtf8(errorUtf8)));
+            }
+            catch (Exception error) { UnityEngine.Debug.LogException(error); }
+        }
+
+        private sealed class LogoutSource : IAtlasTaskSource<bool>
+        {
+            private AtlasTaskCompletionSourceCore<bool> _core;
+            public AtlasTask<bool> Task => AtlasTask<bool>.FromSource(this, _core.Version);
+            public void SetResult() => _core.TrySetResult(true);
+            public void SetException(Exception error) => _core.TrySetException(error);
+            public short Version => _core.Version;
+            public AtlasTaskStatus GetStatus(short token) => _core.GetStatus(token);
+            public void OnCompleted(Action<object?> callback, object? state, short token)
+                => _core.OnCompleted(callback, state, token);
+            public bool GetResult(short token) => _core.GetResult(token);
         }
 
         private sealed class LoginSource : IAtlasTaskSource<LoginResult>

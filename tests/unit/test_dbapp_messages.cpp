@@ -31,9 +31,90 @@ std::vector<std::byte> make_blob(std::string_view text) {
 
 }  // namespace
 
-// ============================================================================
-// WriteEntity
-// ============================================================================
+TEST(DbappMessages, RecoveryGrantIssuanceHasBoundedExpiryAndOwnerBinding) {
+  AccountSession current;
+  current.version = 1;
+  current.phase = AccountSessionPhase::kActive;
+  current.owner = {Address("127.0.0.1", 30001), 9, 111};
+  AccountSessionOperation op;
+  op.id[0] = std::byte{1};
+  op.account_dbid = 42;
+  op.account_type_id = 7;
+  op.actor = current.owner;
+  op.expected_version = current.version;
+  op.action = AccountSessionAction::kIssueRecovery;
+  op.recovery.credential_hash[0] = std::byte{21};
+  op.recovery.entity_dbid = 42;
+  op.recovery.entity_type_id = 7;
+  auto issued = ApplySessionOperation(current, op, 1000);
+  ASSERT_TRUE(issued.HasValue());
+  EXPECT_EQ(issued->recovery.expires_at_ms, 601000);
+  EXPECT_EQ(issued->owner, current.owner);
+  EXPECT_EQ(issued->version, 2u);
+  BinaryWriter writer;
+  WriteAccountSession(writer, *issued);
+  BinaryReader reader(writer.Data());
+  auto decoded = ReadAccountSession(reader);
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_EQ(*decoded, *issued);
+  EXPECT_EQ(reader.Remaining(), 0u);
+  auto old_format = writer.Detach();
+  old_format[0] = std::byte{1};
+  BinaryReader incompatible(old_format);
+  EXPECT_FALSE(ReadAccountSession(incompatible));
+  AccountSessionRequest request;
+  request.operation = op;
+  auto operation_copy = round_trip(request);
+  ASSERT_TRUE(operation_copy && operation_copy->operation);
+  EXPECT_EQ(operation_copy->operation->recovery, op.recovery);
+  EXPECT_FALSE(ApplySessionOperation(current, op, 0));
+  EXPECT_FALSE(ApplySessionOperation(current, op, INT64_MAX));
+  op.actor.entity_id++;
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+  op.actor = current.owner;
+  op.recovery.expires_at_ms = 999999;
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+  op.recovery.expires_at_ms = 0;
+  op.recovery.credential_hash = {};
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+}
+
+TEST(DbappMessages, RecoveryConsumptionRejectsExpiryReplayAndDifferentStoredIdentity) {
+  AccountSession current;
+  current.version = 3;
+  current.phase = AccountSessionPhase::kActive;
+  current.owner = {Address("127.0.0.1", 30001), 9, 111};
+  current.recovery.credential_hash[0] = std::byte{1};
+  current.recovery.entity_dbid = 42;
+  current.recovery.entity_type_id = 7;
+  current.recovery.expires_at_ms = 5000;
+  AccountSessionOperation op;
+  op.id[0] = std::byte{1};
+  op.account_dbid = 42;
+  op.account_type_id = 7;
+  op.actor = current.owner;
+  op.expected_version = current.version;
+  op.action = AccountSessionAction::kConsumeRecovery;
+  op.recovery = current.recovery;
+  op.recovery.expires_at_ms = 0;
+  op.recovery.credential_hash[0] = std::byte{2};
+  op.recovery_proof = current.recovery.credential_hash;
+  EXPECT_FALSE(ApplySessionOperation(current, op, 5000));
+  auto rotated = ApplySessionOperation(current, op, 4999);
+  ASSERT_TRUE(rotated.HasValue());
+  EXPECT_EQ(rotated->recovery.expires_at_ms, 604999);
+  op.expected_version = rotated->version;
+  EXPECT_FALSE(ApplySessionOperation(*rotated, op, 4999));
+  op.expected_version = current.version;
+  ++op.recovery.entity_dbid;
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+  --op.recovery.entity_dbid;
+  ++op.recovery.entity_type_id;
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+  --op.recovery.entity_type_id;
+  current.recovery = {};
+  EXPECT_FALSE(ApplySessionOperation(current, op, 1000));
+}
 
 TEST(DbappMessages, AccountSessionRequestAndReplyRoundTrip) {
   AccountSessionRequest request;

@@ -207,7 +207,7 @@ void BaseApp::OnAwaitClientHandoff(IntrusivePtr<Channel> channel,
       session->handoff_prepared_version == request.expected.version &&
       session->record.owner == request.expected.target &&
       session->record.handoff_id == request.expected.handoff_id &&
-      session->record.version == request.expected.version + 3) {
+      session->record.version >= request.expected.version + 3) {
     ReplyToHandoff(*channel, request, session->record);
     return;
   }
@@ -297,6 +297,20 @@ auto BaseApp::AuthenticateClientHandoff(IntrusivePtr<Channel> channel,
   if (confirmed && bindable && !channel->IsCondemned() &&
       entity_mgr_.AssignSessionKey(session->owner.entity_id, request.session_key)) {
     session->record = *record;
+    session->supports_recovery = request.supports_recovery;
+    if (request.supports_recovery) {
+      auto issued = co_await IssueClientRecoveryCredential(session);
+      proxy = entity_mgr_.FindProxy(session->owner.entity_id);
+      if (!issued || !IsCurrentIncomingClientHandoff(*incoming) || !target_available() || !proxy) {
+        if (!channel->IsCondemned()) {
+          baseapp::AuthenticateResult reply;
+          reply.error = "recovery_credential_unconfirmed";
+          (void)channel->SendMessage(reply);
+        }
+        incoming->authenticating = false;
+        co_return;
+      }
+    }
     FinishClientAuthenticate(*channel, request);
     if (proxy->HasClient()) {
       RegisterAccountOwner(incoming->request.username, proxy->EntityId());

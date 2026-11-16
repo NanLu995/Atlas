@@ -1,3 +1,6 @@
+#include <chrono>
+#include <format>
+
 #include "db/account_session.h"
 #include "db_sqlite/sqlite_database.h"
 
@@ -74,7 +77,8 @@ void SqliteDatabase::UpdateAccountSession(const AccountSessionOperation& op,
       if (!current) return current.Error();
       return ConfirmSessionReceipt(op, **previous, *current);
     }
-    if (op.action == AccountSessionAction::kClaim) {
+    if (op.action == AccountSessionAction::kClaim ||
+        op.action == AccountSessionAction::kClaimRecovery) {
       auto account = FetchByDbid(op.account_dbid, op.account_type_id);
       if (!account) return account.Error();
       if (!account->found) return Error{ErrorCode::kNotFound, "session account does not exist"};
@@ -89,7 +93,28 @@ void SqliteDatabase::UpdateAccountSession(const AccountSessionOperation& op,
     }
     auto current = ReadAccountSessionImpl(op.account_dbid, op.account_type_id);
     if (!current) return current.Error();
-    auto next = ApplySessionOperation(*current, op);
+    if (op.action == AccountSessionAction::kClaimRecovery) {
+      const auto& old = current->owner;
+      auto retired = Prepare(std::format(
+          "SELECT retired FROM atlas_checkout_processes WHERE base_ip = {} AND base_port = {} "
+          "AND instance = {}",
+          old.base_addr.Ip(), old.base_addr.Port(), old.process_instance));
+      if (!retired) return retired.Error();
+      const auto rc = sqlite3_step(retired->Get());
+      if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return SqliteError("retired session owner lookup failed", rc);
+      if (rc != SQLITE_ROW || sqlite3_column_type(retired->Get(), 0) != SQLITE_INTEGER ||
+          sqlite3_column_int(retired->Get(), 0) != 1)
+        return Error{ErrorCode::kPermissionDenied, "previous session owner retirement unconfirmed"};
+      auto entity = FetchByDbid(current->recovery.entity_dbid, current->recovery.entity_type_id);
+      if (!entity) return entity.Error();
+      if (!entity->found || entity->checked_out_by != op.recovery_checkout)
+        return Error{ErrorCode::kPermissionDenied, "recovery target checkout changed"};
+    }
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    auto next = ApplySessionOperation(*current, op, now_ms);
     if (!next) return next.Error();
     BinaryWriter payload;
     WriteAccountSession(payload, *next);

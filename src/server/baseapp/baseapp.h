@@ -57,6 +57,7 @@ struct Authenticate;
 struct ClientBaseRpc;
 struct ClientCellRpc;
 struct ClientMovementInput;
+struct ClientLogout;
 struct MovementCorrectionReport;
 struct MovementCommandStartFromCell;
 struct MovementCommandEndFromCell;
@@ -67,6 +68,8 @@ namespace login {
 struct PrepareLogin;
 struct PrepareLoginResult;
 struct CancelPrepareLogin;
+struct PrepareResume;
+struct PrepareResumeResult;
 }  // namespace login
 
 namespace baseappmgr {
@@ -286,11 +289,35 @@ class BaseApp : public EntityApp {
     bool revoking{false};
     bool remote_handoff{false};
     bool supports_handoff{false};
+    bool supports_recovery{false};
+    RecoveryCredential recovery_credential;
+    TimePoint recovery_deadline{};
     AccountSessionOwner handoff_source;
     uint64_t handoff_prepared_version{0};
   };
   auto AuthenticateClientSession(IntrusivePtr<Channel> channel, baseapp::Authenticate request,
                                  std::shared_ptr<ClientSession> session) -> FireAndForget;
+  auto IssueClientRecoveryCredential(
+      std::shared_ptr<ClientSession> session,
+      AccountSessionAction action = AccountSessionAction::kIssueRecovery, Sha256Digest proof = {},
+      std::optional<CheckoutInfo> account_checkout = {}) -> Task<Result<void>>;
+  auto OnPrepareResume(IntrusivePtr<Channel> channel, login::PrepareResume request)
+      -> FireAndForget;
+  auto OnClientLogout(IntrusivePtr<Channel> channel, baseapp::ClientLogout request)
+      -> FireAndForget;
+  auto RefreshPersistedRecoveryCredential(EntityID entity_id) -> FireAndForget;
+  auto PrepareSessionRecovery(login::PrepareResume request)
+      -> Task<Result<login::PrepareResumeResult>>;
+  auto RecoverPersistentSession(login::PrepareResume request, AccountSession record)
+      -> Task<Result<login::PrepareResumeResult>>;
+  auto LoadRecoveryEntity(DatabaseID dbid, uint16_t type_id, bool has_client)
+      -> Task<Result<dbapp::CheckoutEntityAck>>;
+  auto StartRecoveryEntityLoad(DatabaseID dbid, uint16_t type_id, bool has_client,
+                               std::function<void(Result<dbapp::CheckoutEntityAck>)> complete)
+      -> EntityID;
+  CancellationSource recovery_cancel_;
+  std::size_t session_recoveries_{0};
+  std::unordered_set<DatabaseID> recovery_accounts_;
   auto ReloginAfterSessionRelease(EntityID entity_id, PendingLogin pending) -> FireAndForget;
   auto ApplyClientSessionOperation(std::shared_ptr<ClientSession> session,
                                    AccountSessionOperation operation, CancellationToken token = {})
@@ -500,6 +527,7 @@ class BaseApp : public EntityApp {
     bool awaiting_ack{false};
     bool outcome_unknown{false};
     bool stalled{false};
+    std::function<void(Result<dbapp::CheckoutEntityAck>)> complete{};
   };
   struct LoadSnapshot {
     uint32_t entity_count{0};

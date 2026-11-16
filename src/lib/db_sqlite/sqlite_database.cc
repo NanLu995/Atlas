@@ -20,7 +20,7 @@ auto UnixTimeMs() -> int64_t {
       .count();
 }
 
-constexpr int kSqliteSchemaVersion = 2;
+constexpr int kSqliteSchemaVersion = 3;
 
 auto ConstraintErrorKind(sqlite3* db) -> atlas::DatabaseErrorKind {
   switch (sqlite3_extended_errcode(db)) {

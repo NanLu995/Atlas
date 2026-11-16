@@ -54,6 +54,24 @@ bool FakeCluster::Start() {
         (void)(*ch_result)->SendMessage(reply);
       });
   if (!reg_login) return false;
+  auto reg_resume = net_loginapp_.InterfaceTable().RegisterTypedHandler<login::ResumeRequest>(
+      [this](const Address&, Channel* channel, const login::ResumeRequest& request) {
+        if (!channel) return;
+        login::LoginResult reply;
+        if (recovery_.IsPresent() && request.credential == recovery_) {
+          auto random = SessionKey::Generate();
+          if (random) {
+            std::memcpy(recovery_.value.data(), random->bytes, 32);
+            reply.status = login::LoginStatus::kSuccess;
+            reply.session_key = expected_session_key_;
+            reply.baseapp_addr = baseapp_addr_;
+          }
+        } else {
+          reply.status = login::LoginStatus::kInvalidCredentials;
+        }
+        (void)channel->SendMessage(reply);
+      });
+  if (!reg_resume) return false;
 
   auto reg_auth = net_baseapp_.InterfaceTable().RegisterTypedHandler<baseapp::Authenticate>(
       [this](const Address& src, Channel*, const baseapp::Authenticate& msg) {
@@ -70,12 +88,22 @@ bool FakeCluster::Start() {
           reply.success = std::memcmp(msg.session_key.bytes, expected_session_key_.bytes, 32) == 0;
           reply.entity_id = 42;
           reply.type_id = 7;
+          if (msg.supports_recovery) reply.recovery = recovery_;
         } else {
           reply.success = false;
         }
         (void)auth_channel_->SendMessage(reply);
       });
   if (!reg_auth) return false;
+  auto reg_logout = net_baseapp_.InterfaceTable().RegisterTypedHandler<baseapp::ClientLogout>(
+      [this](const Address&, Channel* channel, const baseapp::ClientLogout& request) {
+        if (!channel || channel != auth_channel_) return;
+        baseapp::ClientLogoutResult reply;
+        reply.request_id = request.request_id;
+        if (request.entity_id != 42) reply.status = ErrorCode::kPermissionDenied;
+        (void)channel->SendMessage(reply);
+      });
+  if (!reg_logout) return false;
 
   auto reg_rpc = net_baseapp_.InterfaceTable().RegisterTypedHandler<baseapp::ClientBaseRpc>(
       [this](const Address&, Channel*, const baseapp::ClientBaseRpc& msg) {

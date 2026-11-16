@@ -38,9 +38,9 @@ auto CreateDatabase(const DatabaseConfig& config) -> std::unique_ptr<IDatabase> 
   }
 
   using CreateFn = IDatabase* (*)();
-  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV3");
+  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV4");
   if (!fn_result) {
-    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v3 (AtlasCreateDatabaseV3 missing)",
+    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v4 (AtlasCreateDatabaseV4 missing)",
                     lib_path.string());
     return nullptr;
   }

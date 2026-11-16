@@ -4,6 +4,16 @@
 
 #include "platform/sha256.h"
 
+TEST(Sha256Test, DigestComparisonCoversEveryByte) {
+  atlas::Sha256Digest expected{};
+  EXPECT_TRUE(atlas::Sha256DigestEquals(expected, expected));
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    auto changed = expected;
+    changed[index] = std::byte{1};
+    EXPECT_FALSE(atlas::Sha256DigestEquals(expected, changed));
+  }
+}
+
 TEST(Sha256Test, EmptyAndKnownTextMatchStandardDigests) {
   const std::pair<std::string, std::string> cases[] = {
       {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},

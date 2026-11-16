@@ -3,6 +3,15 @@ using System.Runtime.InteropServices;
 
 namespace Atlas.Client.Native;
 
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct AtlasRecoveryCredential
+{
+    public long AccountDbId;
+    public ushort AccountTypeId;
+    public fixed byte Value[32];
+    public long ExpiresAtMs;
+}
+
 public enum AtlasNetState
 {
     Disconnected    = 0,

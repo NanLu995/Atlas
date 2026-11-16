@@ -2,6 +2,7 @@
 #define ATLAS_SERVER_LOGINAPP_LOGINAPP_H_
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -46,6 +47,8 @@ class LoginApp : public ManagerApp {
   friend class LoginRollbackTest;
 
   void OnLoginRequest(const Address& src, Channel* ch, const login::LoginRequest& msg);
+  void OnResumeRequest(const Address& src, Channel* channel, const login::ResumeRequest& request);
+  auto HandleResumeCoro(uint64_t client_channel_id, login::ResumeRequest request) -> FireAndForget;
 
   auto HandleLoginCoro(uint64_t client_channel_id, Address client_addr, login::LoginRequest request)
       -> FireAndForget;
@@ -92,6 +95,7 @@ class LoginApp : public ManagerApp {
   PendingRpcRegistry rpc_registry_;
 
   std::unordered_map<std::string, uint32_t> pending_by_username_;
+  std::map<std::pair<DatabaseID, uint16_t>, uint64_t> pending_recoveries_;
   std::unordered_map<uint64_t, CancellationSource> channel_cancel_sources_;
   uint32_t next_request_id_{1};
 

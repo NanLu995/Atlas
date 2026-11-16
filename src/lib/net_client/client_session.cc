@@ -81,6 +81,7 @@ ClientSession::~ClientSession() {
     Disconnect(ATLAS_DISCONNECT_INTERNAL);
   }
   ClearSessionKey();
+  SecureZero(recovery_credential_.value.data(), recovery_credential_.value.size());
 }
 
 auto ClientSession::Poll() -> int32_t {
@@ -115,10 +116,15 @@ auto ClientSession::Poll() -> int32_t {
       callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_ConnectionLost);
     }
   }
+  if (!pending_disconnect_ && pending_login_start_) {
+    auto start = std::exchange(pending_login_start_, {});
+    start();
+  }
   return 0;
 }
 
 void ClientSession::PrepareForDestroy() {
+  pending_login_start_ = {};
   pending_transport_send_ = {};
   pending_transport_channel_ = 0;
   (void)SetCallbacks(AtlasNetCallbacks{});
@@ -126,6 +132,8 @@ void ClientSession::PrepareForDestroy() {
   login_user_data_ = nullptr;
   auth_callback_ = nullptr;
   auth_user_data_ = nullptr;
+  logout_callback_ = nullptr;
+  logout_user_data_ = nullptr;
   CancelLoginTimeout();
   CancelAuthTimeout();
 }
@@ -146,8 +154,56 @@ auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp
     last_error_ = "DTLS configuration failed; plaintext login is prohibited";
     return ATLAS_NET_ERR_NOCONN;
   }
+  SecureZero(recovery_credential_.value.data(), recovery_credential_.value.size());
+  recovery_credential_ = {};
 
-  Address login_addr(loginapp_host, loginapp_port);
+  login::LoginRequest request;
+  request.username = std::string(username);
+  request.password_hash = std::string(password_hash);
+  request.entity_def_digest = entity_def_digest_;
+  return StartLoginTransport(loginapp_host, loginapp_port, callback, user_data,
+                             [request](Channel* channel) { return channel->SendMessage(request); });
+}
+
+auto ClientSession::StartResume(std::string_view host, uint16_t port,
+                                const AtlasRecoveryCredential& credential,
+                                AtlasLoginResultFn callback, void* user_data) -> int32_t {
+  if (pending_disconnect_ || state_ != ATLAS_NET_STATE_DISCONNECTED) return ATLAS_NET_ERR_BUSY;
+  login::ResumeRequest request;
+  request.credential.account_dbid = credential.account_dbid;
+  request.credential.account_type_id = credential.account_type_id;
+  std::memcpy(request.credential.value.data(), credential.value, 32);
+  request.credential.expires_at_ms = credential.expires_at_ms;
+  request.entity_def_digest = entity_def_digest_;
+  if (host.empty() || port == 0 || !callback || credential.account_dbid <= kInvalidDBID ||
+      credential.account_type_id == 0 || credential.expires_at_ms <= 0 ||
+      !request.credential.IsPresent())
+    return ATLAS_NET_ERR_INVAL;
+  if (dtls_required_ && !dtls_configured_) return ATLAS_NET_ERR_NOCONN;
+  recovery_credential_ = request.credential;
+  return StartLoginTransport(host, port, callback, user_data,
+                             [request](Channel* channel) { return channel->SendMessage(request); });
+}
+
+auto ClientSession::StartLoginTransport(std::string_view host, uint16_t port,
+                                        AtlasLoginResultFn callback, void* user_data,
+                                        std::function<Result<void>(Channel*)> send) -> int32_t {
+  if (polling_) {
+    if (pending_login_start_) return ATLAS_NET_ERR_BUSY;
+    login_callback_ = callback;
+    login_user_data_ = user_data;
+    state_ = ATLAS_NET_STATE_LOGGING_IN;
+    pending_login_start_ = [this, host = std::string(host), port, callback, user_data,
+                            send = std::move(send)]() mutable {
+      if (StartLoginTransport(host, port, callback, user_data, std::move(send)) != ATLAS_NET_OK) {
+        state_ = ATLAS_NET_STATE_DISCONNECTED;
+        FireLoginCallback(ATLAS_LOGIN_INTERNAL_ERROR, {}, 0, last_error_);
+      }
+    };
+    return ATLAS_NET_OK;
+  }
+  if (network_.ChannelCount() == 0) network_.CloseRudpSocket();
+  Address login_addr(host, port);
   auto ch_result = network_.ConnectRudp(login_addr, NetworkInterface::InternetRudpProfile());
   if (!ch_result) {
     last_error_ = std::format("ConnectRudp(loginapp) failed: {}", ch_result.Error().Message());
@@ -157,24 +213,24 @@ auto ClientSession::StartLogin(std::string_view loginapp_host, uint16_t loginapp
   loginapp_channel_ = *ch_result;
   ApplyTransportImpairment(loginapp_channel_);
 
-  auto reg = network_.InterfaceTable().RegisterTypedHandler<::atlas::login::LoginResult>(
-      [this](const Address&, Channel*, const ::atlas::login::LoginResult& msg) {
-        OnLoginResult(msg);
-      });
-  if (!reg) {
-    last_error_ = std::format("Register LoginResult handler failed: {}", reg.Error().Message());
-    CloseLoginAppChannel();
-    return ATLAS_NET_ERR_INVAL;
+  if (!network_.InterfaceTable().Find(login::LoginResult::Descriptor().id)) {
+    auto reg = network_.InterfaceTable().RegisterTypedHandler<::atlas::login::LoginResult>(
+        [this](const Address&, Channel* channel, const ::atlas::login::LoginResult& msg) {
+          if (channel != loginapp_channel_ || !channel || pending_disconnect_) return;
+          OnLoginResult(msg);
+        });
+    if (!reg) {
+      last_error_ = std::format("Register LoginResult handler failed: {}", reg.Error().Message());
+      CloseLoginAppChannel();
+      return ATLAS_NET_ERR_INVAL;
+    }
   }
 
-  ::atlas::login::LoginRequest req;
-  req.username = std::string(username);
-  req.password_hash = std::string(password_hash);
-  req.entity_def_digest = entity_def_digest_;
   auto sent = SendAfterHandshake(
-      loginapp_channel_, [channel = loginapp_channel_, req] { return channel->SendMessage(req); });
+      loginapp_channel_,
+      [channel = loginapp_channel_, send = std::move(send)] { return send(channel); });
   if (!sent) {
-    last_error_ = std::format("Send(LoginRequest) failed: {}", sent.Error().Message());
+    last_error_ = std::format("Send(login request) failed: {}", sent.Error().Message());
     (void)Disconnect(ATLAS_DISCONNECT_USER);
     if (sent.Error().Code() == ErrorCode::kWouldBlock ||
         sent.Error().Code() == ErrorCode::kRateLimited)
@@ -278,6 +334,7 @@ auto ClientSession::StartAuthenticate(AtlasAuthResultFn callback, void* user_dat
 
   ::atlas::baseapp::Authenticate auth_msg;
   auth_msg.supports_handoff = true;
+  auth_msg.supports_recovery = true;
   std::memcpy(auth_msg.session_key.bytes, session_key_.data(), session_key_.size());
   auto send_result = SendAfterHandshake(baseapp_channel_, [channel = baseapp_channel_, auth_msg] {
     return channel->SendMessage(auth_msg);
@@ -316,11 +373,15 @@ void ClientSession::OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg
                  msg.success, msg.entity_id, msg.type_id);
   if (state_ == ATLAS_NET_STATE_HANDOFF) {
     if (!msg.success || msg.entity_id != handoff_entity_id_ ||
-        msg.process_instance != handoff_instance_ || msg.type_id == 0) {
+        msg.process_instance != handoff_instance_ || msg.type_id == 0 ||
+        (msg.recovery.IsPresent() && recovery_credential_.account_dbid != kInvalidDBID &&
+         (msg.recovery.account_dbid != recovery_credential_.account_dbid ||
+          msg.recovery.account_type_id != recovery_credential_.account_type_id))) {
       FailClientHandoff(msg.error.empty() ? "Client handoff authentication mismatch" : msg.error);
       return;
     }
     CancelAuthTimeout();
+    recovery_credential_ = msg.recovery;
     std::memcpy(session_key_.data(), handoff_credential_.bytes, session_key_.size());
     SecureZero(handoff_credential_.bytes, sizeof(handoff_credential_.bytes));
     player_entity_id_ = msg.entity_id;
@@ -338,7 +399,10 @@ void ClientSession::OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg
   if (state_ != ATLAS_NET_STATE_AUTHENTICATING) return;
   CancelAuthTimeout();
 
-  if (!msg.success) {
+  if (!msg.success || (recovery_credential_.IsPresent() &&
+                       (!msg.recovery.IsPresent() ||
+                        msg.recovery.account_dbid != recovery_credential_.account_dbid ||
+                        msg.recovery.account_type_id != recovery_credential_.account_type_id))) {
     last_error_ = msg.error.empty() ? "authentication rejected" : msg.error;
     CloseBaseAppChannel();
     ClearSessionKey();
@@ -349,6 +413,7 @@ void ClientSession::OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg
 
   player_entity_id_ = msg.entity_id;
   player_type_id_ = msg.type_id;
+  recovery_credential_ = msg.recovery;
   state_ = ATLAS_NET_STATE_CONNECTED;
 
   InstallDefaultHandler();
@@ -383,6 +448,7 @@ void ClientSession::OnClientHandoff(const ::atlas::baseapp::ClientHandoff& msg) 
   ApplyTransportImpairment(baseapp_channel_);
   ::atlas::baseapp::Authenticate authenticate;
   authenticate.supports_handoff = true;
+  authenticate.supports_recovery = true;
   authenticate.session_key = msg.credential;
   if (auto sent = SendAfterHandshake(baseapp_channel_,
                                      [channel = baseapp_channel_, authenticate] {
@@ -423,6 +489,21 @@ void ClientSession::CancelAuthTimeout() {
 }
 
 void ClientSession::InstallDefaultHandler() {
+  (void)network_.InterfaceTable().RegisterTypedHandler<baseapp::ClientLogoutResult>(
+      [this](const Address&, Channel* channel, const baseapp::ClientLogoutResult& result) {
+        OnLogoutResult(channel, result);
+      });
+  (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::RecoveryCredentialUpdate>(
+      [this](const Address&, Channel* channel,
+             const ::atlas::baseapp::RecoveryCredentialUpdate& msg) {
+        if (channel != baseapp_channel_ || !channel || pending_disconnect_ ||
+            state_ != ATLAS_NET_STATE_CONNECTED || msg.entity_id != player_entity_id_ ||
+            (recovery_credential_.account_dbid != kInvalidDBID &&
+             (msg.credential.account_dbid != recovery_credential_.account_dbid ||
+              msg.credential.account_type_id != recovery_credential_.account_type_id)))
+          return;
+        recovery_credential_ = msg.credential;
+      });
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::ClientHandoff>(
       [this](const Address&, Channel* channel, const ::atlas::baseapp::ClientHandoff& msg) {
         if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
@@ -433,6 +514,10 @@ void ClientSession::InstallDefaultHandler() {
   (void)network_.InterfaceTable().RegisterTypedHandler<::atlas::baseapp::EntityTransferred>(
       [this](const Address&, Channel* channel, const ::atlas::baseapp::EntityTransferred& msg) {
         if (channel != baseapp_channel_ || !channel || pending_disconnect_) return;
+        SecureZero(recovery_credential_.value.data(), recovery_credential_.value.size());
+        recovery_credential_.expires_at_ms = 0;
+        player_entity_id_ = msg.new_entity_id;
+        player_type_id_ = msg.new_type_id;
         uint8_t body[sizeof(uint32_t) + sizeof(uint16_t)];
         std::memcpy(body, &msg.new_entity_id, sizeof(uint32_t));
         std::memcpy(body + sizeof(uint32_t), &msg.new_type_id, sizeof(uint16_t));
@@ -511,11 +596,27 @@ void ClientSession::InstallDefaultHandler() {
 }
 
 auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
+  if (reason == ATLAS_DISCONNECT_LOGOUT && state_ == ATLAS_NET_STATE_CONNECTED)
+    return StartLogout(nullptr, nullptr);
   if (polling_) {
     if (!pending_disconnect_) pending_disconnect_ = reason;
     return ATLAS_NET_OK;
   }
   const bool was_connected = state_ != ATLAS_NET_STATE_DISCONNECTED;
+  pending_login_start_ = {};
+  AtlasLogoutResultFn cancelled_logout = nullptr;
+  void* cancelled_logout_data = nullptr;
+  if (logout_request_id_ != 0) {
+    logout_request_id_ = 0;
+    dispatcher_.CancelTimer(logout_timeout_);
+    logout_timeout_ = {};
+    cancelled_logout = std::exchange(logout_callback_, nullptr);
+    cancelled_logout_data = std::exchange(logout_user_data_, nullptr);
+  }
+  if (reason != ATLAS_DISCONNECT_INTERNAL) {
+    SecureZero(recovery_credential_.value.data(), recovery_credential_.value.size());
+    recovery_credential_ = {};
+  }
   pending_transport_send_ = {};
   pending_transport_channel_ = 0;
 
@@ -541,6 +642,60 @@ auto ClientSession::Disconnect(AtlasDisconnectReason reason) -> int32_t {
   if (reason == ATLAS_DISCONNECT_LOGOUT && was_connected) {
     callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_LoggedOff);
   }
+  if (cancelled_logout) cancelled_logout(cancelled_logout_data, 0, "logout_result_unconfirmed");
+  return ATLAS_NET_OK;
+}
+
+auto ClientSession::StartLogout(AtlasLogoutResultFn callback, void* user_data) -> int32_t {
+  if (pending_disconnect_ || logout_request_id_ != 0) return ATLAS_NET_ERR_BUSY;
+  if (state_ != ATLAS_NET_STATE_CONNECTED || !baseapp_channel_ || baseapp_channel_->IsCondemned())
+    return ATLAS_NET_ERR_NOCONN;
+  if (next_logout_id_ == 0) return ATLAS_NET_ERR_BUSY;
+  const auto id = next_logout_id_++;
+  auto sent = baseapp_channel_->SendMessage(baseapp::ClientLogout{id, player_entity_id_});
+  if (!sent) {
+    last_error_ = "logout_not_queued";
+    return ATLAS_NET_ERR_IO;
+  }
+  logout_request_id_ = id;
+  logout_callback_ = callback;
+  logout_user_data_ = user_data;
+  logout_timeout_ = dispatcher_.AddTimer(
+      kLoginTimeout, [this](TimerHandle) { CompleteLogout(false, "logout_result_unconfirmed"); });
+  return ATLAS_NET_OK;
+}
+
+void ClientSession::OnLogoutResult(Channel* channel, const baseapp::ClientLogoutResult& result) {
+  if (!channel || channel != baseapp_channel_ || pending_disconnect_ || logout_request_id_ == 0 ||
+      result.request_id != logout_request_id_)
+    return;
+  CompleteLogout(result.status == ErrorCode::kNone, result.error);
+}
+
+void ClientSession::CompleteLogout(bool success, std::string error) {
+  if (logout_request_id_ == 0) return;
+  logout_request_id_ = 0;
+  dispatcher_.CancelTimer(logout_timeout_);
+  logout_timeout_ = {};
+  auto callback = std::exchange(logout_callback_, nullptr);
+  auto* user_data = std::exchange(logout_user_data_, nullptr);
+  last_error_ = success ? "" : (error.empty() ? "logout_result_unconfirmed" : std::move(error));
+  SecureZero(recovery_credential_.value.data(), recovery_credential_.value.size());
+  recovery_credential_ = {};
+  (void)Disconnect(ATLAS_DISCONNECT_USER);
+  if (callback) callback(user_data, static_cast<uint8_t>(success), last_error_.c_str());
+  if (success)
+    callbacks_.on_disconnect(reinterpret_cast<AtlasNetContext*>(this), kRpcReason_LoggedOff);
+}
+
+auto ClientSession::GetRecoveryCredential(AtlasRecoveryCredential* credential) const -> int32_t {
+  if (!credential) return ATLAS_NET_ERR_INVAL;
+  *credential = {};
+  if (!recovery_credential_.IsPresent()) return ATLAS_NET_ERR_NOCONN;
+  credential->account_dbid = recovery_credential_.account_dbid;
+  credential->account_type_id = recovery_credential_.account_type_id;
+  std::memcpy(credential->value, recovery_credential_.value.data(), sizeof(credential->value));
+  credential->expires_at_ms = recovery_credential_.expires_at_ms;
   return ATLAS_NET_OK;
 }
 

@@ -181,6 +181,23 @@ int32_t AtlasNetAuthenticate(AtlasNetContext* ctx, AtlasAuthResultFn callback, v
   return ctx->StartAuthenticate(callback, user_data);
 }
 
+int32_t AtlasNetResume(AtlasNetContext* ctx, const char* loginapp_host, uint16_t loginapp_port,
+                       const AtlasRecoveryCredential* credential, AtlasLoginResultFn callback,
+                       void* user_data) {
+  if (!ctx || !loginapp_host || !credential) return ATLAS_NET_ERR_INVAL;
+  return ctx->StartResume(loginapp_host, loginapp_port, *credential, callback, user_data);
+}
+
+int32_t AtlasNetLogout(AtlasNetContext* ctx, AtlasLogoutResultFn callback, void* user_data) {
+  if (!ctx) return ATLAS_NET_ERR_INVAL;
+  return ctx->StartLogout(callback, user_data);
+}
+
+int32_t AtlasNetGetRecoveryCredential(AtlasNetContext* ctx, AtlasRecoveryCredential* credential) {
+  if (!ctx) return ATLAS_NET_ERR_INVAL;
+  return ctx->GetRecoveryCredential(credential);
+}
+
 int32_t AtlasNetSetEntityDefDigest(AtlasNetContext* ctx, const uint8_t* data, int32_t len) {
   if (!ctx || !data || len != 32) return ATLAS_NET_ERR_INVAL;
   ctx->SetEntityDefDigest(data, len);

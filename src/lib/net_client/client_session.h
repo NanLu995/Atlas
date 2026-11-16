@@ -12,6 +12,7 @@
 #include "network/event_dispatcher.h"
 #include "network/network_interface.h"
 #include "server/entity_types.h"
+#include "server/recovery_credential.h"
 
 namespace atlas::login {
 struct LoginResult;
@@ -19,6 +20,7 @@ struct LoginResult;
 namespace atlas::baseapp {
 struct AuthenticateResult;
 struct ClientHandoff;
+struct ClientLogoutResult;
 }
 
 namespace atlas::net_client {
@@ -44,6 +46,10 @@ class ClientSession {
   auto StartLogin(std::string_view loginapp_host, uint16_t loginapp_port, std::string_view username,
                   std::string_view password_hash, AtlasLoginResultFn callback, void* user_data)
       -> int32_t;
+  auto StartResume(std::string_view loginapp_host, uint16_t loginapp_port,
+                   const AtlasRecoveryCredential& credential, AtlasLoginResultFn callback,
+                   void* user_data) -> int32_t;
+  auto StartLogout(AtlasLogoutResultFn callback, void* user_data) -> int32_t;
 
   // Legal only in LOGIN_SUCCEEDED. Reads cached SessionKey + BaseApp addr.
   auto StartAuthenticate(AtlasAuthResultFn callback, void* user_data) -> int32_t;
@@ -54,6 +60,7 @@ class ClientSession {
   auto SetTransportImpairment(uint32_t one_way_latency_ms, uint32_t loss_permyriad,
                               uint32_t seed) -> int32_t;
   auto ConfigureDtls(const char* trust_file, const char* peer_identity) -> int32_t;
+  auto GetRecoveryCredential(AtlasRecoveryCredential* credential) const -> int32_t;
 
   auto SendBaseRpc(uint32_t entity_id, uint32_t rpc_id, const uint8_t* payload, int32_t len)
       -> int32_t;
@@ -78,10 +85,14 @@ class ClientSession {
   auto FillStats(AtlasNetStats* out) const -> int32_t;
 
  private:
+  auto StartLoginTransport(std::string_view host, uint16_t port, AtlasLoginResultFn callback,
+                           void* user_data, std::function<Result<void>(Channel*)> send) -> int32_t;
   void OnLoginResult(const ::atlas::login::LoginResult& msg);
   void FireLoginCallback(AtlasLoginStatus status, std::string_view baseapp_host,
                          uint16_t baseapp_port, std::string_view error);
   void CancelLoginTimeout();
+  void OnLogoutResult(Channel* channel, const baseapp::ClientLogoutResult& result);
+  void CompleteLogout(bool success, std::string error);
 
   void OnAuthResult(const ::atlas::baseapp::AuthenticateResult& msg);
   void OnClientHandoff(const ::atlas::baseapp::ClientHandoff& msg);
@@ -118,10 +129,16 @@ class ClientSession {
   Address baseapp_addr_{};
   EntityID player_entity_id_{kInvalidEntityID};
   uint16_t player_type_id_{0};
+  RecoveryCredential recovery_credential_;
 
   AtlasLoginResultFn login_callback_{nullptr};
   void* login_user_data_{nullptr};
   TimerHandle login_timeout_{};
+  uint64_t next_logout_id_{1};
+  uint64_t logout_request_id_{0};
+  TimerHandle logout_timeout_{};
+  AtlasLogoutResultFn logout_callback_{nullptr};
+  void* logout_user_data_{nullptr};
 
   AtlasAuthResultFn auth_callback_{nullptr};
   void* auth_user_data_{nullptr};
@@ -136,6 +153,7 @@ class ClientSession {
 
   std::string last_error_;
   std::function<Result<void>()> pending_transport_send_;
+  std::function<void()> pending_login_start_;
   ChannelId pending_transport_channel_{0};
   bool dtls_required_{false};
   bool dtls_configured_{false};

@@ -103,6 +103,15 @@ enum class AccountSessionPhase : uint8_t {
   kAwaitingClient,
 };
 
+struct AccountRecoveryGrant {
+  std::array<std::byte, 32> credential_hash{};
+  DatabaseID entity_dbid{kInvalidDBID};
+  uint16_t entity_type_id{0};
+  int64_t expires_at_ms{0};
+
+  [[nodiscard]] auto operator==(const AccountRecoveryGrant&) const -> bool = default;
+};
+
 struct AccountSession {
   uint64_t version{0};
   AccountSessionPhase phase{AccountSessionPhase::kOffline};
@@ -110,6 +119,7 @@ struct AccountSession {
   AccountSessionOwner target;
   std::array<std::byte, 16> handoff_id{};
   std::array<std::byte, 32> credential_hash{};
+  AccountRecoveryGrant recovery;
 
   [[nodiscard]] auto operator==(const AccountSession&) const -> bool = default;
 };
@@ -123,6 +133,10 @@ enum class AccountSessionAction : uint8_t {
   kAbort,
   kRelease,
   kMoveLocal,
+  kIssueRecovery,
+  kRevokeRecovery,
+  kConsumeRecovery,
+  kClaimRecovery,
 };
 
 struct AccountSessionOperation {
@@ -136,6 +150,9 @@ struct AccountSessionOperation {
   std::array<std::byte, 16> handoff_id{};
   std::array<std::byte, 32> credential_hash{};
   std::optional<CheckoutInfo> claim_checkout;
+  AccountRecoveryGrant recovery;
+  std::array<std::byte, 32> recovery_proof{};
+  std::optional<CheckoutInfo> recovery_checkout;
 };
 
 struct DatabaseWriteOperation {

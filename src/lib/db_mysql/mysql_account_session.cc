@@ -56,7 +56,8 @@ auto MysqlDatabase::DoUpdateAccountSession(st_mysql* conn, const AccountSessionO
       if (!current) return current.Error();
       return ConfirmSessionReceipt(op, **previous, *current);
     }
-    if (op.action == AccountSessionAction::kClaim) {
+    if (op.action == AccountSessionAction::kClaim ||
+        op.action == AccountSessionAction::kClaimRecovery) {
       auto account = FetchByDbid(conn, op.account_dbid, op.account_type_id, true);
       if (!account) return account.Error();
       if (!account->found) return Error{ErrorCode::kNotFound, "session account does not exist"};
@@ -71,7 +72,37 @@ auto MysqlDatabase::DoUpdateAccountSession(st_mysql* conn, const AccountSessionO
     }
     auto current = DoReadAccountSession(conn, op.account_dbid, op.account_type_id, true);
     if (!current) return current.Error();
-    auto next = ApplySessionOperation(*current, op);
+    if (op.action == AccountSessionAction::kClaimRecovery) {
+      const auto& old = current->owner;
+      auto retired = QueryScalar(
+          conn,
+          std::format(
+              "SELECT retired FROM atlas_checkout_processes WHERE base_ip = {} AND base_port = {} "
+              "AND instance = {} FOR UPDATE",
+              old.base_addr.Ip(), old.base_addr.Port(), old.process_instance));
+      if (!retired) return retired.Error();
+      if (!*retired || **retired != "1")
+        return Error{ErrorCode::kPermissionDenied, "previous session owner retirement unconfirmed"};
+      auto entity =
+          FetchByDbid(conn, current->recovery.entity_dbid, current->recovery.entity_type_id, true);
+      if (!entity) return entity.Error();
+      if (!entity->found || entity->checked_out_by != op.recovery_checkout)
+        return Error{ErrorCode::kPermissionDenied, "recovery target checkout changed"};
+    }
+    int64_t now_ms = 0;
+    if (op.action == AccountSessionAction::kIssueRecovery ||
+        op.action == AccountSessionAction::kConsumeRecovery ||
+        op.action == AccountSessionAction::kClaimRecovery) {
+      auto time =
+          QueryScalar(conn, "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)");
+      if (!time) return time.Error();
+      if (!*time) return Error{ErrorCode::kIoError, "database time unavailable"};
+      const auto& value = **time;
+      const auto parsed = std::from_chars(value.data(), value.data() + value.size(), now_ms);
+      if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+        return Error{ErrorCode::kIoError, "invalid database time"};
+    }
+    auto next = ApplySessionOperation(*current, op, now_ms);
     if (!next) return next.Error();
     BinaryWriter payload;
     WriteAccountSession(payload, *next);

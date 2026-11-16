@@ -14,6 +14,7 @@
 #include "network/message.h"
 #include "network/message_ids.h"
 #include "server/entity_types.h"
+#include "server/recovery_credential.h"
 
 namespace atlas::baseapp {
 
@@ -599,12 +600,13 @@ static_assert(NetworkMessage<ReplicatedBaselineToClient>);
 struct Authenticate {
   SessionKey session_key;
   bool supports_handoff{false};
+  bool supports_recovery{false};
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kAuthenticate),
                                    "baseapp::Authenticate",
                                    MessageLengthStyle::kFixed,
-                                   static_cast<int>(sizeof(SessionKey) + sizeof(uint8_t)),
+                                   static_cast<int>(sizeof(SessionKey) + 2 * sizeof(uint8_t)),
                                    MessageReliability::kReliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
@@ -614,6 +616,7 @@ struct Authenticate {
     w.WriteBytes(std::span<const std::byte>(reinterpret_cast<const std::byte*>(session_key.bytes),
                                             sizeof(session_key.bytes)));
     w.Write(static_cast<uint8_t>(supports_handoff));
+    w.Write(static_cast<uint8_t>(supports_recovery));
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<Authenticate> {
@@ -622,9 +625,11 @@ struct Authenticate {
     Authenticate msg;
     std::memcpy(msg.session_key.bytes, key_span->data(), sizeof(SessionKey));
     auto handoff = r.Read<uint8_t>();
-    if (!handoff || *handoff > 1 || r.Remaining() != 0)
+    auto recovery = r.Read<uint8_t>();
+    if (!handoff || *handoff > 1 || !recovery || *recovery > 1 || r.Remaining() != 0)
       return Error{ErrorCode::kInvalidArgument, "invalid client handoff capability"};
     msg.supports_handoff = *handoff != 0;
+    msg.supports_recovery = *recovery != 0;
     return msg;
   }
 };
@@ -636,6 +641,7 @@ struct AuthenticateResult {
   uint16_t type_id{0};
   std::string error;
   uint64_t process_instance{0};
+  RecoveryCredential recovery;
 
   static auto Descriptor() -> const MessageDesc& {
     static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kAuthenticateResult),
@@ -653,6 +659,7 @@ struct AuthenticateResult {
     w.Write(type_id);
     w.WriteString(error);
     w.Write(process_instance);
+    WriteRecoveryCredential(w, recovery);
   }
 
   static auto Deserialize(BinaryReader& r) -> Result<AuthenticateResult> {
@@ -661,7 +668,9 @@ struct AuthenticateResult {
     auto ti = r.Read<uint16_t>();
     auto err = r.ReadString();
     auto instance = r.Read<uint64_t>();
-    if (!ok || !eid || !ti || !err || !instance || *ok > 1 || r.Remaining() != 0)
+    auto recovery = ReadRecoveryCredential(r);
+    if (!ok || !eid || !ti || !err || !instance || !recovery || *ok > 1 || r.Remaining() != 0 ||
+        (*ok == 0 && recovery->IsPresent()))
       return Error{ErrorCode::kInvalidArgument, "AuthenticateResult: truncated"};
     AuthenticateResult msg;
     msg.success = (*ok != 0);
@@ -669,10 +678,99 @@ struct AuthenticateResult {
     msg.type_id = *ti;
     msg.error = std::move(*err);
     msg.process_instance = *instance;
+    msg.recovery = *recovery;
     return msg;
   }
 };
 static_assert(NetworkMessage<AuthenticateResult>);
+
+struct ClientLogout {
+  uint64_t request_id{0};
+  EntityID entity_id{kInvalidEntityID};
+
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kClientLogout),
+                                   "baseapp::ClientLogout",
+                                   MessageLengthStyle::kFixed,
+                                   12,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
+    return kDesc;
+  }
+  void Serialize(BinaryWriter& writer) const {
+    writer.Write(request_id);
+    writer.Write(entity_id);
+  }
+  static auto Deserialize(BinaryReader& reader) -> Result<ClientLogout> {
+    auto id = reader.Read<uint64_t>();
+    auto entity = reader.Read<EntityID>();
+    if (!id || *id == 0 || !entity || *entity == kInvalidEntityID || reader.Remaining() != 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid client logout"};
+    return ClientLogout{*id, *entity};
+  }
+};
+static_assert(NetworkMessage<ClientLogout>);
+
+struct ClientLogoutResult {
+  uint64_t request_id{0};
+  ErrorCode status{ErrorCode::kNone};
+  std::string error;
+
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kClientLogoutResult),
+                                   "baseapp::ClientLogoutResult",
+                                   MessageLengthStyle::kVariable,
+                                   -1,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
+    return kDesc;
+  }
+  void Serialize(BinaryWriter& writer) const {
+    writer.Write(request_id);
+    writer.Write(static_cast<uint16_t>(status));
+    writer.WriteString(error);
+  }
+  static auto Deserialize(BinaryReader& reader) -> Result<ClientLogoutResult> {
+    auto id = reader.Read<uint64_t>();
+    auto status = reader.Read<uint16_t>();
+    auto error = reader.ReadString();
+    if (!id || *id == 0 || !status || *status > static_cast<uint16_t>(ErrorCode::kCommitUnknown) ||
+        !error || error->size() > 512 || reader.Remaining() != 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid client logout result"};
+    return ClientLogoutResult{*id, static_cast<ErrorCode>(*status), std::move(*error)};
+  }
+};
+static_assert(NetworkMessage<ClientLogoutResult>);
+
+struct RecoveryCredentialUpdate {
+  EntityID entity_id{kInvalidEntityID};
+  RecoveryCredential credential;
+
+  static auto Descriptor() -> const MessageDesc& {
+    static const MessageDesc kDesc{msg_id::Id(msg_id::BaseApp::kRecoveryCredentialUpdate),
+                                   "baseapp::RecoveryCredentialUpdate",
+                                   MessageLengthStyle::kVariable,
+                                   -1,
+                                   MessageReliability::kReliable,
+                                   MessageUrgency::kImmediate};
+    return kDesc;
+  }
+
+  void Serialize(BinaryWriter& writer) const {
+    writer.Write(entity_id);
+    WriteRecoveryCredential(writer, credential);
+  }
+
+  static auto Deserialize(BinaryReader& reader) -> Result<RecoveryCredentialUpdate> {
+    auto entity = reader.Read<EntityID>();
+    auto credential = ReadRecoveryCredential(reader);
+    if (!entity || !IsServerEntityId(*entity) || !credential || !credential->IsPresent() ||
+        reader.Remaining() != 0)
+      return Error{ErrorCode::kInvalidArgument, "invalid recovery credential update"};
+    return RecoveryCredentialUpdate{*entity, *credential};
+  }
+};
+static_assert(NetworkMessage<RecoveryCredentialUpdate>);
 
 // Owning-entity change after server-side GiveClientTo (ID 2024).
 // ClientCellRpc must use new_entity_id after this.

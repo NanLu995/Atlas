@@ -19,6 +19,7 @@
 #include "cellapp/cellapp_messages.h"
 #include "cellappmgr/cellappmgr_messages.h"
 #include "coro/entity_rpc_reply.h"
+#include "coro/scope_guard.h"
 #include "db/entity_blob.h"
 #include "db/idatabase.h"
 #include "dbapp/dbapp_messages.h"
@@ -345,6 +346,10 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
       });
 
   auto& ext_table = external_network_.InterfaceTable();
+  (void)ext_table.RegisterTypedHandler<baseapp::ClientLogout>(
+      [this](const Address&, Channel* channel, const baseapp::ClientLogout& request) {
+        if (channel) OnClientLogout(IntrusivePtr<Channel>{channel}, request);
+      });
   (void)ext_table.RegisterTypedHandler<baseapp::Authenticate>(
       [this](const Address& /*src*/, Channel* ch, const baseapp::Authenticate& msg) {
         OnClientAuthenticate(*ch, msg);
@@ -372,6 +377,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
 }
 
 void BaseApp::Fini() {
+  recovery_cancel_.RequestCancellation();
   rpc_registry_.Shutdown();
   entity_mgr_.FlushDestroyed();
   SweepMovementAckRelayState();
@@ -632,6 +638,10 @@ void BaseApp::RegisterWatchers() {
 void BaseApp::RegisterInternalHandlers() {
   RegisterClientHandoffHandlers();
   auto& table = Network().InterfaceTable();
+  (void)table.RegisterTypedHandler<login::PrepareResume>(
+      [this](const Address&, Channel* channel, const login::PrepareResume& request) {
+        if (channel) OnPrepareResume(IntrusivePtr<Channel>{channel}, request);
+      });
   (void)table.RegisterTypedHandler<baseapp::RevokeAccountSession>(
       [this](const Address&, Channel* channel, const baseapp::RevokeAccountSession& request) {
         if (channel) OnRevokeAccountSession(IntrusivePtr<Channel>{channel}, request);
@@ -787,6 +797,8 @@ void BaseApp::RegisterInternalHandlers() {
             }
           }
           ent->OnWriteAck(msg.dbid, saved);
+          if (saved && !kPendingWrite.logoff_after_write)
+            RefreshPersistedRecoveryCredential(ent->EntityId());
           if (saved && kPendingWrite.logoff_after_write) {
             StartDisconnectLogoff(ent->EntityId());
           }
@@ -908,6 +920,12 @@ void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntit
   }
   auto pending = std::move(waiting);
   pending_entity_checkouts_.erase(found);
+  auto complete = std::move(pending.complete);
+  Result<dbapp::CheckoutEntityAck> completion{
+      Error{ErrorCode::kIoError, "persistent recovery entity load failed"}};
+  ScopeGuard completion_guard([&] {
+    if (complete) complete(std::move(completion));
+  });
   if (msg.status == dbapp::CheckoutStatus::kSuccess) pending.resolved_dbid = msg.dbid;
   const auto entity_id = pending.request.entity_id;
   auto cancel_load = [&] {
@@ -929,6 +947,7 @@ void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntit
     FinishLoginFlow(pending.resolved_dbid);
     ATLAS_LOG_ERROR("BaseApp: database load failed, entity={} status={}", entity_id,
                     static_cast<int>(msg.status));
+    if (complete && !pending.outcome_unknown) completion = msg;
     return;
   }
   if (!std::ranges::equal(pending.request.entity_def_digest,
@@ -963,8 +982,10 @@ void BaseApp::OnCheckoutEntityAck(const Address& src, const dbapp::CheckoutEntit
   if (!RestoreManagedEntity(entity_id, entity->TypeId(), msg.dbid, base_span)) {
     (void)NotifyManagedEntityDestroyed(entity_id, "CreateBaseFromDB rollback");
     cancel_load();
+    return;
   }
   FinishLoginFlow(msg.dbid);
+  if (complete) completion = msg;
 }
 
 void BaseApp::OnAbortCheckoutAck(const Address& src, const dbapp::AbortCheckoutAck& msg) {
@@ -993,11 +1014,13 @@ bool BaseApp::SendEntityCheckout(PendingDbCheckout& pending) {
 }
 
 void BaseApp::RetryEntityCheckouts() {
+  std::vector<std::function<void(Result<dbapp::CheckoutEntityAck>)>> completions;
   for (auto it = pending_entity_checkouts_.begin(); it != pending_entity_checkouts_.end();) {
     auto& pending = it->second;
     const bool expired = Clock::now() - pending.created_at > kPendingTimeout;
     if (expired || !entity_mgr_.Find(pending.request.entity_id) ||
         (!pending.awaiting_ack && pending.retry_count >= kDbappCheckoutRetryLimit)) {
+      auto complete = std::move(pending.complete);
       entity_mgr_.Destroy(pending.request.entity_id);
       if (pending.awaiting_ack || pending.outcome_unknown) {
         pending.awaiting_ack = false;
@@ -1008,6 +1031,7 @@ void BaseApp::RetryEntityCheckouts() {
       }
       FinishLoginFlow(pending.resolved_dbid);
       it = pending_entity_checkouts_.erase(it);
+      if (complete) completions.push_back(std::move(complete));
       continue;
     }
     if (!pending.awaiting_ack && Clock::now() >= pending.next_retry_at) {
@@ -1015,6 +1039,8 @@ void BaseApp::RetryEntityCheckouts() {
     }
     ++it;
   }
+  for (auto& complete : completions)
+    complete(Error{ErrorCode::kTimeout, "persistent recovery checkout unconfirmed"});
 }
 
 void BaseApp::RetryCanceledCheckouts() {
@@ -1776,7 +1802,10 @@ void BaseApp::EnterDetachedGrace(EntityID entity_id) {
   }
 
   const auto kNow = Clock::now();
-  const auto kUntil = kNow + kDetachedProxyGrace;
+  auto kUntil = kNow + kDetachedProxyGrace;
+  if (const auto session = client_sessions_.find(entity_id);
+      session != client_sessions_.end() && session->second->supports_recovery)
+    kUntil = std::max(kUntil, session->second->recovery_deadline);
   proxy->EnterDetachedGrace(kUntil);
   detached_proxies_[entity_id] = DetachedProxyState{kNow, kUntil};
 }
@@ -4322,8 +4351,11 @@ void BaseApp::FinishClientAuthenticate(Channel& ch, const baseapp::Authenticate&
 
   baseapp::AuthenticateResult res;
   res.success = true;
-  if (auto session = client_sessions_.find(proxy->EntityId()); session != client_sessions_.end())
+  if (auto session = client_sessions_.find(proxy->EntityId()); session != client_sessions_.end()) {
     session->second->supports_handoff = msg.supports_handoff;
+    session->second->supports_recovery = msg.supports_recovery;
+    if (msg.supports_recovery) res.recovery = session->second->recovery_credential;
+  }
   res.entity_id = proxy->EntityId();
   res.type_id = proxy->TypeId();
   res.process_instance = Config().process_instance;

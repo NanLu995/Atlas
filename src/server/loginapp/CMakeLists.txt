@@ -2,6 +2,7 @@
 
 add_library(atlas_loginapp_lib STATIC
   loginapp.cc
+  session_recovery.cc
 )
 
 target_include_directories(atlas_loginapp_lib PUBLIC

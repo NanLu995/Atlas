@@ -16,7 +16,7 @@
 namespace atlas {
 
 namespace {
-constexpr int kMysqlSchemaVersion = 2;
+constexpr int kMysqlSchemaVersion = 3;
 constexpr unsigned int kErDupEntry = 1062;  // MySQL ER_DUP_ENTRY
 
 auto UnixTimeMs() -> int64_t {

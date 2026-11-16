@@ -25,6 +25,24 @@ namespace Atlas.Client.Tests
         private const int kPositionBatchFlagsOffset = 1 + 4 + 3 * 4 + 8 + 2;
 
         [Fact]
+        public void RecoveryCredentialCopiesItsSecretAndMatchesNativeLayout()
+        {
+            var value = new byte[32];
+            value[0] = 7;
+            var credential = new SessionRecoveryCredential(42, 7, value, 1000000);
+            value[0] = 9;
+            Assert.Equal(7, credential.Value.Span[0]);
+            Assert.Equal(56, Marshal.SizeOf<AtlasRecoveryCredential>());
+            Assert.Equal(48, Marshal.OffsetOf<AtlasRecoveryCredential>(
+                nameof(AtlasRecoveryCredential.ExpiresAtMs)).ToInt32());
+            Assert.Throws<ArgumentException>(() => new SessionRecoveryCredential(0, 7, value, 1));
+            Assert.Throws<ArgumentException>(() => new SessionRecoveryCredential(42, 0, value, 1));
+            Assert.Throws<ArgumentException>(() => new SessionRecoveryCredential(42, 7, new byte[31], 1));
+            Assert.Throws<ArgumentException>(() => new SessionRecoveryCredential(42, 7, new byte[32], 1));
+            Assert.Throws<ArgumentException>(() => new SessionRecoveryCredential(42, 7, value, 0));
+        }
+
+        [Fact]
         public void MovementNativeStructLayoutsStayPinned()
         {
             Assert.Equal(17, Marshal.SizeOf<AtlasMovementInputFrame>());

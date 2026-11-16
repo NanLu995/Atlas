@@ -2,6 +2,7 @@
 
 #include "baseapp.h"
 #include "coro/rpc_call.h"
+#include "coro/scope_guard.h"
 #include "foundation/log.h"
 #include "platform/secure_random.h"
 
@@ -15,6 +16,7 @@ BaseApp::BaseApp(EventDispatcher& dispatcher, NetworkInterface& internal_network
       cellapp_peers_(internal_network) {}
 
 BaseApp::~BaseApp() {
+  recovery_cancel_.RequestCancellation();
   rpc_registry_.Shutdown();
 }
 
@@ -154,7 +156,8 @@ void BaseApp::OnClientAuthenticate(Channel& channel, const baseapp::Authenticate
       return;
     }
     if (!session->frozen && session->record.phase == AccountSessionPhase::kActive &&
-        session->record.owner == session->owner && !session->pending_operation) {
+        session->record.owner == session->owner && !session->pending_operation &&
+        (!request.supports_recovery || session->recovery_credential.IsPresent())) {
       FinishClientAuthenticate(channel, request);
       return;
     }
@@ -224,8 +227,62 @@ auto BaseApp::AuthenticateClientSession(IntrusivePtr<Channel> channel,
     RejectAuthentication(*channel, "account_session_confirmation_failed");
     co_return;
   }
+  session->supports_recovery = request.supports_recovery;
+  if (request.supports_recovery) {
+    auto issued = co_await IssueClientRecoveryCredential(session);
+    if (!issued || session->wait_cancel.Token().IsCancelled()) {
+      ++auth_fail_total_;
+      RejectAuthentication(*channel, "recovery_credential_unconfirmed");
+      co_return;
+    }
+  }
   session->frozen = false;
   if (!channel->IsCondemned()) FinishClientAuthenticate(*channel, request);
+}
+
+auto BaseApp::IssueClientRecoveryCredential(std::shared_ptr<ClientSession> session,
+                                            AccountSessionAction action, Sha256Digest proof,
+                                            std::optional<CheckoutInfo> account_checkout)
+    -> Task<Result<void>> {
+  if (session->busy)
+    co_return Error{ErrorCode::kWouldBlock, "recovery credential confirmation pending"};
+  auto* entity = entity_mgr_.Find(session->owner.entity_id);
+  const auto current = client_sessions_.find(session->owner.entity_id);
+  if (!entity || entity->IsPendingDestroy() || current == client_sessions_.end() ||
+      current->second != session || session->record.phase != AccountSessionPhase::kActive ||
+      (action != AccountSessionAction::kClaimRecovery && session->record.owner != session->owner))
+    co_return Error{ErrorCode::kPermissionDenied, "client session is not recoverable"};
+  RecoveryCredential credential;
+  credential.account_dbid = session->account_dbid;
+  credential.account_type_id = session->account_type_id;
+  if (auto random = FillSecureRandom(credential.value); !random) co_return random.Error();
+  if (!credential.IsPresent()) co_return Error{ErrorCode::kIoError, "empty recovery randomness"};
+  auto digest = Sha256(credential.value);
+  if (!digest) co_return digest.Error();
+  auto operation = MakeSessionOperation(session->account_dbid, session->account_type_id,
+                                        session->record, session->owner, action);
+  if (!operation) co_return operation.Error();
+  operation->recovery.credential_hash = *digest;
+  operation->recovery.entity_dbid = entity->Dbid();
+  operation->recovery.entity_type_id = entity->TypeId();
+  operation->recovery_proof = proof;
+  if (action == AccountSessionAction::kClaimRecovery) {
+    operation->claim_checkout = account_checkout;
+    operation->recovery_checkout = entity->CheckoutOwner();
+  }
+  auto saved =
+      co_await ApplyClientSessionOperation(session, *operation, session->wait_cancel.Token());
+  if (!saved) co_return saved.Error();
+  const auto still_current = client_sessions_.find(session->owner.entity_id);
+  if (still_current == client_sessions_.end() || still_current->second != session ||
+      session->wait_cancel.Token().IsCancelled())
+    co_return Error{ErrorCode::kCancelled, "recovery session no longer current"};
+  if (saved->recovery.credential_hash != *digest || saved->owner != session->owner)
+    co_return Error{ErrorCode::kCommitUnknown, "recovery grant confirmation mismatch"};
+  credential.expires_at_ms = saved->recovery.expires_at_ms;
+  session->recovery_credential = credential;
+  session->recovery_deadline = Clock::now() + Milliseconds(kSessionRecoveryLifetimeMs);
+  co_return Result<void>{};
 }
 
 auto BaseApp::ReleaseClientSession(EntityID entity_id, std::optional<uint64_t> expected_version)
@@ -368,6 +425,16 @@ auto BaseApp::MoveClientSession(EntityID source, EntityID destination) -> Task<R
   session->transfer_target = kInvalidEntityID;
   if (!installed)
     co_return Error{ErrorCode::kCommitUnknown, "client transfer notification was not confirmed"};
+  if (session->supports_recovery) {
+    auto issued = co_await IssueClientRecoveryCredential(session);
+    if (!issued) co_return issued.Error();
+    auto* client = ResolveClientChannel(destination);
+    if (!client) co_return Error{ErrorCode::kReceiverGone, "client transfer channel unavailable"};
+    if (auto sent = client->SendMessage(
+            baseapp::RecoveryCredentialUpdate{destination, session->recovery_credential});
+        !sent)
+      co_return sent.Error();
+  }
   session->frozen = false;
   co_return Result<void>{};
 }

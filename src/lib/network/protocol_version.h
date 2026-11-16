@@ -10,7 +10,7 @@
 
 namespace atlas {
 
-inline constexpr uint16_t kConnectionProtocolVersion = 1;
+inline constexpr uint16_t kConnectionProtocolVersion = 2;
 inline constexpr std::array<std::byte, 6> kConnectionProtocolHeader{
     std::byte{0x41},
     std::byte{0x54},

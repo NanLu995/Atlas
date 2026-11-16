@@ -81,6 +81,44 @@ inline void CheckAccountSessionContract(IDatabase& db) {
   ASSERT_FALSE(conflict.HasValue());
   EXPECT_EQ(conflict.Error().Code(), ErrorCode::kAlreadyExists);
 
+  auto issue = operation(AccountSessionAction::kIssueRecovery, active->version, source);
+  issue.recovery.credential_hash[0] = std::byte{17};
+  issue.recovery.entity_dbid = kAccount;
+  issue.recovery.entity_type_id = 1;
+  auto issued = UpdateSession(db, issue);
+  ASSERT_TRUE(issued.HasValue()) << issued.Error().Message();
+  EXPECT_EQ(issued->recovery.credential_hash, issue.recovery.credential_hash);
+  EXPECT_GT(issued->recovery.expires_at_ms, kSessionRecoveryLifetimeMs);
+  EXPECT_EQ(issued->owner, source);
+  auto issue_replay = UpdateSession(db, issue);
+  ASSERT_TRUE(issue_replay.HasValue());
+  EXPECT_EQ(*issue_replay, *issued);
+  auto forbidden = operation(AccountSessionAction::kIssueRecovery, issued->version, target);
+  forbidden.recovery = issue.recovery;
+  EXPECT_FALSE(UpdateSession(db, forbidden).HasValue());
+  auto same = operation(AccountSessionAction::kIssueRecovery, issued->version, source);
+  same.recovery = issue.recovery;
+  EXPECT_FALSE(UpdateSession(db, same).HasValue());
+  auto consume = operation(AccountSessionAction::kConsumeRecovery, issued->version, source);
+  consume.recovery = issue.recovery;
+  consume.recovery.credential_hash[0] = std::byte{18};
+  consume.recovery_proof = issue.recovery.credential_hash;
+  auto rotated = UpdateSession(db, consume);
+  ASSERT_TRUE(rotated.HasValue()) << rotated.Error().Message();
+  EXPECT_EQ(rotated->recovery.credential_hash, consume.recovery.credential_hash);
+  auto consumed_retry = UpdateSession(db, consume);
+  ASSERT_TRUE(consumed_retry.HasValue());
+  EXPECT_EQ(*consumed_retry, *rotated);
+  auto token_replay = operation(AccountSessionAction::kConsumeRecovery, rotated->version, source);
+  token_replay.recovery = issue.recovery;
+  token_replay.recovery.credential_hash[0] = std::byte{19};
+  token_replay.recovery_proof = issue.recovery.credential_hash;
+  EXPECT_FALSE(UpdateSession(db, token_replay).HasValue());
+  auto revoke = operation(AccountSessionAction::kRevokeRecovery, rotated->version, source);
+  active = UpdateSession(db, revoke);
+  ASSERT_TRUE(active.HasValue());
+  EXPECT_EQ(active->recovery, AccountRecoveryGrant{});
+
   auto move = operation(AccountSessionAction::kMoveLocal, active->version, source);
   move.target = local;
   auto moved = UpdateSession(db, move);
@@ -139,6 +177,64 @@ inline void CheckAccountSessionContract(IDatabase& db) {
   db.GetEntity(kAccount, 1, [&](GetResult value) { stored = std::move(value); });
   ASSERT_TRUE(stored.success);
   EXPECT_EQ(stored.checked_out_by, checkout);
+}
+
+inline void CheckSessionRecoveryClaim(IDatabase& db) {
+  auto claim = CreateSessionAccount(db);
+  ASSERT_TRUE(claim.HasValue());
+  auto active = UpdateSession(db, *claim);
+  ASSERT_TRUE(active.HasValue());
+  auto issue = *claim;
+  issue.id[0] = std::byte{2};
+  issue.action = AccountSessionAction::kIssueRecovery;
+  issue.claim_checkout.reset();
+  issue.expected_version = active->version;
+  issue.recovery.credential_hash[0] = std::byte{7};
+  issue.recovery.entity_dbid = claim->account_dbid;
+  issue.recovery.entity_type_id = claim->account_type_id;
+  auto issued = UpdateSession(db, issue);
+  ASSERT_TRUE(issued.HasValue());
+  Result<void> released{Error{ErrorCode::kInternalError}};
+  db.ReleaseCheckout(claim->account_dbid, claim->account_type_id, *claim->claim_checkout,
+                     [&](Result<void> value) { released = std::move(value); });
+  ASSERT_TRUE(released.HasValue());
+  CheckoutInfo owner{Address(0x7F000001u, 32000), 8, 200, 0, 202};
+  GetResult checked_out;
+  db.CheckoutEntity(claim->account_dbid, claim->account_type_id, owner,
+                    [&](GetResult value) { checked_out = std::move(value); });
+  ASSERT_TRUE(checked_out.success);
+  owner.ownership_version = checked_out.checkout_version;
+  auto recover = issue;
+  recover.id[0] = std::byte{3};
+  recover.action = AccountSessionAction::kClaimRecovery;
+  recover.actor = {owner.base_addr, owner.entity_id, owner.process_instance};
+  recover.expected_version = issued->version;
+  recover.claim_checkout = owner;
+  recover.recovery_checkout = owner;
+  recover.recovery_proof = issue.recovery.credential_hash;
+  recover.recovery.credential_hash[0] = std::byte{8};
+  auto uncertain = UpdateSession(db, recover);
+  ASSERT_FALSE(uncertain.HasValue());
+  EXPECT_EQ(uncertain.Error().Code(), ErrorCode::kPermissionDenied);
+  Result<int> retired{Error{ErrorCode::kInternalError}};
+  db.RetireCheckoutProcess(claim->actor.base_addr, claim->actor.process_instance,
+                           [&](Result<int> value) { retired = std::move(value); });
+  ASSERT_TRUE(retired.HasValue());
+  auto wrong_checkout = recover;
+  wrong_checkout.recovery_checkout->ownership_version++;
+  EXPECT_FALSE(UpdateSession(db, wrong_checkout).HasValue());
+  auto recovered = UpdateSession(db, recover);
+  ASSERT_TRUE(recovered.HasValue()) << recovered.Error().Message();
+  EXPECT_EQ(recovered->owner, recover.actor);
+  EXPECT_EQ(recovered->recovery.credential_hash, recover.recovery.credential_hash);
+  auto retry = UpdateSession(db, recover);
+  ASSERT_TRUE(retry.HasValue());
+  EXPECT_EQ(*retry, *recovered);
+  auto replay = recover;
+  replay.id[0] = std::byte{4};
+  replay.expected_version = recovered->version;
+  replay.recovery.credential_hash[0] = std::byte{9};
+  EXPECT_FALSE(UpdateSession(db, replay).HasValue());
 }
 
 inline void CheckRetiredSessionReplay(IDatabase& db) {

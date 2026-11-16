@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -25,6 +26,16 @@ using atlas::test::FakeCluster;
 namespace atlas::net_client {
 
 struct ClientSessionTestAccess {
+  static void LogoutReply(ClientSession& session, Channel* channel,
+                          const baseapp::ClientLogoutResult& reply) {
+    session.OnLogoutResult(channel, reply);
+  }
+  static void SetRecoveryOwner(ClientSession& session, EntityID entity_id,
+                               const RecoveryCredential& credential) {
+    session.state_ = ATLAS_NET_STATE_CONNECTED;
+    session.player_entity_id_ = entity_id;
+    session.recovery_credential_ = credential;
+  }
   static void FillSendWindow(ClientSession& session, const Address& address, bool authenticate) {
     auto channel = session.network_.ConnectRudp(address);
     ASSERT_TRUE(channel);
@@ -186,6 +197,169 @@ TEST(NetClientFlow, ServerMessagesRequireBoundBaseAppChannel) {
   EXPECT_EQ(deliveries, 3);
   net_client::ClientSessionTestAccess::Clear(session);
   counter = nullptr;
+}
+
+TEST(NetClientFlow, RecoveryUpdatesRequireTheBoundChannelEntityAndAccount) {
+  EventDispatcher dispatcher("recovery_source");
+  NetworkInterface network(dispatcher);
+  auto expected = network.ConnectRudp(Address("127.0.0.1", 31001));
+  auto wrong = network.ConnectRudp(Address("127.0.0.1", 31002));
+  ASSERT_TRUE(expected && wrong);
+  net_client::ClientSession session;
+  auto& table = net_client::ClientSessionTestAccess::Setup(session, *expected);
+  RecoveryCredential original{42, 7, {}, 1000000};
+  original.value[0] = std::byte{1};
+  net_client::ClientSessionTestAccess::SetRecoveryOwner(session, 100, original);
+  baseapp::RecoveryCredentialUpdate update{100, original};
+  update.credential.value[0] = std::byte{3};
+  auto dispatch = [&](Channel* channel) {
+    BinaryWriter writer;
+    update.Serialize(writer);
+    BinaryReader reader(writer.Data());
+    ASSERT_TRUE(table.Dispatch({}, channel, update.Descriptor().id, reader));
+  };
+  AtlasRecoveryCredential credential{};
+  dispatch(*wrong);
+  dispatch(nullptr);
+  ASSERT_EQ(session.GetRecoveryCredential(&credential), ATLAS_NET_OK);
+  EXPECT_EQ(credential.value[0], 1);
+  update.entity_id++;
+  dispatch(*expected);
+  update.entity_id--;
+  update.credential.account_dbid++;
+  dispatch(*expected);
+  ASSERT_EQ(session.GetRecoveryCredential(&credential), ATLAS_NET_OK);
+  EXPECT_EQ(credential.value[0], 1);
+  update.credential.account_dbid--;
+  dispatch(*expected);
+  ASSERT_EQ(session.GetRecoveryCredential(&credential), ATLAS_NET_OK);
+  EXPECT_EQ(credential.value[0], 3);
+  EXPECT_EQ(session.Disconnect(ATLAS_DISCONNECT_INTERNAL), ATLAS_NET_OK);
+  EXPECT_EQ(session.GetRecoveryCredential(&credential), ATLAS_NET_OK);
+  EXPECT_EQ(session.Disconnect(ATLAS_DISCONNECT_LOGOUT), ATLAS_NET_OK);
+  EXPECT_EQ(session.GetRecoveryCredential(&credential), ATLAS_NET_ERR_NOCONN);
+}
+
+TEST(NetClientFlow, RecoveryCredentialCrossesSdkBoundaryAndRotatesAfterResume) {
+  FakeCluster cluster;
+  RecoveryCredential initial{42, 7, {}, 601000};
+  auto random = SessionKey::Generate();
+  ASSERT_TRUE(random);
+  std::memcpy(initial.value.data(), random->bytes, 32);
+  cluster.SetRecoveryCredential(initial);
+  ASSERT_TRUE(cluster.Start());
+  auto* context = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(context, nullptr);
+  auto destroy =
+      std::unique_ptr<AtlasNetContext, decltype(&AtlasNetDestroy)>(context, AtlasNetDestroy);
+  LoginCallbackState login;
+  ASSERT_EQ(AtlasNetLogin(context, "127.0.0.1", cluster.LoginAppPort(), "recovery-test",
+                          "<test-password>", &LoginCallback, &login),
+            ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return login.done.load(); }));
+  AuthCallbackState auth;
+  ASSERT_EQ(AtlasNetAuthenticate(context, &AuthCallback, &auth), ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return auth.done.load(); }));
+  ASSERT_TRUE(auth.success);
+  AtlasRecoveryCredential old{};
+  ASSERT_EQ(AtlasNetGetRecoveryCredential(context, &old), ATLAS_NET_OK);
+  EXPECT_EQ(old.account_dbid, 42);
+  ASSERT_EQ(AtlasNetDisconnect(context, ATLAS_DISCONNECT_INTERNAL), ATLAS_NET_OK);
+  login.done = false;
+  ASSERT_EQ(
+      AtlasNetResume(context, "127.0.0.1", cluster.LoginAppPort(), &old, &LoginCallback, &login),
+      ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return login.done.load(); }));
+  ASSERT_EQ(login.status, ATLAS_LOGIN_SUCCESS);
+  auth.done = false;
+  ASSERT_EQ(AtlasNetAuthenticate(context, &AuthCallback, &auth), ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return auth.done.load(); }));
+  ASSERT_TRUE(auth.success);
+  AtlasRecoveryCredential rotated{};
+  ASSERT_EQ(AtlasNetGetRecoveryCredential(context, &rotated), ATLAS_NET_OK);
+  EXPECT_NE(std::memcmp(old.value, rotated.value, 32), 0);
+  ASSERT_EQ(AtlasNetDisconnect(context, ATLAS_DISCONNECT_INTERNAL), ATLAS_NET_OK);
+  login.done = false;
+  ASSERT_EQ(
+      AtlasNetResume(context, "127.0.0.1", cluster.LoginAppPort(), &old, &LoginCallback, &login),
+      ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return login.done.load(); }));
+  EXPECT_EQ(login.status, ATLAS_LOGIN_INVALID_CREDENTIALS);
+}
+
+TEST(NetClientFlow, LoginRejectionCallbackCanQueueAnotherLoginWithoutReusingTheConnection) {
+  FakeCluster cluster;
+  cluster.SetLoginPolicy(atlas::test::LoginPolicy::kRejectInvalidCreds);
+  ASSERT_TRUE(cluster.Start());
+  auto* context = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(context, nullptr);
+  auto destroy =
+      std::unique_ptr<AtlasNetContext, decltype(&AtlasNetDestroy)>(context, AtlasNetDestroy);
+  struct Attempt {
+    AtlasNetContext* context;
+    uint16_t port;
+    int replies{0};
+    AtlasLoginResultFn callback{nullptr};
+  } attempt{context, cluster.LoginAppPort()};
+  attempt.callback = +[](void* data, uint8_t status, const char*, uint16_t, const char*) {
+    auto& attempt = *static_cast<Attempt*>(data);
+    EXPECT_EQ(status, ATLAS_LOGIN_INVALID_CREDENTIALS);
+    if (++attempt.replies < 3) {
+      EXPECT_EQ(AtlasNetLogin(attempt.context, "127.0.0.1", attempt.port, "rejected-account",
+                              "<test-password>", attempt.callback, &attempt),
+                ATLAS_NET_OK);
+    }
+  };
+  ASSERT_EQ(AtlasNetLogin(context, "127.0.0.1", attempt.port, "rejected-account", "<test-password>",
+                          attempt.callback, &attempt),
+            ATLAS_NET_OK);
+  ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), context,
+                        [&] { return attempt.replies == 3; }));
+  EXPECT_EQ(AtlasNetGetState(context), ATLAS_NET_STATE_DISCONNECTED);
+}
+
+TEST(NetClientFlow, LogoutWaitsForMatchingReplyAndCompletesOnlyOnce) {
+  EventDispatcher dispatcher;
+  NetworkInterface network(dispatcher);
+  auto expected = network.ConnectRudp(Address("127.0.0.1", 31001));
+  auto wrong = network.ConnectRudp(Address("127.0.0.1", 31002));
+  ASSERT_TRUE(expected);
+  ASSERT_TRUE(wrong);
+  net_client::ClientSession session;
+  ASSERT_EQ(session.SetCallbacks(AtlasNetCallbacks{}), ATLAS_NET_OK);
+  RecoveryCredential credential{42, 7, {}, 1000000};
+  credential.value[0] = std::byte{1};
+  net_client::ClientSessionTestAccess::Setup(session, *expected);
+  net_client::ClientSessionTestAccess::SetRecoveryOwner(session, 100, credential);
+  int calls = 0;
+  ASSERT_EQ(session.StartLogout(
+                +[](void* data, uint8_t success, const char*) {
+                  EXPECT_EQ(success, 1);
+                  ++*static_cast<int*>(data);
+                },
+                &calls),
+            ATLAS_NET_OK);
+  EXPECT_EQ(session.GetState(), ATLAS_NET_STATE_CONNECTED);
+  EXPECT_EQ(session.StartLogout(nullptr, nullptr), ATLAS_NET_ERR_BUSY);
+  baseapp::ClientLogoutResult reply;
+  reply.request_id = 1;
+  net_client::ClientSessionTestAccess::LogoutReply(session, *wrong, reply);
+  reply.request_id = 2;
+  net_client::ClientSessionTestAccess::LogoutReply(session, *expected, reply);
+  EXPECT_EQ(calls, 0);
+  reply.request_id = 1;
+  net_client::ClientSessionTestAccess::LogoutReply(session, *expected, reply);
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(session.GetState(), ATLAS_NET_STATE_DISCONNECTED);
+  AtlasRecoveryCredential cached{};
+  EXPECT_EQ(session.GetRecoveryCredential(&cached), ATLAS_NET_ERR_NOCONN);
+  net_client::ClientSessionTestAccess::LogoutReply(session, *expected, reply);
+  EXPECT_EQ(calls, 1);
 }
 
 TEST(NetClientFlow, LoginAndAuthenticateRejectFullSendWindowBeforeWaiting) {
@@ -543,9 +717,19 @@ TEST(NetClientFlow, DestroyFromLogoutCallbackCompletesOuterDisconnect) {
   ASSERT_TRUE(PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx,
                         [&] { return auth.done.load(); }));
   AtlasNetCallbacks callbacks{};
-  callbacks.on_disconnect = +[](AtlasNetContext* context, int32_t) { AtlasNetDestroy(context); };
+  bool completed = false;
+  static bool* destroyed;
+  destroyed = &completed;
+  callbacks.on_disconnect = +[](AtlasNetContext* context, int32_t) {
+    *destroyed = true;
+    AtlasNetDestroy(context);
+  };
   ASSERT_EQ(AtlasNetSetCallbacks(ctx, &callbacks), ATLAS_NET_OK);
   EXPECT_EQ(AtlasNetDisconnect(ctx, ATLAS_DISCONNECT_LOGOUT), ATLAS_NET_OK);
+  const bool received =
+      PumpUntil(cluster.LoginAppDisp(), cluster.BaseAppDisp(), ctx, [&] { return completed; });
+  if (!received) AtlasNetDestroy(ctx);
+  EXPECT_TRUE(received);
 }
 
 TEST(NetClientFlow, DisconnectDuringAuthCallbackRejectsFurtherSends) {

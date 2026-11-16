@@ -42,7 +42,7 @@ auto BaseApp::PendingShutdownOperations() const -> std::size_t {
          pending_entity_checkouts_.size() + canceled_checkouts_.size() + pending_logins_.size() +
          pending_force_logoffs_.size() + prepared_login_entities_.size() +
          login_session_checks_.size() + incoming_client_handoffs_.size() + session_revocations_ +
-         destroy_ack_waiters_.size() + pending_space_creates_.size();
+         session_recoveries_ + destroy_ack_waiters_.size() + pending_space_creates_.size();
 }
 
 void BaseApp::LogShutdownPending() const {
@@ -53,6 +53,15 @@ void BaseApp::LogShutdownPending() const {
       "BaseApp: shutdown writes={} logoffs={} checkins={} checkouts={} rpc_waits={}",
       pending_write_to_db_.size(), pending_logoff_writes_.size(), pending_checkins_.size(),
       pending_entity_checkouts_.size() + canceled_checkouts_.size(), rpc_registry_.PendingCount());
+  ATLAS_LOG_ERROR(
+      "BaseApp: shutdown recoveries={} revocations={} login_checks={} handoffs={} prepared={} "
+      "destroy_waits={} space_waits={}",
+      session_recoveries_, session_revocations_, login_session_checks_.size(),
+      incoming_client_handoffs_.size(), prepared_login_entities_.size(),
+      destroy_ack_waiters_.size(), pending_space_creates_.size());
+  ATLAS_LOG_ERROR("BaseApp: shutdown app_pending={} client_sends={} rpc_replies={} saves={}",
+                  ServerApp::PendingShutdownOperations(), external_network_.PendingSendCount(),
+                  rpc_registry_.ReplyCount(), shutdown_saves_.size());
 }
 
 void BaseApp::FinishShutdownSave(EntityID entity_id, bool success, std::string_view error) {

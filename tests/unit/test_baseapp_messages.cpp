@@ -15,6 +15,39 @@
 using namespace atlas;
 using namespace atlas::baseapp;
 
+TEST(BaseAppMessages, LogoutMessagesValidateIdsStatusAndPayloadBoundaries) {
+  ClientLogout request{(uint64_t{1} << 40) + 1, 42};
+  BinaryWriter writer;
+  request.Serialize(writer);
+  BinaryReader valid(writer.Data());
+  auto parsed = ClientLogout::Deserialize(valid);
+  ASSERT_TRUE(parsed);
+  EXPECT_EQ(parsed->request_id, request.request_id);
+  for (size_t length = 0; length < writer.Data().size(); ++length) {
+    BinaryReader reader(writer.Data().first(length));
+    EXPECT_FALSE(ClientLogout::Deserialize(reader));
+  }
+  writer.Write(uint8_t{1});
+  BinaryReader trailing(writer.Data());
+  EXPECT_FALSE(ClientLogout::Deserialize(trailing));
+  ClientLogoutResult reply{request.request_id, ErrorCode::kCommitUnknown, "unconfirmed"};
+  BinaryWriter response;
+  reply.Serialize(response);
+  BinaryReader response_reader(response.Data());
+  auto decoded = ClientLogoutResult::Deserialize(response_reader);
+  ASSERT_TRUE(decoded);
+  EXPECT_EQ(decoded->status, reply.status);
+  for (size_t length = 0; length < response.Data().size(); ++length) {
+    BinaryReader reader(response.Data().first(length));
+    EXPECT_FALSE(ClientLogoutResult::Deserialize(reader));
+  }
+  reply.status = static_cast<ErrorCode>(65535);
+  BinaryWriter invalid;
+  reply.Serialize(invalid);
+  BinaryReader invalid_reader(invalid.Data());
+  EXPECT_FALSE(ClientLogoutResult::Deserialize(invalid_reader));
+}
+
 TEST(BaseAppMessages, ClientHandoffRejectsEmptyCredentialsAndMalformedDestinations) {
   ClientHandoff request;
   request.target = {Address("127.0.0.1", 25002), 55, 222};
@@ -46,6 +79,7 @@ TEST(BaseAppMessages, AuthenticationCapabilityAndProcessIdentityAreStrict) {
   Authenticate request;
   request.session_key.bytes[0] = 1;
   request.supports_handoff = true;
+  request.supports_recovery = true;
   BinaryWriter writer;
   request.Serialize(writer);
   EXPECT_EQ(writer.Data().size(), static_cast<std::size_t>(request.Descriptor().fixed_length));
@@ -53,6 +87,7 @@ TEST(BaseAppMessages, AuthenticationCapabilityAndProcessIdentityAreStrict) {
   auto parsed = Authenticate::Deserialize(input);
   ASSERT_TRUE(parsed.HasValue());
   EXPECT_TRUE(parsed->supports_handoff);
+  EXPECT_TRUE(parsed->supports_recovery);
   auto bytes = writer.Detach();
   bytes.back() = std::byte{2};
   BinaryReader invalid(bytes);
@@ -62,6 +97,8 @@ TEST(BaseAppMessages, AuthenticationCapabilityAndProcessIdentityAreStrict) {
   reply.entity_id = 55;
   reply.type_id = 7;
   reply.process_instance = (uint64_t{1} << 40) + 222;
+  reply.recovery = RecoveryCredential{42, 7, {}, 1000000};
+  reply.recovery.value[0] = std::byte{3};
   BinaryWriter result;
   reply.Serialize(result);
   for (std::size_t length = 0; length < result.Data().size(); ++length) {
@@ -72,6 +109,7 @@ TEST(BaseAppMessages, AuthenticationCapabilityAndProcessIdentityAreStrict) {
   auto identity = AuthenticateResult::Deserialize(reader);
   ASSERT_TRUE(identity.HasValue());
   EXPECT_EQ(identity->process_instance, reply.process_instance);
+  EXPECT_EQ(identity->recovery, reply.recovery);
   result.Write(uint8_t{1});
   BinaryReader trailing(result.Data());
   EXPECT_FALSE(AuthenticateResult::Deserialize(trailing).HasValue());

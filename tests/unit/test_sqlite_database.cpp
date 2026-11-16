@@ -198,6 +198,10 @@ TEST_F(SqliteDatabaseTest, AccountSessionOwnershipContract) {
   atlas::test_support::CheckAccountSessionContract(db_);
 }
 
+TEST_F(SqliteDatabaseTest, SessionRecoveryClaimRequiresConfirmedRetirementAndCheckouts) {
+  atlas::test_support::CheckSessionRecoveryClaim(db_);
+}
+
 TEST_F(SqliteDatabaseTest, SessionClaimAcceptsAProcessCheckoutBeforeEntityAllocation) {
   auto claim = atlas::test_support::CreateSessionAccount(db_, 0);
   ASSERT_TRUE(claim.HasValue());

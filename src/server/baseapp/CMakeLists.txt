@@ -6,6 +6,8 @@ add_library(atlas_baseapp_lib STATIC
   shutdown.cc
   account_session.cc
   session_revocation.cc
+  session_recovery.cc
+  recovery_load.cc
   client_handoff.cc
   outgoing_client_handoff.cc
   baseapp_native_provider.cc

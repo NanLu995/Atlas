@@ -113,7 +113,7 @@ Database admission is limited to 4,096 operations, including callbacks waiting f
 Capacity rejection precedes execution (`RateLimited` / `kOverloaded`); draining rejects new work
 as `ReceiverGone` / `kStopping`. `BeginDrain` and `PendingOperations` expose this lifecycle.
 Checkout cleanup and automatic-load APIs return `Result` callbacks, including setters, so backend
-errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV3`.
+errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV4`.
 Immediate reliable UDP sends obey the configured send window. Deferred bundles retain at most
 256 KiB per channel and reliability class; full admission returns `WouldBlock` without appending.
 RPC calls distinguish capacity rejection (`RateLimited`), duplicate requests (`AlreadyExists`)
@@ -398,6 +398,7 @@ C# cluster fixture starts and stops the processes; no Godot installation is requ
 
 ```bash
 dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedName~RpcMailboxRealTests
+dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter FullyQualifiedName~SessionRecoveryRealTests
 ```
 
 This covers Client→Base and Client→Cell replies, Base→Cell and Cell→Base calls,
@@ -517,7 +518,7 @@ cursor after restart. Backups must retain all three sources; this does not provi
 from arbitrarily removed metadata or make raw backend deletion an ID reclamation operation.
 Concurrent MySQL startup serializes schema initialization with a database-scoped advisory lock.
 Both backends initialize only empty databases. Existing databases must have the matching
-`schema_version` (currently 2); missing or incompatible metadata rejects startup without
+`schema_version` (currently 3); missing or incompatible metadata rejects startup without
 overwriting the version or upgrading the schema. Rebuild matching processes and use a new
 isolated database; no old-format migration is provided. SQLite initializes its schema and
 metadata in one transaction. Interrupted MySQL DDL may leave an incomplete database, which
@@ -539,6 +540,39 @@ BaseApp also refuses checkout completion if definitions changed while it was wai
 Inline synchronized components carry their type name and flattened fields in the entity slot
 descriptor instead of requiring a global component ID. Their fields and nested types participate
 in both storage and definition validation; local components remain outside snapshot persistence.
+Account-session payload version 2 stores recovery credential digests, controlled entity storage
+identity and expiry. Grant issuance, consumption with rotation, and revocation share the ownership/version and
+operation receipt transaction. An expired grant or a replay with a new operation ID is rejected;
+a retry of the same confirmed operation returns its recorded result. Digest comparison uses
+the existing OpenSSL constant-time primitive. Issuance expires after ten minutes using MySQL server time or the SQLite
+host clock; clients cannot supply the expiry. Release or control ownership changes revoke grants.
+A crash recovery claim additionally requires confirmed retirement of the old process and current
+checkouts of both the account and persistent controlled entity in the claiming process. Missing
+retirement or stale checkout versions refuse the claim; temporary entities cannot be claimed.
+The native SDK ABI 3.2 adds `AtlasNetGetRecoveryCredential`, `AtlasNetResume` and
+`AtlasNetLogout`; desktop C# exposes `GetRecoveryCredential()`, `ResumeAsync()` and
+`LogoutAsync()`. After a transport loss, keep the credential in memory, call resume against
+LoginApp, then authenticate against the returned BaseApp as with ordinary login.
+LoginApp must have a nonzero `--internal-port` matching its registered cluster endpoint;
+resume requests from an unregistered source address or process instance are refused. The
+`test_cluster` launcher assigns this port explicitly. Its public DTLS port remains separate. A successful
+resume consumes and rotates the credential before returning a new connection key. A live
+owner reuses its entity; a confirmed retired owner restores the persistent identity through
+checkout and the existing snapshot loader. Runtime EntityIDs may change. A temporary entity
+cannot recover after its process dies. A valid checkout held elsewhere is not stolen.
+When a controlled temporary entity is first saved, its confirmed DBID is bound to a new
+recovery grant and delivered to the connected client. Save confirmation alone does not confirm
+delivery of that grant; retain the latest credential received by the SDK.
+Logout success means database revocation was confirmed; timeout or transport loss reports an
+unconfirmed result. `Disconnect(Logout)` queues that same exchange; keep polling for its result.
+Credentials expire ten minutes after issuance; fetching a cached credential does not renew it.
+Do not log credentials or persist them in ordinary configuration. Password reauthentication,
+logout and a change of controlled entity invalidate the previous credential.
+Protocol version 2, storage schema 3 and database plugin ABI V4 require matching rebuilt
+processes and an isolated new database; no migration is provided.
+`SessionRecoveryRealTests` requires MySQL and covers live and crashed owners, transferred control,
+persistent target restoration, temporary target refusal, credential rotation and logout revocation.
+SQLite smoke tests do not replace it.
 
 Transaction commit failures report an uncertain outcome rather than success. SQLite
 batch callbacks wait for the transaction result. Checkout distinguishes missing entities
@@ -652,7 +686,7 @@ and ownership version; success is returned after database confirmation. An unava
 changed version or uncertain commit rejects this login instead of assuming the session is offline.
 Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
 login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
-Database plugins must export `AtlasCreateDatabaseV3`; rebuild both plugins and the server.
+Database plugins must export `AtlasCreateDatabaseV4`; rebuild both plugins and the server.
 The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
 Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
 tracks peer process instances even for death-only subscriptions: a new instance at the same
@@ -1004,7 +1038,7 @@ confirmation releases the source binding. Rejection restores input only after a 
 database abort; an unknown outcome keeps the source frozen. The account entity and its checkout
 stay at the source, and neither source nor target entities are implicitly destroyed.
 
-The native SDK (`atlas_net_client`, C ABI `0x03000000`) supports this switch for Godot and other
+The native SDK (`atlas_net_client`, C ABI `0x03020000`) supports this switch for Godot and other
 DLL hosts. It clears old entities, space data and RPC waits, rejects sends during `Handoff`,
 verifies the target channel, entity and process identity, and delivers `EntityTransferred`
 before `CellReady`. A failed or
@@ -1015,7 +1049,7 @@ preparation. Rebuild all SDKs and servers together for the authentication layout
 Remote script waits allow 40 seconds; cancelling that wait does not undo remote execution.
 RUDP interfaces do not share bound endpoints; binding an endpoint already owned by another
 RUDP interface fails with `AddressInUse`, including explicit client source-port bindings.
-TCP frames and UDP/RUDP datagrams use connection protocol version 1, prefixed by `ATLS` and
+TCP frames and UDP/RUDP datagrams use connection protocol version 2, prefixed by `ATLS` and
 a little-endian 16-bit version. TCP then carries its 32-bit payload length; UDP/RUDP retain
 their existing payload/header after the prefix. Incompatible TCP peers are disconnected;
 incompatible or truncated datagrams are dropped before a peer channel is allocated. RUDP MTU

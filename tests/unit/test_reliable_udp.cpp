@@ -67,6 +67,28 @@ class ReliableUdpTest : public ::testing::Test {
   }
 };
 
+TEST_F(ReliableUdpTest, ClosingFromDeliveryAcknowledgesReceiptBeforeDelayedAckIsCancelled) {
+  auto sender_socket = Socket::CreateUdp();
+  auto receiver_socket = Socket::CreateUdp();
+  ASSERT_TRUE(sender_socket && receiver_socket);
+  ASSERT_TRUE(sender_socket->Bind(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(receiver_socket->Bind(Address("127.0.0.1", 0)));
+  ReliableUdpChannel sender(dispatcher_, table_, *sender_socket,
+                            receiver_socket->LocalAddress().Value());
+  ReliableUdpChannel receiver(dispatcher_, table_, *receiver_socket,
+                              sender_socket->LocalAddress().Value());
+  sender.Activate();
+  receiver.Activate();
+  ASSERT_TRUE(table_.RegisterTypedHandler<RudpTestMsg>(
+      [&](const Address&, Channel*, const RudpTestMsg&) { receiver.Condemn(); }));
+  ASSERT_TRUE(sender.SendMessage(RudpTestMsg{42}));
+  EXPECT_EQ(sender.UnackedCount(), 1u);
+  pump_datagrams(*receiver_socket, receiver);
+  pump_datagrams(*sender_socket, sender);
+  EXPECT_EQ(sender.UnackedCount(), 0u);
+  dispatcher_.ProcessOnce();
+}
+
 TEST_F(ReliableUdpTest, ReliableSendAndReceive) {
   auto sock_a = Socket::CreateUdp();
   ASSERT_TRUE(sock_a.HasValue());

@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include "coro/fire_and_forget.h"
+#include "server/await_machined_query.h"
 #include "server/common_messages.h"
 #include "server/server_app.h"
 #include "test_null_channel.h"
@@ -484,6 +486,45 @@ class MachinedSourceTest : public ::testing::Test {
                     .HasValue());
   }
 };
+
+TEST_F(MachinedSourceTest, AwaitedRegistryQueryHandlesInlineCancellationAndLateCompletion) {
+  CancellationSource cancel;
+  uint32_t calls = 0;
+  auto run = [&]() -> FireAndForget {
+    auto result = co_await AwaitMachinedQuery(client_, ProcessType::kBaseApp, cancel.Token());
+    EXPECT_FALSE(result);
+    if (!result) {
+      EXPECT_EQ(result.Error().Code(), ErrorCode::kCancelled);
+    }
+    ++calls;
+  };
+  run();
+  EXPECT_EQ(calls, 0u);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 1u);
+  cancel.RequestCancellation();
+  EXPECT_EQ(calls, 1u);
+  MachinedClientTestAccess::ExpireQueries(client_);
+  client_.Tick();
+  EXPECT_EQ(calls, 1u);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+  run();
+  EXPECT_EQ(calls, 2u);
+  EXPECT_EQ(MachinedClientTestAccess::PendingQueries(client_), 0u);
+}
+
+TEST(ServerApp, AwaitedRegistryQueryCompletesInlineWhenDisconnected) {
+  EventDispatcher dispatcher;
+  NetworkInterface network(dispatcher);
+  MachinedClient client(dispatcher, network);
+  bool completed = false;
+  auto run = [&]() -> FireAndForget {
+    auto result = co_await AwaitMachinedQuery(client, ProcessType::kBaseApp);
+    EXPECT_FALSE(result);
+    completed = true;
+  };
+  run();
+  EXPECT_TRUE(completed);
+}
 
 TEST_F(MachinedSourceTest, QueryResponseRequiresCurrentMachinedChannel) {
   uint32_t calls = 0;

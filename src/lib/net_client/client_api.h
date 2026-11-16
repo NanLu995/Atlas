@@ -12,8 +12,8 @@ extern "C" {
 #endif
 
 // ABI layout: [MAJOR:8][MINOR:8][PATCH:16]; Create rejects major mismatch or newer caller minor.
-// 3.1 adds explicit DTLS configuration for public RUDP.
-#define ATLAS_NET_ABI_VERSION 0x03010000u
+// 3.2 adds session recovery credentials and resume requests.
+#define ATLAS_NET_ABI_VERSION 0x03020000u
 
 #define ATLAS_NET_OK 0
 #define ATLAS_NET_ERR_BUSY -16
@@ -76,11 +76,31 @@ typedef void (*AtlasLoginResultFn)(void* user_data, uint8_t status, const char* 
 typedef void (*AtlasAuthResultFn)(void* user_data, uint8_t success, uint32_t entity_id,
                                   uint16_t type_id, const char* error_message);
 
+typedef struct AtlasRecoveryCredential {
+  int64_t account_dbid;
+  uint16_t account_type_id;
+  uint8_t value[32];
+  int64_t expires_at_ms;
+} AtlasRecoveryCredential;
+
+// Copies a secret; callers must not log it or put it in ordinary configuration files.
+ATLAS_NET_API int32_t AtlasNetGetRecoveryCredential(AtlasNetContext* ctx,
+                                                    AtlasRecoveryCredential* credential);
+
 // Legal only in DISCONNECTED. Result delivered from a future Poll.
 ATLAS_NET_API int32_t AtlasNetLogin(AtlasNetContext* ctx, const char* loginapp_host,
                                     uint16_t loginapp_port, const char* username,
                                     const char* password_hash, AtlasLoginResultFn callback,
                                     void* user_data);
+
+ATLAS_NET_API int32_t AtlasNetResume(AtlasNetContext* ctx, const char* loginapp_host,
+                                     uint16_t loginapp_port,
+                                     const AtlasRecoveryCredential* credential,
+                                     AtlasLoginResultFn callback, void* user_data);
+
+typedef void (*AtlasLogoutResultFn)(void* user_data, uint8_t success, const char* error);
+ATLAS_NET_API int32_t AtlasNetLogout(AtlasNetContext* ctx, AtlasLogoutResultFn callback,
+                                     void* user_data);
 
 // 32-byte SHA-256 stamped onto every LoginRequest; BaseApp rejects
 // mismatched .def builds. Pass Atlas.Rpc.EntityDefDigest.Bytes once.

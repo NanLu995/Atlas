@@ -7,6 +7,7 @@ add_library(atlas_platform STATIC
   io_poller.cc
   io_poller_select.cc
   password_hash.cc
+  secure_digest.cc
   signal_handler.cc
   threading.cc
 )

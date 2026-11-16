@@ -42,6 +42,7 @@ class FakeCluster {
 
   void SetLoginPolicy(LoginPolicy policy) { login_policy_ = policy; }
   void SetAuthPolicy(AuthPolicy policy) { auth_policy_ = policy; }
+  void SetRecoveryCredential(RecoveryCredential credential) { recovery_ = credential; }
 
   EventDispatcher& LoginAppDisp() { return disp_loginapp_; }
   EventDispatcher& BaseAppDisp() { return disp_baseapp_; }
@@ -82,6 +83,7 @@ class FakeCluster {
 
   LoginPolicy login_policy_{LoginPolicy::kAccept};
   AuthPolicy auth_policy_{AuthPolicy::kAccept};
+  RecoveryCredential recovery_;
 
   std::atomic<bool> login_request_seen_{false};
   std::atomic<bool> authenticate_request_seen_{false};

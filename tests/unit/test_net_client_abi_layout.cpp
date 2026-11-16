@@ -33,6 +33,9 @@ static_assert(offsetof(AtlasMovementStateFrame, flags) == 36);
 static_assert(offsetof(AtlasMovementStateFrame, last_processed_input_seq) == 40);
 
 static_assert(sizeof(AtlasNetStats) == 24);
+static_assert(sizeof(AtlasRecoveryCredential) == 56);
+static_assert(offsetof(AtlasRecoveryCredential, value) == 10);
+static_assert(offsetof(AtlasRecoveryCredential, expires_at_ms) == 48);
 static_assert(offsetof(AtlasNetStats, rtt_ms) == 0);
 static_assert(offsetof(AtlasNetStats, bytes_sent) == 4);
 static_assert(offsetof(AtlasNetStats, bytes_recv) == 8);
@@ -42,6 +45,19 @@ static_assert(offsetof(AtlasNetStats, loss_rate) == 20);
 
 TEST(NetClientAbi, VersionMatchesHeaderConstant) {
   EXPECT_EQ(AtlasNetGetAbiVersion(), ATLAS_NET_ABI_VERSION);
+}
+
+TEST(NetClientAbi, MissingRecoveryCredentialClearsTheOutput) {
+  EXPECT_EQ(AtlasNetGetRecoveryCredential(nullptr, nullptr), ATLAS_NET_ERR_INVAL);
+  auto* ctx = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(ctx, nullptr);
+  AtlasRecoveryCredential credential{};
+  credential.value[0] = 7;
+  EXPECT_EQ(AtlasNetGetRecoveryCredential(ctx, nullptr), ATLAS_NET_ERR_INVAL);
+  EXPECT_EQ(AtlasNetGetRecoveryCredential(ctx, &credential), ATLAS_NET_ERR_NOCONN);
+  EXPECT_EQ(credential.account_dbid, 0);
+  EXPECT_EQ(credential.value[0], 0);
+  AtlasNetDestroy(ctx);
 }
 
 TEST(NetClientAbi, CreateRejectsMajorMismatch) {
@@ -261,6 +277,20 @@ TEST(NetClientAbi, MovementPredictStepMatchesServerMotorSequence) {
   }
 
   EXPECT_EQ(api_state.last_processed_input_seq, 10000u);
+}
+
+TEST(NetClientAbi, RecoveryEntryPointsRejectMissingContextOrCredential) {
+  EXPECT_EQ(AtlasNetResume(nullptr, "127.0.0.1", 20000, nullptr, nullptr, nullptr),
+            ATLAS_NET_ERR_INVAL);
+  EXPECT_EQ(AtlasNetLogout(nullptr, nullptr, nullptr), ATLAS_NET_ERR_INVAL);
+  auto* context = AtlasNetCreate(ATLAS_NET_ABI_VERSION);
+  ASSERT_NE(context, nullptr);
+  AtlasRecoveryCredential credential{};
+  EXPECT_EQ(AtlasNetResume(context, "127.0.0.1", 20000, &credential, nullptr, nullptr),
+            ATLAS_NET_ERR_INVAL);
+  EXPECT_EQ(AtlasNetLogout(context, nullptr, nullptr), ATLAS_NET_ERR_NOCONN);
+  EXPECT_EQ(AtlasNetGetState(context), ATLAS_NET_STATE_DISCONNECTED);
+  AtlasNetDestroy(context);
 }
 
 TEST(NetClientAbi, MovementPredictStepRejectsNonFiniteState) {

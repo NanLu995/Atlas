@@ -338,6 +338,10 @@ TEST_F(MysqlDatabaseTest, AccountSessionOwnershipContract) {
   atlas::test_support::CheckAccountSessionContract(db_);
 }
 
+TEST_F(MysqlDatabaseTest, SessionRecoveryClaimRequiresConfirmedRetirementAndCheckouts) {
+  atlas::test_support::CheckSessionRecoveryClaim(db_);
+}
+
 TEST_F(MysqlDatabaseTest, SessionClaimAcceptsAProcessCheckoutBeforeEntityAllocation) {
   auto claim = atlas::test_support::CreateSessionAccount(db_, 0);
   ASSERT_TRUE(claim.HasValue());

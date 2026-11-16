@@ -14,6 +14,7 @@ namespace {
 auto Uses64BitRequestId(MessageID id) -> bool {
   return id == msg_id::Id(msg_id::Common::kEntityRpcReply) ||
          id == msg_id::Id(msg_id::DBApp::kAccountSessionReply) ||
+         id == msg_id::Id(msg_id::Login::kPrepareResumeResult) ||
          id == msg_id::Id(msg_id::BaseApp::kRevokeAccountSessionReply) ||
          id == msg_id::Id(msg_id::BaseApp::kPrepareClientHandoffReply);
 }
