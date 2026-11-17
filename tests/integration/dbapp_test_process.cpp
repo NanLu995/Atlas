@@ -25,11 +25,12 @@ class DatabaseProcess final : public atlas::DBApp {
 int main(int argc, char* argv[]) {
   std::vector<std::string> values;
   for (int i = 0; i < argc; ++i) values.emplace_back(argv[i]);
-  for (const auto* field : {"HOST", "PORT", "USER", "PASSWORD", "DATABASE"}) {
+  for (const auto* field : {"HOST", "PORT", "USER", "PASSWORD", "DATABASE", "SSL_CA"}) {
     auto value = atlas::ReadEnvironmentVariable((std::string("ATLAS_TEST_MYSQL_") + field).c_str());
     if (!value || value->empty()) return 2;
     std::string option = field;
     for (auto& character : option) {
+      if (character == '_') character = '-';
       if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + 32);
     }
     values.emplace_back("--db-mysql-" + option);

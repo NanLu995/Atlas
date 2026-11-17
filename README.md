@@ -19,12 +19,12 @@ Atlas is aimed at large, long-running online worlds where the server must scale 
 - Embedded .NET runtime for server-side gameplay scripting.
 - C# client runtime with desktop and Unity integration surfaces, plus the UE MVP
   C++ plugin/client path.
-- Runtime-loaded MySQL/MariaDB and explicitly selected SQLite database plugins.
+- Runtime-loaded Oracle MySQL 8.4 and explicitly selected SQLite database plugins.
 - DBAppMgr range sharding, worker-rebuilt manager HA, and Reviver supervision for
   CellAppMgr, BaseAppMgr, and DBAppMgr.
 - Tracy instrumentation, baseline stress drivers, and trace comparison tools.
 
-The primary MySQL/MariaDB backend is implemented. DB replication, shard auto-rebalance,
+The primary Oracle MySQL 8.4 backend is implemented. DB replication, shard auto-rebalance,
 and full session resume remain out of the current production baseline.
 
 ## MVP Unity Demo
@@ -63,7 +63,7 @@ LoginApp ──► BaseAppMgr ──► BaseApp ◄──► CellApp
                   ▼          ▼         CellAppMgr
                 DBAppMgr ─► DBApp
                               │
-                   MySQL/MariaDB / SQLite
+                   Oracle MySQL 8.4 / SQLite
 ```
 
 | Process | Responsibility |
@@ -113,7 +113,7 @@ Database admission is limited to 4,096 operations, including callbacks waiting f
 Capacity rejection precedes execution (`RateLimited` / `kOverloaded`); draining rejects new work
 as `ReceiverGone` / `kStopping`. `BeginDrain` and `PendingOperations` expose this lifecycle.
 Checkout cleanup and automatic-load APIs return `Result` callbacks, including setters, so backend
-errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV5`.
+errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV6`.
 Immediate reliable UDP sends obey the configured send window. Deferred bundles retain at most
 256 KiB per channel and reliability class; full admission returns `WouldBlock` without appending.
 RPC calls distinguish capacity rejection (`RateLimited`), duplicate requests (`AlreadyExists`)
@@ -499,12 +499,18 @@ the existing `ClientHandoffRealTests` suite. This local topology does not verify
 
 ## Database
 
-Atlas loads SQLite and MySQL/MariaDB plugins through the database factory. MySQL/MariaDB
+Prepare the pinned Oracle client before building with `tools\bin\prepare_mysql.bat`
+(Linux: `bash tools/bin/prepare_mysql.sh`). See [Oracle MySQL setup and licensing](docs/oracle_mysql.md).
+MySQL connections require `mysql_ssl_ca` (`--db-mysql-ssl-ca`) and always verify the CA chain
+and the configured host identity. There is no plaintext or unverified mode.
+
+
+Atlas loads SQLite and Oracle MySQL 8.4 plugins through the database factory. Oracle MySQL 8.4
 is the default for development, integration, deployment and cluster acceptance, with multiple
 DBApps sharing one logical database. `ATLAS_DB_MYSQL` defaults to ON and builds the plugin
-using MariaDB Connector/C. SQLite requires explicit selection and is limited to single-DBApp
+using the pinned Oracle libmysqlclient C API. SQLite requires explicit selection and is limited to single-DBApp
 lightweight development, quick smoke checks and independent tests, with WAL and busy-timeout support.
-Use `database.type` in JSON or `--db-type` with `sqlite` or `mysql` (also for MariaDB).
+Use `database.type` in JSON or `--db-type` with `sqlite` or `mysql`.
 The XML database backend has been removed. Explicit `xml` or other unsupported backend
 types fail configuration validation and factory creation, even if an old plugin remains
 beside the executable; there is no fallback. Existing data files are not removed or migrated.
@@ -694,7 +700,7 @@ and ownership version; success is returned after database confirmation. An unava
 changed version or uncertain commit rejects this login instead of assuming the session is offline.
 Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
 login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
-Database plugins must export `AtlasCreateDatabaseV5`; rebuild both plugins and the server.
+Database plugins must export `AtlasCreateDatabaseV6`; rebuild both plugins and the server.
 The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
 Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
 tracks peer process instances even for death-only subscriptions: a new instance at the same
@@ -747,7 +753,8 @@ Example DBApp configuration:
     "mysql_port": 3306,
     "mysql_user": "<database-user>",
     "mysql_database": "<isolated-development-database>",
-    "mysql_database_id": "<32-lowercase-hex-logical-database-id>"
+    "mysql_database_id": "<32-lowercase-hex-logical-database-id>",
+    "mysql_ssl_ca": "<trusted-database-ca.pem>"
   }
 }
 ```
@@ -759,7 +766,7 @@ DBApp reads this variable when the configured password is empty. Host, user and 
 come from the configuration or CLI. A missing database/user/password, invalid connection
 settings, unavailable plugin or failed connection stops startup; no SQLite fallback occurs.
 The tools also accept `ATLAS_DB_MYSQL_HOST`, `PORT`, `USER`, `PASSWORD`, `DATABASE`, `DATABASE_ID` and
-`POOL_SIZE` (each with the `ATLAS_DB_MYSQL_` prefix) or `--database-config <local-json>`.
+`POOL_SIZE` and `SSL_CA` (each with the `ATLAS_DB_MYSQL_` prefix) or `--database-config <local-json>`.
 They pass the password through the child environment, excluding it from generated JSON.
 
 `mysql_database_id` is required: generate it once with `tools\bin\database_recovery.bat new-id`
@@ -777,8 +784,8 @@ to false. Keep it false for production startup, restore and endpoint switching s
 database cannot be claimed as new storage. Existing databases are validated even when initialization
 is enabled; this flag never overwrites identity or upgrades metadata.
 
-The development recovery tool uses an installed matching `mariadb`/`mariadb-dump` or
-`mysql`/`mysqldump` pair. Supply `--client` and `--dump-tool` paths if absent from PATH.
+The development recovery tool uses the pinned Oracle `mysql`/`mysqldump` 8.4 SDK or
+explicitly selected matching Oracle tools. Supply `--client` and `--dump-tool` paths if absent from PATH.
 Stop all DBApps and other writers before backup or restore; `--quiesced` asserts this precondition.
 It is not an online backup coordinator. Use a new private backup directory and an existing empty
 target database. The source and target configs must name the same logical identity.

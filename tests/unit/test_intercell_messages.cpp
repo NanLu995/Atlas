@@ -425,7 +425,7 @@ TEST(IntercellMessages, OffloadEntityAck_RoundTripFailure) {
 }
 
 TEST(IntercellMessages, OffloadAckRejectsInvalidStatusAndTruncatedEpoch) {
-  for (const auto [success, reason] :
+  for (const auto& [success, reason] :
        {std::pair{uint8_t{2}, uint8_t{0}}, std::pair{uint8_t{1}, uint8_t{1}},
         std::pair{uint8_t{0}, uint8_t{0}}, std::pair{uint8_t{0}, uint8_t{7}}}) {
     BinaryWriter writer;

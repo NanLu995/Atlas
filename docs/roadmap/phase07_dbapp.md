@@ -1,7 +1,7 @@
 # Phase 7: DBApp + 数据库层
 
-**Status:** ✅ SQLite / MySQL/MariaDB 后端可用；SQLite 用于单 DBApp 开发和测试，
-MySQL/MariaDB 支持多个 DBApp 共享同一个逻辑数据库。
+**Status:** ✅ SQLite / Oracle MySQL 8.4 后端可用；SQLite 用于单 DBApp 开发和测试，
+Oracle MySQL 8.4 支持多个 DBApp 共享同一个逻辑数据库。
 **前置依赖:** Phase 5、Phase 6、脚本层 EntityDef 元数据（[`docs/scripting/`](../scripting/)）
 **BigWorld 参考:** `server/dbapp/`, `lib/db_storage/idatabase.hpp`
 
@@ -10,7 +10,7 @@ MySQL/MariaDB 支持多个 DBApp 共享同一个逻辑数据库。
 把 Phase 7 层面的数据库能力收敛成可持续演进的**单 DBApp 架构**：
 
 - `DBApp` 作为唯一数据库代理进程，隔离 `BaseApp` / `LoginApp` 与底层存储
-- `IDatabase` 屏蔽 SQLite / MySQL/MariaDB 后端差异
+- `IDatabase` 屏蔽 SQLite / Oracle MySQL 8.4 后端差异
 - 实体 CRUD、`lookup_by_name`、`checkout / clear_checkout`、`auto_load`
   语义稳定
 - 支撑当前登录主链路与 `checkin / checkout / relogin rollback` 场景
@@ -22,13 +22,13 @@ MySQL/MariaDB 支持多个 DBApp 共享同一个逻辑数据库。
 | P7.1 | 基线收敛 | ✅ |
 | P7.2 | SQLite backend，显式单 DBApp 开发/测试 | ✅ |
 | P7.3 | DBApp 集成补强（登录回滚 / BaseApp 故障路径） | ✅ |
-| P7.4 | MySQL backend 正式实现（MariaDB Connector/C + 线程池 + CI 真机验证） | ✅ |
+| P7.4 | MySQL backend 正式实现（Oracle libmysqlclient + 线程池 + CI 契约） | ✅ |
 
 ## 设计
 
 ### 后端策略
 
-MySQL/MariaDB 默认用于主要开发、联调、部署及多 DBApp 共享存储验收；SQLite 显式用于单 DBApp 冒烟及独立测试。
+Oracle MySQL 8.4 默认用于主要开发、联调、部署及多 DBApp 共享存储验收；SQLite 显式用于单 DBApp 冒烟及独立测试。
 XML 数据库后端已移除，显式选择 `xml` 时配置及工厂均报错，不提供后端回退或数据迁移。
 通用 XML 解析、配置及实体定义支持不受影响，既有数据文件保留。
 BaseApp checkout 绑定每次启动的安全随机进程实例身份。死亡回收在事务中退役该身份并清理
@@ -68,7 +68,7 @@ CheckinEntity[Ack] / DeleteEntity[Ack] / LookupEntity[Ack] / AbortCheckout[Ack]
 
 `ServerConfig` 支持 `db_sqlite_path / wal / busy_timeout_ms / foreign_keys`、
 `db_mysql_*` 系列字段。`database.type` 和 `--db-type` 仅接受 `sqlite` 或 `mysql`，
-MariaDB 也使用 `mysql`；`db_type` 默认值为 `mysql`。
+`db_type` 默认值为 `mysql`。
 
 ## 已落地与剩余工作
 
@@ -81,23 +81,22 @@ MariaDB 也使用 `mysql`；`db_type` 默认值为 `mysql`。
 
 ### P7.4 — MySQL backend ✅
 
-`atlas_db_mysql` 插件基于 **MariaDB Connector/C**（`FetchContent`，`ATLAS_DB_MYSQL`
-默认 ON；MySQL 8 与 MariaDB 协议兼容）。数据模型与语义对齐 SQLite：InnoDB
-建表、`X'..'` 十六进制字面量二进制绑定、事务化 checkout（条件 UPDATE +
-affected-rows 竞争检测）、dbid range、id counter。
+`atlas_db_mysql` 插件使用固定的 Oracle MySQL 8.4.13 C API，共享客户端库，
+`ATLAS_DB_MYSQL` 默认 ON。构建准备、开源交付条件和启动方式见
+[Oracle MySQL](../oracle_mysql_CN.md)。MySQL 仅支持 Oracle 8.4 LTS；SQLite 保持单 DBApp 辅助用途。
 
-`deferred` 模式（DBApp 驱动方式）下走**工作线程池**：每 worker 独立连接、按实体
-hash 保序、结果经 `ProcessResults()` 回主线程，DB 往返不阻塞 tick 循环；连接
-`MYSQL_OPT_RECONNECT` 自愈掉线。非 deferred 走 bootstrap 连接内联。`SupportsMultiDbapp()`
-返回 true（事务 checkout 在共享 DB 下安全，为 Phase 15 铺路）。
+数据模型保持 InnoDB、二进制 blob、事务 checkout、稳定操作去重、所有权版本和原子 ID 区间预留。
+Deferred 模式每 worker 独立连接，按实体 hash 保序，`ProcessResults()` 在主线程交付回调。
+自动重连关闭；连接出错后重新打开并核对逻辑库身份与格式，不将结果不确定的提交当作成功。
+连接始终使用 TLS `VERIFY_IDENTITY`，要求显式 CA。
 
-验证：`test_mysql_database` 契约测试镜像 SQLite 的 9 项断言，`MySQL Backend`
-工作流起 MariaDB 服务容器真机跑通（同步内联与线程池两条路径均覆盖）。
+`MySQL Backend` CI 使用固定摘要的 Oracle 8.4.13 容器及临时证书，覆盖同步、线程池及真实 DBApp。
+既有 MariaDB 验证记录仍只代表当时的后端，不能作为 Oracle 验收结论。
 
 ## 边界
 
 **本文档负责：** DBApp 角色与边界、后端策略、`IDatabase` 语义、单 DBApp
-实施路线、SQLite/MySQL/MariaDB 后端范围。
+实施路线、SQLite/Oracle MySQL 8.4 后端范围。
 
 **不负责：** 多 LoginApp / LoginAppMgr 设计、登录入口负载均衡、BaseApp 重复
 登录状态机、CellApp / Space 持久化策略。

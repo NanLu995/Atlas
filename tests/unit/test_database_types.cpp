@@ -88,7 +88,7 @@ TEST(DatabaseTypes, SqlitePluginExportsOnlyTheCurrentDatabaseInterface) {
   auto library = DynamicLibrary::Load(path);
   ASSERT_TRUE(library.HasValue());
   using CreateFn = IDatabase* (*)();
-  EXPECT_TRUE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV5").HasValue());
+  EXPECT_TRUE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV6").HasValue());
   EXPECT_FALSE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV4").HasValue());
   EXPECT_FALSE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV3").HasValue());
   EXPECT_FALSE(library->GetSymbol<CreateFn>("AtlasCreateDatabaseV2").HasValue());

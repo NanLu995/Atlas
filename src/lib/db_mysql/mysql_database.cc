@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "db/entity_blob.h"
+#include "db_mysql/mysql_client.h"
 #include "foundation/log.h"
 
 namespace atlas {
@@ -48,6 +49,11 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
     return Error{ErrorCode::kInvalidArgument,
                  "MySQL mysql_database_id requires 32 lowercase hexadecimal characters; "
                  "configure the expected logical database identity explicitly"};
+  }
+  if (config.mysql_ssl_ca.empty()) {
+    return Error{ErrorCode::kInvalidArgument,
+                 "MySQL requires mysql_ssl_ca; TLS certificate and target identity verification "
+                 "cannot be disabled"};
   }
   stopping_ = false;
   entity_defs_ = &entity_defs;
@@ -124,19 +130,35 @@ auto MysqlDatabase::AdmitOperation() const -> Result<void> {
   return {};
 }
 
-auto MysqlDatabase::OpenConnection() const -> st_mysql* {
-  st_mysql* conn = mysql_init(nullptr);
+auto MysqlDatabase::OpenConnection() const -> MYSQL* {
+  if (!InitializeMysqlThread()) {
+    ATLAS_LOG_ERROR("MysqlDatabase: Oracle client thread initialization failed");
+    return nullptr;
+  }
+  MYSQL* conn = mysql_init(nullptr);
   if (conn == nullptr) return nullptr;
 
+  unsigned int protocol = MYSQL_PROTOCOL_TCP;
   unsigned int connect_timeout = 10;
-  mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
-  mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+  unsigned int query_timeout = 5;
+  unsigned int local_infile = 0;
+  enum mysql_ssl_mode ssl_mode = SSL_MODE_VERIFY_IDENTITY;
   // Reconnecting within a transaction could turn a rolled-back COMMIT into success.
   bool reconnect = false;
-  mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
-  unsigned int query_timeout = 5;
-  mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &query_timeout);
-  mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT, &query_timeout);
+  if (mysql_options(conn, MYSQL_OPT_PROTOCOL, &protocol) != 0 ||
+      mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout) != 0 ||
+      mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4") != 0 ||
+      mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect) != 0 ||
+      mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &query_timeout) != 0 ||
+      mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT, &query_timeout) != 0 ||
+      mysql_options(conn, MYSQL_OPT_LOCAL_INFILE, &local_infile) != 0 ||
+      mysql_options(conn, MYSQL_OPT_SSL_CA, config_.mysql_ssl_ca.c_str()) != 0 ||
+      mysql_options(conn, MYSQL_OPT_SSL_MODE, &ssl_mode) != 0 ||
+      mysql_options(conn, MYSQL_OPT_TLS_VERSION, "TLSv1.2,TLSv1.3") != 0) {
+    ATLAS_LOG_ERROR("MysqlDatabase: Oracle client options rejected: {}", mysql_error(conn));
+    mysql_close(conn);
+    return nullptr;
+  }
 
   if (mysql_real_connect(conn, config_.mysql_host.c_str(), config_.mysql_user.c_str(),
                          config_.mysql_password.c_str(), config_.mysql_database.c_str(),
@@ -145,16 +167,29 @@ auto MysqlDatabase::OpenConnection() const -> st_mysql* {
     mysql_close(conn);
     return nullptr;
   }
+  const auto version = mysql_get_server_version(conn);
+  if (version < 80400 || version >= 80500 ||
+      std::string_view(mysql_get_server_info(conn)).find("MariaDB") != std::string_view::npos) {
+    ATLAS_LOG_ERROR("MysqlDatabase: Oracle MySQL 8.4 LTS server required");
+    mysql_close(conn);
+    return nullptr;
+  }
   return conn;
 }
 
-auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) const
+auto MysqlDatabase::EnsureSchema(MYSQL* conn, const Sha256Digest& storage_schema) const
     -> Result<void> {
   constexpr std::string_view kLock = "CONCAT('atlas.schema.', LEFT(SHA2(DATABASE(), 256), 48))";
-  auto locked = QueryScalar(conn, std::format("SELECT GET_LOCK({}, 10)", kLock));
-  if (!locked) return locked.Error();
-  if (*locked != "1")
-    return Error{ErrorCode::kTimeout, "MysqlDatabase: schema initialization lock unavailable"};
+  // Keep lock acquisition within its own budget instead of relying on I/O timeouts.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  for (;;) {
+    auto locked = QueryScalar(conn, std::format("SELECT GET_LOCK({}, 0)", kLock));
+    if (!locked) return locked.Error();
+    if (*locked == "1") break;
+    if (*locked != "0" || std::chrono::steady_clock::now() >= deadline)
+      return Error{ErrorCode::kTimeout, "MysqlDatabase: schema initialization lock unavailable"};
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
   auto schema = EnsureSchemaLocked(conn, storage_schema);
   auto released = QueryScalar(conn, std::format("SELECT RELEASE_LOCK({})", kLock));
   if (!schema) return schema.Error();
@@ -164,7 +199,7 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_sch
   return {};
 }
 
-auto MysqlDatabase::ValidateSchema(st_mysql* conn, const Sha256Digest& storage_schema) const
+auto MysqlDatabase::ValidateSchema(MYSQL* conn, const Sha256Digest& storage_schema) const
     -> Result<void> {
   auto version = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'schema_version'");
   if (!version)
@@ -196,7 +231,7 @@ auto MysqlDatabase::ValidateSchema(st_mysql* conn, const Sha256Digest& storage_s
   return ExecSql(conn, "SELECT checkout_instance FROM entities LIMIT 0");
 }
 
-auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema) const
+auto MysqlDatabase::EnsureSchemaLocked(MYSQL* conn, const Sha256Digest& storage_schema) const
     -> Result<void> {
   auto existing = QueryScalar(conn,
                               "SELECT TABLE_NAME FROM information_schema.TABLES "
@@ -326,9 +361,9 @@ auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& stora
 // ── worker pool ─────────────────────────────────────────────────────────────
 
 void MysqlDatabase::WorkerLoop(Worker& worker) {
-  st_mysql* conn = nullptr;
+  MYSQL* conn = nullptr;
   for (;;) {
-    std::function<void(st_mysql*)> job;
+    std::function<void(MYSQL*)> job;
     {
       std::unique_lock<std::mutex> lock(worker.mutex);
       worker.cv.wait(lock, [&] { return worker.stop || !worker.jobs.empty(); });
@@ -343,7 +378,7 @@ void MysqlDatabase::WorkerLoop(Worker& worker) {
   if (conn != nullptr) mysql_close(conn);
 }
 
-void MysqlDatabase::RefreshConnection(st_mysql*& conn) const {
+void MysqlDatabase::RefreshConnection(MYSQL*& conn) const {
   if (conn == nullptr || mysql_errno(conn) != 0) {
     if (conn != nullptr) mysql_close(conn);
     conn = OpenConnection();
@@ -360,7 +395,7 @@ void MysqlDatabase::RefreshConnection(st_mysql*& conn) const {
 }
 
 void MysqlDatabase::EnqueueForEntity(uint16_t type_id, uint64_t key,
-                                     std::function<void(st_mysql*)> job) {
+                                     std::function<void(MYSQL*)> job) {
   const std::size_t idx =
       static_cast<std::size_t>(key * 1099511628211ULL + type_id) % workers_.size();
   Worker& w = *workers_[idx];
@@ -391,7 +426,7 @@ void MysqlDatabase::ProcessResults() {
 
 // ── SQL helpers (operate on a caller-supplied connection) ───────────────────
 
-auto MysqlDatabase::ExecSql(st_mysql* conn, std::string_view sql) -> Result<void> {
+auto MysqlDatabase::ExecSql(MYSQL* conn, std::string_view sql) -> Result<void> {
   if (conn == nullptr) {
     return Error{ErrorCode::kIoError, "MysqlDatabase: not connected"};
   }
@@ -405,7 +440,7 @@ auto MysqlDatabase::ExecSql(st_mysql* conn, std::string_view sql) -> Result<void
   return {};
 }
 
-auto MysqlDatabase::QueryScalar(st_mysql* conn, std::string_view sql)
+auto MysqlDatabase::QueryScalar(MYSQL* conn, std::string_view sql)
     -> Result<std::optional<std::string>> {
   if (mysql_real_query(conn, sql.data(), static_cast<unsigned long>(sql.size())) != 0)
     return MysqlErr(conn, "MysqlDatabase: schema query failed");
@@ -417,7 +452,7 @@ auto MysqlDatabase::QueryScalar(st_mysql* conn, std::string_view sql)
   return std::optional<std::string>{std::string(row[0], mysql_fetch_lengths(rows.get())[0])};
 }
 
-auto MysqlDatabase::QueryRow(st_mysql* conn, std::string_view sql) -> Result<EntityRow> {
+auto MysqlDatabase::QueryRow(MYSQL* conn, std::string_view sql) -> Result<EntityRow> {
   if (conn == nullptr) {
     return Error{ErrorCode::kIoError, "MysqlDatabase: not connected"};
   }
@@ -466,7 +501,7 @@ auto MysqlDatabase::ReadRow(char** row, const unsigned long* len) -> EntityRow {
   return r;
 }
 
-auto MysqlDatabase::FetchByDbid(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool for_update)
+auto MysqlDatabase::FetchByDbid(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool for_update)
     -> Result<EntityRow> {
   return QueryRow(
       conn, std::format("SELECT dbid, type_id, `blob`, identifier, password_hash, auto_load, "
@@ -476,7 +511,7 @@ auto MysqlDatabase::FetchByDbid(st_mysql* conn, DatabaseID dbid, uint16_t type_i
                         static_cast<uint64_t>(dbid), type_id, for_update ? "FOR UPDATE" : ""));
 }
 
-auto MysqlDatabase::FetchByName(st_mysql* conn, uint16_t type_id, std::string_view identifier,
+auto MysqlDatabase::FetchByName(MYSQL* conn, uint16_t type_id, std::string_view identifier,
                                 bool for_update) -> Result<EntityRow> {
   return QueryRow(
       conn, std::format("SELECT dbid, type_id, `blob`, identifier, password_hash, auto_load, "
@@ -505,12 +540,12 @@ auto MysqlDatabase::IdentifierLiteral(std::string_view identifier) -> std::strin
   return HexLiteral(std::as_bytes(std::span<const char>(identifier.data(), identifier.size())));
 }
 
-auto MysqlDatabase::MysqlErr(st_mysql* conn, std::string_view prefix) -> Error {
+auto MysqlDatabase::MysqlErr(MYSQL* conn, std::string_view prefix) -> Error {
   const char* msg = (conn != nullptr) ? mysql_error(conn) : "no connection";
   return Error{ErrorCode::kIoError, std::format("{}: {}", prefix, msg)};
 }
 
-auto MysqlDatabase::ConstraintErrorKind(st_mysql* conn) -> DatabaseErrorKind {
+auto MysqlDatabase::ConstraintErrorKind(MYSQL* conn) -> DatabaseErrorKind {
   if (conn == nullptr || mysql_errno(conn) != kErDupEntry) {
     return DatabaseErrorKind::kNone;
   }
@@ -519,23 +554,23 @@ auto MysqlDatabase::ConstraintErrorKind(st_mysql* conn) -> DatabaseErrorKind {
                                                        : DatabaseErrorKind::kDuplicateIdentifier;
 }
 
-auto MysqlDatabase::BeginTxn(st_mysql* conn) -> Result<void> {
+auto MysqlDatabase::BeginTxn(MYSQL* conn) -> Result<void> {
   return ExecSql(conn, "START TRANSACTION");
 }
 
-auto MysqlDatabase::Commit(st_mysql* conn) -> Result<void> {
+auto MysqlDatabase::Commit(MYSQL* conn) -> Result<void> {
   auto result = ExecSql(conn, "COMMIT");
   if (!result) return Error{ErrorCode::kCommitUnknown, std::string(result.Error().Message())};
   return {};
 }
 
-void MysqlDatabase::Rollback(st_mysql* conn) {
+void MysqlDatabase::Rollback(MYSQL* conn) {
   (void)ExecSql(conn, "ROLLBACK");
 }
 
 // ── operation bodies ────────────────────────────────────────────────────────
 
-auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
+auto MysqlDatabase::DoPut(MYSQL* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                           std::span<const std::byte> blob, const std::string& identifier,
                           bool write_password, const std::string& password_hash,
                           bool transaction_open) -> PutResult {
@@ -626,7 +661,7 @@ auto MysqlDatabase::DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, Wri
   return result;
 }
 
-auto MysqlDatabase::LockOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+auto MysqlDatabase::LockOperationReceipt(MYSQL* conn, const std::array<std::byte, 16>& id,
                                          const Sha256Digest& hash)
     -> Result<std::optional<DatabaseOperationReceipt>> {
   const auto key = HexLiteral(id);
@@ -669,7 +704,7 @@ auto MysqlDatabase::LockOperationReceipt(st_mysql* conn, const std::array<std::b
   return std::optional{receipt};
 }
 
-auto MysqlDatabase::SaveOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+auto MysqlDatabase::SaveOperationReceipt(MYSQL* conn, const std::array<std::byte, 16>& id,
                                          const DatabaseOperationReceipt& receipt) -> Result<void> {
   auto updated = ExecSql(conn, std::format("UPDATE atlas_write_receipts SET result_dbid = {}, "
                                            "result_checkout_version = {} WHERE operation_id = {} "
@@ -681,8 +716,7 @@ auto MysqlDatabase::SaveOperationReceipt(st_mysql* conn, const std::array<std::b
   return {};
 }
 
-auto MysqlDatabase::DoCheckoutWithOperation(st_mysql* conn,
-                                            const DatabaseCheckoutOperation& operation,
+auto MysqlDatabase::DoCheckoutWithOperation(MYSQL* conn, const DatabaseCheckoutOperation& operation,
                                             bool acquire) -> GetResult {
   GetResult result;
   if (!operation.IsValid()) {
@@ -780,7 +814,7 @@ auto MysqlDatabase::DoCheckoutWithOperation(st_mysql* conn,
   return result;
 }
 
-auto MysqlDatabase::DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperation& operation,
+auto MysqlDatabase::DoPutWithOperation(MYSQL* conn, const DatabaseWriteOperation& operation,
                                        DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                                        std::span<const std::byte> blob,
                                        const std::string& identifier) -> PutResult {
@@ -908,7 +942,7 @@ auto MysqlDatabase::DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperat
   return result;
 }
 
-auto MysqlDatabase::DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> GetResult {
+auto MysqlDatabase::DoGet(MYSQL* conn, DatabaseID dbid, uint16_t type_id) -> GetResult {
   GetResult result;
   auto row_result = FetchByDbid(conn, dbid, type_id);
   if (!row_result) {
@@ -927,7 +961,7 @@ auto MysqlDatabase::DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> 
   return result;
 }
 
-auto MysqlDatabase::DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool transaction_open)
+auto MysqlDatabase::DoDel(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool transaction_open)
     -> DelResult {
   if (!transaction_open) {
     if (auto begun = BeginTxn(conn); !begun)
@@ -959,7 +993,7 @@ auto MysqlDatabase::DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id, boo
   return DelResult{false, std::string(result.Error().Message()), kind};
 }
 
-auto MysqlDatabase::DoLookup(st_mysql* conn, uint16_t type_id, const std::string& identifier)
+auto MysqlDatabase::DoLookup(MYSQL* conn, uint16_t type_id, const std::string& identifier)
     -> LookupResult {
   LookupResult result;
   auto row_result = FetchByName(conn, type_id, identifier);
@@ -976,7 +1010,7 @@ auto MysqlDatabase::DoLookup(st_mysql* conn, uint16_t type_id, const std::string
   return result;
 }
 
-auto MysqlDatabase::AcquireCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+auto MysqlDatabase::AcquireCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                                     const CheckoutInfo& new_owner, int64_t now_ms)
     -> Result<uint64_t> {
   auto next = ExecSql(
@@ -1011,7 +1045,7 @@ auto MysqlDatabase::AcquireCheckout(st_mysql* conn, DatabaseID dbid, uint16_t ty
   return acquired->checkout_version;
 }
 
-auto MysqlDatabase::CheckoutTail(st_mysql* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
+auto MysqlDatabase::CheckoutTail(MYSQL* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
                                  const CheckoutInfo& new_owner, int64_t now_ms) -> GetResult {
   GetResult result;
   auto acquired = AcquireCheckout(conn, dbid, type_id, new_owner, now_ms);
@@ -1032,7 +1066,7 @@ auto MysqlDatabase::CheckoutTail(st_mysql* conn, DatabaseID dbid, uint16_t type_
   return result;
 }
 
-auto MysqlDatabase::DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+auto MysqlDatabase::DoCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                                const CheckoutInfo& new_owner) -> GetResult {
   GetResult result;
   const auto now = UnixTimeMs();
@@ -1071,9 +1105,8 @@ auto MysqlDatabase::DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id
   return CheckoutTail(conn, dbid, type_id, std::move(row), new_owner, now);
 }
 
-auto MysqlDatabase::DoCheckoutByName(st_mysql* conn, uint16_t type_id,
-                                     const std::string& identifier, const CheckoutInfo& new_owner)
-    -> GetResult {
+auto MysqlDatabase::DoCheckoutByName(MYSQL* conn, uint16_t type_id, const std::string& identifier,
+                                     const CheckoutInfo& new_owner) -> GetResult {
   GetResult result;
   const auto now = UnixTimeMs();
   if (auto begin = BeginTxn(conn); !begin) {
@@ -1112,7 +1145,7 @@ auto MysqlDatabase::DoCheckoutByName(st_mysql* conn, uint16_t type_id,
   return CheckoutTail(conn, resolved_dbid, type_id, std::move(row), new_owner, now);
 }
 
-auto MysqlDatabase::DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id)
+auto MysqlDatabase::DoClearCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id)
     -> Result<bool> {
   auto upd = ExecSql(
       conn, std::format("UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
@@ -1123,7 +1156,7 @@ auto MysqlDatabase::DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t ty
   return mysql_affected_rows(conn) > 0;
 }
 
-auto MysqlDatabase::DoClearForAddress(st_mysql* conn, const Address& base_addr) -> Result<int> {
+auto MysqlDatabase::DoClearForAddress(MYSQL* conn, const Address& base_addr) -> Result<int> {
   auto upd = ExecSql(
       conn, std::format("UPDATE entities SET checked_out = 0, checkout_ip = 0, checkout_port = 0, "
                         "checkout_app_id = 0, checkout_eid = 0, updated_at_ms = {} "
@@ -1133,7 +1166,7 @@ auto MysqlDatabase::DoClearForAddress(st_mysql* conn, const Address& base_addr) 
   return static_cast<int>(mysql_affected_rows(conn));
 }
 
-auto MysqlDatabase::DoGetAutoLoad(st_mysql* conn) -> Result<std::vector<EntityData>> {
+auto MysqlDatabase::DoGetAutoLoad(MYSQL* conn) -> Result<std::vector<EntityData>> {
   std::vector<EntityData> result;
   static constexpr std::string_view kSql =
       "SELECT dbid, type_id, `blob`, identifier FROM entities WHERE auto_load = 1 "
@@ -1160,7 +1193,7 @@ auto MysqlDatabase::DoGetAutoLoad(st_mysql* conn) -> Result<std::vector<EntityDa
   return result;
 }
 
-auto MysqlDatabase::DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
+auto MysqlDatabase::DoSetAutoLoad(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
     -> Result<void> {
   return ExecSql(
       conn, std::format("UPDATE entities SET auto_load = {}, updated_at_ms = {} "
@@ -1168,8 +1201,7 @@ auto MysqlDatabase::DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type
                         auto_load ? 1 : 0, UnixTimeMs(), static_cast<uint64_t>(dbid), type_id));
 }
 
-auto MysqlDatabase::DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high)
-    -> DbidRangeResult {
+auto MysqlDatabase::DoGetMaxDbid(MYSQL* conn, DatabaseID low, DatabaseID high) -> DbidRangeResult {
   DbidRangeResult result;
   if (high <= low) {
     result.success = true;
@@ -1201,7 +1233,7 @@ auto MysqlDatabase::DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high
   return result;
 }
 
-auto MysqlDatabase::DoReserveEntityIds(st_mysql* conn, uint32_t count) -> Result<EntityIdRange> {
+auto MysqlDatabase::DoReserveEntityIds(MYSQL* conn, uint32_t count) -> Result<EntityIdRange> {
   if (count == 0 || count >= kFirstLocalEntityID) {
     return Error{ErrorCode::kOutOfRange, "invalid EntityID reservation count"};
   }
@@ -1255,7 +1287,7 @@ void MysqlDatabase::PutEntity(DatabaseID dbid, uint16_t type_id, WriteFlags flag
   std::vector<std::byte> owned(blob.begin(), blob.end());
   Dispatch<PutResult>(
       type_id, dbid,
-      [dbid, type_id, flags, b = std::move(owned), id = identifier](st_mysql* conn) {
+      [dbid, type_id, flags, b = std::move(owned), id = identifier](MYSQL* conn) {
         return DoPut(conn, dbid, type_id, flags, b, id, false, {});
       },
       std::move(callback));
@@ -1269,7 +1301,7 @@ void MysqlDatabase::PutEntityWithOperation(const DatabaseWriteOperation& operati
   std::vector<std::byte> owned(blob.begin(), blob.end());
   Dispatch<PutResult>(
       type_id, dbid,
-      [operation, dbid, type_id, flags, data = std::move(owned), identifier](st_mysql* conn) {
+      [operation, dbid, type_id, flags, data = std::move(owned), identifier](MYSQL* conn) {
         return DoPutWithOperation(conn, operation, dbid, type_id, flags, data, identifier);
       },
       std::move(callback));
@@ -1284,21 +1316,21 @@ void MysqlDatabase::PutEntityWithPassword(DatabaseID dbid, uint16_t type_id, Wri
   Dispatch<PutResult>(
       type_id, dbid,
       [dbid, type_id, flags, b = std::move(owned), id = identifier, pw = password_hash](
-          st_mysql* conn) { return DoPut(conn, dbid, type_id, flags, b, id, true, pw); },
+          MYSQL* conn) { return DoPut(conn, dbid, type_id, flags, b, id, true, pw); },
       std::move(callback));
 }
 
 void MysqlDatabase::GetEntity(DatabaseID dbid, uint16_t type_id,
                               std::function<void(GetResult)> callback) {
   Dispatch<GetResult>(
-      type_id, dbid, [dbid, type_id](st_mysql* conn) { return DoGet(conn, dbid, type_id); },
+      type_id, dbid, [dbid, type_id](MYSQL* conn) { return DoGet(conn, dbid, type_id); },
       std::move(callback));
 }
 
 void MysqlDatabase::DelEntity(DatabaseID dbid, uint16_t type_id,
                               std::function<void(DelResult)> callback) {
   Dispatch<DelResult>(
-      type_id, dbid, [dbid, type_id](st_mysql* conn) { return DoDel(conn, dbid, type_id); },
+      type_id, dbid, [dbid, type_id](MYSQL* conn) { return DoDel(conn, dbid, type_id); },
       std::move(callback));
 }
 
@@ -1306,7 +1338,7 @@ void MysqlDatabase::LookupByName(uint16_t type_id, const std::string& identifier
                                  std::function<void(LookupResult)> callback) {
   Dispatch<LookupResult>(
       type_id, std::hash<std::string>{}(identifier),
-      [type_id, id = identifier](st_mysql* conn) { return DoLookup(conn, type_id, id); },
+      [type_id, id = identifier](MYSQL* conn) { return DoLookup(conn, type_id, id); },
       std::move(callback));
 }
 
@@ -1314,7 +1346,7 @@ void MysqlDatabase::CheckoutEntity(DatabaseID dbid, uint16_t type_id, const Chec
                                    std::function<void(GetResult)> callback) {
   Dispatch<GetResult>(
       type_id, dbid,
-      [dbid, type_id, new_owner](st_mysql* conn) {
+      [dbid, type_id, new_owner](MYSQL* conn) {
         return DoCheckout(conn, dbid, type_id, new_owner);
       },
       std::move(callback));
@@ -1324,7 +1356,7 @@ void MysqlDatabase::CheckoutWithOperation(const DatabaseCheckoutOperation& opera
                                           std::function<void(GetResult)> callback) {
   Dispatch<GetResult>(
       operation.type_id, operation.dbid,
-      [operation](st_mysql* conn) { return DoCheckoutWithOperation(conn, operation, true); },
+      [operation](MYSQL* conn) { return DoCheckoutWithOperation(conn, operation, true); },
       std::move(callback));
 }
 
@@ -1332,7 +1364,7 @@ void MysqlDatabase::ResolveCheckoutOperation(const DatabaseCheckoutOperation& op
                                              std::function<void(GetResult)> callback) {
   Dispatch<GetResult>(
       operation.type_id, operation.dbid,
-      [operation](st_mysql* conn) { return DoCheckoutWithOperation(conn, operation, false); },
+      [operation](MYSQL* conn) { return DoCheckoutWithOperation(conn, operation, false); },
       std::move(callback));
 }
 
@@ -1341,7 +1373,7 @@ void MysqlDatabase::CheckoutEntityByName(uint16_t type_id, const std::string& id
                                          std::function<void(GetResult)> callback) {
   Dispatch<GetResult>(
       type_id, std::hash<std::string>{}(identifier),
-      [type_id, id = identifier, new_owner](st_mysql* conn) {
+      [type_id, id = identifier, new_owner](MYSQL* conn) {
         return DoCheckoutByName(conn, type_id, id, new_owner);
       },
       std::move(callback));
@@ -1351,7 +1383,7 @@ void MysqlDatabase::ReleaseCheckout(DatabaseID dbid, uint16_t type_id, const Che
                                     std::function<void(Result<void>)> callback) {
   Dispatch<Result<void>>(
       type_id, dbid,
-      [dbid, type_id, owner](st_mysql* conn) -> Result<void> {
+      [dbid, type_id, owner](MYSQL* conn) -> Result<void> {
         if (owner.ownership_version == 0) {
           return Error{ErrorCode::kPermissionDenied, "missing checkout version"};
         }
@@ -1374,8 +1406,7 @@ void MysqlDatabase::ReleaseCheckout(DatabaseID dbid, uint16_t type_id, const Che
       std::move(callback));
 }
 
-auto MysqlDatabase::CheckCheckoutProcess(st_mysql* conn, const CheckoutInfo& owner)
-    -> Result<void> {
+auto MysqlDatabase::CheckCheckoutProcess(MYSQL* conn, const CheckoutInfo& owner) -> Result<void> {
   if (owner.process_instance == 0) return {};
   if (owner.process_instance > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
     return Error{ErrorCode::kInvalidArgument, "invalid checkout process instance"};
@@ -1405,7 +1436,7 @@ void MysqlDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t ins
                                           std::function<void(Result<int>)> callback) {
   Dispatch<Result<int>>(
       0, 0,
-      [base_addr, instance](st_mysql* conn) -> Result<int> {
+      [base_addr, instance](MYSQL* conn) -> Result<int> {
         if (instance == 0 ||
             instance > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
           return Error{ErrorCode::kInvalidArgument, "invalid checkout process instance"};
@@ -1446,29 +1477,28 @@ void MysqlDatabase::RetireCheckoutProcess(const Address& base_addr, uint64_t ins
 void MysqlDatabase::ClearCheckout(DatabaseID dbid, uint16_t type_id,
                                   std::function<void(Result<bool>)> callback) {
   Dispatch<Result<bool>>(
-      type_id, dbid,
-      [dbid, type_id](st_mysql* conn) { return DoClearCheckout(conn, dbid, type_id); },
+      type_id, dbid, [dbid, type_id](MYSQL* conn) { return DoClearCheckout(conn, dbid, type_id); },
       std::move(callback));
 }
 
 void MysqlDatabase::ClearCheckoutsForAddress(const Address& base_addr,
                                              std::function<void(Result<int>)> callback) {
   Dispatch<Result<int>>(
-      0, 0, [base_addr](st_mysql* conn) { return DoClearForAddress(conn, base_addr); },
+      0, 0, [base_addr](MYSQL* conn) { return DoClearForAddress(conn, base_addr); },
       std::move(callback));
 }
 
 void MysqlDatabase::GetAutoLoadEntities(
     std::function<void(Result<std::vector<EntityData>>)> callback) {
   Dispatch<Result<std::vector<EntityData>>>(
-      0, 0, [](st_mysql* conn) { return DoGetAutoLoad(conn); }, std::move(callback));
+      0, 0, [](MYSQL* conn) { return DoGetAutoLoad(conn); }, std::move(callback));
 }
 
 void MysqlDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_load,
                                 std::function<void(Result<void>)> callback) {
   Dispatch<Result<void>>(
       type_id, dbid,
-      [dbid, type_id, auto_load](st_mysql* conn) {
+      [dbid, type_id, auto_load](MYSQL* conn) {
         return DoSetAutoLoad(conn, dbid, type_id, auto_load);
       },
       std::move(callback));
@@ -1477,15 +1507,14 @@ void MysqlDatabase::SetAutoLoad(DatabaseID dbid, uint16_t type_id, bool auto_loa
 void MysqlDatabase::GetMaxDbidInRange(DatabaseID low, DatabaseID high,
                                       std::function<void(DbidRangeResult)> callback) {
   Dispatch<DbidRangeResult>(
-      0, 0, [low, high](st_mysql* conn) { return DoGetMaxDbid(conn, low, high); },
+      0, 0, [low, high](MYSQL* conn) { return DoGetMaxDbid(conn, low, high); },
       std::move(callback));
 }
 
 void MysqlDatabase::ReserveEntityIds(uint32_t count,
                                      std::function<void(Result<EntityIdRange>)> callback) {
   Dispatch<Result<EntityIdRange>>(
-      0, 0, [count](st_mysql* conn) { return DoReserveEntityIds(conn, count); },
-      std::move(callback));
+      0, 0, [count](MYSQL* conn) { return DoReserveEntityIds(conn, count); }, std::move(callback));
 }
 
 }  // namespace atlas

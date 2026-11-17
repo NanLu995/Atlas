@@ -44,6 +44,9 @@ jobs:
       - name: Build pinned OpenSSL SDK
         run: python tools/build_openssl.py --config Debug
 
+      - name: Prepare pinned Oracle MySQL SDK and source
+        run: python tools/prepare_mysql.py
+
       - name: Configure
         # ATLAS_BUILD_NET_CLIENT=ON builds libatlas_net_client, the P/Invoke
         # target the real-cluster client tests load at runtime.
@@ -55,7 +58,10 @@ jobs:
       - name: Run nightly real-cluster tests
         env:
           ATLAS_BIN_DIR: ${{ github.workspace }}/bin/debug
-        run: dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter "Category=Nightly" --nologo --logger "console;verbosity=detailed"
+        run: >-
+          python tools/test_mysql.py ${{ runner.os == 'Linux' && '--docker' || '' }} --
+          dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter "Category=Nightly"
+          --nologo --logger "console;verbosity=detailed"
 
       - name: Kill leftover processes (Windows)
         if: always() && runner.os == 'Windows'

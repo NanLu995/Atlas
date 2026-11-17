@@ -117,6 +117,7 @@ static const CliField kCliFields[] = {
     {"db-mysql-password",          &ServerConfig::db_mysql_password},
     {"db-mysql-database",          &ServerConfig::db_mysql_database},
     {"db-mysql-database-id",       &ServerConfig::db_mysql_database_id},
+    {"db-mysql-ssl-ca",            &ServerConfig::db_mysql_ssl_ca},
     {"db-mysql-initialize",        &ServerConfig::db_mysql_initialize},
     {"db-mysql-pool-size",         &ServerConfig::db_mysql_pool_size},
     {"auto-create-accounts",       &ServerConfig::auto_create_accounts},
@@ -346,6 +347,7 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
     cfg.db_mysql_password = db->ReadString("mysql_password", cfg.db_mysql_password);
     cfg.db_mysql_database = db->ReadString("mysql_database", cfg.db_mysql_database);
     cfg.db_mysql_database_id = db->ReadString("mysql_database_id", cfg.db_mysql_database_id);
+    cfg.db_mysql_ssl_ca = db->ReadString("mysql_ssl_ca", cfg.db_mysql_ssl_ca);
     cfg.db_mysql_initialize = db->ReadBool("mysql_initialize", cfg.db_mysql_initialize);
     cfg.db_mysql_pool_size = db->ReadInt("mysql_pool_size", cfg.db_mysql_pool_size);
   }

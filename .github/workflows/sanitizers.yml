@@ -66,6 +66,9 @@ jobs:
       - name: Build pinned OpenSSL SDK
         run: python tools/build_openssl.py --config Debug
 
+      - name: Prepare pinned Oracle MySQL SDK and source
+        run: python tools/prepare_mysql.py
+
       - name: Configure
         env:
           SCCACHE_DIR: ${{ github.workspace }}/.sccache

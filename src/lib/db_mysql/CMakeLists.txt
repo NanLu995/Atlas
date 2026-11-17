@@ -1,20 +1,18 @@
-# atlas_db_mysql — MySQL database backend (MariaDB Connector/C)
-
 if(ATLAS_DB_MYSQL)
   add_library(atlas_db_mysql STATIC
+    mysql_client.cc
     mysql_database.cc
     mysql_account_session.cc
   )
   target_include_directories(atlas_db_mysql
-    PUBLIC "${CMAKE_SOURCE_DIR}/src/lib"
-    PRIVATE "${ATLAS_MARIADB_INCLUDE_DIR}")
+    PUBLIC "${CMAKE_SOURCE_DIR}/src/lib")
   target_link_libraries(atlas_db_mysql
     PUBLIC
       atlas_db_iface
       atlas_entitydef
       atlas_foundation
       atlas_network
-      mariadbclient
+      OracleMySQL::Client
       atlas_compiler_options
   )
 
@@ -25,11 +23,10 @@ if(ATLAS_DB_MYSQL)
   set_target_properties(atlas_db_mysql_plugin PROPERTIES
     OUTPUT_NAME "atlas_db_mysql"
     FOLDER "Plugins"
-    # The import lib (.lib on Windows) must not collide with the static library
-    # of the same name; redirect it to a build-tree subdirectory that nothing
-    # references at runtime.
+    # Keep the plugin import library separate from the backend static library.
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/plugins"
   )
+  atlas_deploy_mysql_runtime(atlas_db_mysql_plugin)
   if(UNIX)
     set_target_properties(atlas_db_mysql_plugin PROPERTIES CXX_VISIBILITY_PRESET hidden)
   endif()

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -13,6 +14,7 @@ import tempfile
 
 from common.database import add_database_options, database_config
 from common.json_io import write_json_atomic
+from common.paths import REPO_ROOT
 
 
 TABLES = ('entities', 'meta', 'atlas_entity_id_counter', 'atlas_write_receipts',
@@ -38,12 +40,18 @@ def validate_metadata(metadata: dict, identity: str) -> None:
         raise RuntimeError('Missing or malformed storage_schema_digest')
 
 
-def program(value: str | None, candidates: tuple[str, ...]) -> str:
-    for candidate in (value,) if value else candidates:
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    raise RuntimeError(f'Missing {value or "/".join(candidates)}; pass its path explicitly')
+def program(value: str | None, name: str) -> str:
+    platform = 'windows/mysql-8.4.13-winx64' if os.name == 'nt' else (
+        'linux/mysql-8.4.13-linux-glibc2.28-x86_64-minimal')
+    pinned = REPO_ROOT / 'build/oracle-mysql/8.4.13' / platform / 'bin' / name
+    resolved = shutil.which(value or str(pinned)) or (None if value else shutil.which(name))
+    if not resolved:
+        raise RuntimeError(f'Missing Oracle {name} 8.4; run prepare_mysql or pass its path explicitly')
+    version = subprocess.run([resolved, '--no-defaults', '--version'], check=True,
+                             capture_output=True, timeout=10).stdout.lower()
+    if b'mariadb' in version or not re.search(rb'\b8\.4\.\d+\b', version) or b'mysql' not in version:
+        raise RuntimeError(f'{name} must be Oracle MySQL 8.4; MariaDB and other versions are unsupported')
+    return resolved
 
 
 class Database:
@@ -56,7 +64,8 @@ class Database:
         config = self.settings
         return ['--protocol=tcp', '--host=' + config['mysql_host'],
                 '--port=' + str(config['mysql_port']), '--user=' + config['mysql_user'],
-                '--default-character-set=utf8mb4']
+                '--default-character-set=utf8mb4', '--ssl-mode=VERIFY_IDENTITY',
+                '--ssl-ca=' + config['mysql_ssl_ca'], '--tls-version=TLSv1.2,TLSv1.3']
 
     def run(self, command: list[str], **kwargs) -> None:
         result = subprocess.run(command, env=self.env, stderr=subprocess.PIPE,
@@ -170,9 +179,7 @@ def backup(database: Database, directory: Path, dump: str) -> None:
     command = [dump, '--no-defaults', *database.arguments(), '--single-transaction', '--quick', '--hex-blob',
                '--skip-comments', '--skip-lock-tables', '--skip-add-locks',
                '--skip-add-drop-table', '--skip-triggers']
-    version = subprocess.run([dump, '--version'], check=True, capture_output=True).stdout
-    if b'mariadb' not in version.lower():
-        command += ['--set-gtid-purged=OFF', '--no-tablespaces']
+    command += ['--set-gtid-purged=OFF', '--no-tablespaces']
     command += [database.settings['mysql_database'], *TABLES]
     with (directory / 'database.sql').open('xb') as output:
         database.run(command, stdout=output)
@@ -200,8 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Atlas development database backup and recovery')
     parser.add_argument('action', choices=('new-id', 'backup', 'restore', 'verify'))
     add_database_options(parser)
-    parser.add_argument('--client', help='Path to the matching mariadb/mysql client')
-    parser.add_argument('--dump-tool', help='Path to mariadb-dump/mysqldump')
+    parser.add_argument('--client', help='Path to the matching Oracle mysql 8.4 client')
+    parser.add_argument('--dump-tool', help='Path to the matching Oracle mysqldump 8.4')
     parser.add_argument('--directory', type=Path, help='New backup directory, or trusted backup to read')
     parser.add_argument('--quiesced', action='store_true',
                         help='Assert all DBApps and other writers are stopped; required for backup/restore')
@@ -211,13 +218,13 @@ def main(argv: list[str] | None = None) -> int:
             print(secrets.token_hex(16))
             return 0
         if args.db_backend != 'mysql':
-            raise RuntimeError('Recovery tool requires MySQL/MariaDB; SQLite is single-DBApp smoke only')
+            raise RuntimeError('Recovery tool requires Oracle MySQL 8.4; SQLite is single-DBApp smoke only')
         if args.action != 'verify' and (not args.quiesced or args.directory is None):
             raise RuntimeError('backup/restore require --directory and --quiesced; stop all writers first')
         settings = database_config(args, Path('unused.sqlite3'))
-        database = Database(settings, program(args.client, ('mariadb', 'mysql')))
+        database = Database(settings, program(args.client, 'mysql'))
         if args.action == 'backup':
-            backup(database, args.directory, program(args.dump_tool, ('mariadb-dump', 'mysqldump')))
+            backup(database, args.directory, program(args.dump_tool, 'mysqldump'))
         elif args.action == 'restore':
             restore(database, args.directory)
         else:

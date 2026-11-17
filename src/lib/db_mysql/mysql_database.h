@@ -19,7 +19,7 @@
 #include "db/write_operation.h"
 #include "foundation/callback_utils.h"
 
-struct st_mysql;
+struct MYSQL;
 
 namespace atlas {
 
@@ -121,13 +121,13 @@ class MysqlDatabase : public IDatabase {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::function<void(st_mysql*)>> jobs;
+    std::deque<std::function<void(MYSQL*)>> jobs;
     bool stop{false};
   };
 
   // Deferred callbacks return through ProcessResults on the main loop.
   template <typename R>
-  void Dispatch(uint16_t type_id, uint64_t key, std::function<R(st_mysql*)> op,
+  void Dispatch(uint16_t type_id, uint64_t key, std::function<R(MYSQL*)> op,
                 std::function<void(R)> callback) {
     if (auto admitted = AdmitOperation(); !admitted) {
       callback(DatabaseFailure<R>(admitted.Error()));
@@ -140,7 +140,7 @@ class MysqlDatabase : public IDatabase {
     }
     pending_operations_.fetch_add(1, std::memory_order_relaxed);
     EnqueueForEntity(
-        type_id, key, [this, op = std::move(op), cb = std::move(callback)](st_mysql* conn) mutable {
+        type_id, key, [this, op = std::move(op), cb = std::move(callback)](MYSQL* conn) mutable {
           R r = op(conn);
           PostResult([this, cb = std::move(cb), r = std::move(r)]() mutable {
             SafeInvoke("Database callback", [&] { cb(std::move(r)); });
@@ -150,77 +150,76 @@ class MysqlDatabase : public IDatabase {
   }
 
   [[nodiscard]] auto AdmitOperation() const -> Result<void>;
-  void EnqueueForEntity(uint16_t type_id, uint64_t key, std::function<void(st_mysql*)> job);
+  void EnqueueForEntity(uint16_t type_id, uint64_t key, std::function<void(MYSQL*)> job);
   void PostResult(std::function<void()> result);
   void WorkerLoop(Worker& worker);
-  [[nodiscard]] auto OpenConnection() const -> st_mysql*;
-  void RefreshConnection(st_mysql*& conn) const;
+  [[nodiscard]] auto OpenConnection() const -> MYSQL*;
+  void RefreshConnection(MYSQL*& conn) const;
 
-  auto ValidateSchema(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
-  auto EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
-  auto EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
-  static auto QueryScalar(st_mysql* conn, std::string_view sql)
-      -> Result<std::optional<std::string>>;
-  static auto ExecSql(st_mysql* conn, std::string_view sql) -> Result<void>;
-  static auto QueryRow(st_mysql* conn, std::string_view sql) -> Result<EntityRow>;
+  auto ValidateSchema(MYSQL* conn, const Sha256Digest& storage_schema) const -> Result<void>;
+  auto EnsureSchema(MYSQL* conn, const Sha256Digest& storage_schema) const -> Result<void>;
+  auto EnsureSchemaLocked(MYSQL* conn, const Sha256Digest& storage_schema) const -> Result<void>;
+  static auto QueryScalar(MYSQL* conn, std::string_view sql) -> Result<std::optional<std::string>>;
+  static auto ExecSql(MYSQL* conn, std::string_view sql) -> Result<void>;
+  static auto QueryRow(MYSQL* conn, std::string_view sql) -> Result<EntityRow>;
   static auto ReadRow(char** row, const unsigned long* lengths) -> EntityRow;
-  static auto FetchByDbid(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+  static auto FetchByDbid(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool for_update = false)
+      -> Result<EntityRow>;
+  static auto FetchByName(MYSQL* conn, uint16_t type_id, std::string_view identifier,
                           bool for_update = false) -> Result<EntityRow>;
-  static auto FetchByName(st_mysql* conn, uint16_t type_id, std::string_view identifier,
-                          bool for_update = false) -> Result<EntityRow>;
-  static auto MysqlErr(st_mysql* conn, std::string_view prefix) -> Error;
-  static auto ConstraintErrorKind(st_mysql* conn) -> DatabaseErrorKind;
+  static auto MysqlErr(MYSQL* conn, std::string_view prefix) -> Error;
+  static auto ConstraintErrorKind(MYSQL* conn) -> DatabaseErrorKind;
   // Binary/identifier values go into SQL as X'..' hex literals: byte-exact and
   // injection-proof without escaping. Empty identifier maps to NULL.
   static auto HexLiteral(std::span<const std::byte> data) -> std::string;
   static auto IdentifierLiteral(std::string_view identifier) -> std::string;
-  static auto BeginTxn(st_mysql* conn) -> Result<void>;
-  static auto CheckCheckoutProcess(st_mysql* conn, const CheckoutInfo& owner) -> Result<void>;
-  static auto Commit(st_mysql* conn) -> Result<void>;
-  static void Rollback(st_mysql* conn);
-  static auto LockOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+  static auto BeginTxn(MYSQL* conn) -> Result<void>;
+  static auto CheckCheckoutProcess(MYSQL* conn, const CheckoutInfo& owner) -> Result<void>;
+  static auto Commit(MYSQL* conn) -> Result<void>;
+  static void Rollback(MYSQL* conn);
+  static auto LockOperationReceipt(MYSQL* conn, const std::array<std::byte, 16>& id,
                                    const Sha256Digest& hash)
       -> Result<std::optional<DatabaseOperationReceipt>>;
-  static auto SaveOperationReceipt(st_mysql* conn, const std::array<std::byte, 16>& id,
+  static auto SaveOperationReceipt(MYSQL* conn, const std::array<std::byte, 16>& id,
                                    const DatabaseOperationReceipt& receipt) -> Result<void>;
-  static auto DoCheckoutWithOperation(st_mysql* conn, const DatabaseCheckoutOperation& operation,
+  static auto DoCheckoutWithOperation(MYSQL* conn, const DatabaseCheckoutOperation& operation,
                                       bool acquire) -> GetResult;
 
   // write_password preserves the stored credential for ordinary entity updates.
-  static auto DoPut(st_mysql* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
+  static auto DoPut(MYSQL* conn, DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                     std::span<const std::byte> blob, const std::string& identifier,
                     bool write_password, const std::string& password_hash,
                     bool transaction_open = false) -> PutResult;
-  static auto DoPutWithOperation(st_mysql* conn, const DatabaseWriteOperation& operation,
+  static auto DoPutWithOperation(MYSQL* conn, const DatabaseWriteOperation& operation,
                                  DatabaseID dbid, uint16_t type_id, WriteFlags flags,
                                  std::span<const std::byte> blob, const std::string& identifier)
       -> PutResult;
-  static auto DoGet(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> GetResult;
-  static auto DoDel(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
-                    bool transaction_open = false) -> DelResult;
-  static auto DoLookup(st_mysql* conn, uint16_t type_id, const std::string& identifier)
+  static auto DoGet(MYSQL* conn, DatabaseID dbid, uint16_t type_id) -> GetResult;
+  static auto DoDel(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool transaction_open = false)
+      -> DelResult;
+  static auto DoLookup(MYSQL* conn, uint16_t type_id, const std::string& identifier)
       -> LookupResult;
-  static auto DoCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+  static auto DoCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                          const CheckoutInfo& new_owner) -> GetResult;
-  static auto DoCheckoutByName(st_mysql* conn, uint16_t type_id, const std::string& identifier,
+  static auto DoCheckoutByName(MYSQL* conn, uint16_t type_id, const std::string& identifier,
                                const CheckoutInfo& new_owner) -> GetResult;
-  static auto AcquireCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+  static auto AcquireCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                               const CheckoutInfo& owner, int64_t now_ms) -> Result<uint64_t>;
-  static auto CheckoutTail(st_mysql* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
+  static auto CheckoutTail(MYSQL* conn, DatabaseID dbid, uint16_t type_id, EntityRow row,
                            const CheckoutInfo& new_owner, int64_t now_ms) -> GetResult;
-  static auto DoClearCheckout(st_mysql* conn, DatabaseID dbid, uint16_t type_id) -> Result<bool>;
-  static auto DoClearForAddress(st_mysql* conn, const Address& base_addr) -> Result<int>;
-  static auto DoGetAutoLoad(st_mysql* conn) -> Result<std::vector<EntityData>>;
-  static auto DoSetAutoLoad(st_mysql* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
+  static auto DoClearCheckout(MYSQL* conn, DatabaseID dbid, uint16_t type_id) -> Result<bool>;
+  static auto DoClearForAddress(MYSQL* conn, const Address& base_addr) -> Result<int>;
+  static auto DoGetAutoLoad(MYSQL* conn) -> Result<std::vector<EntityData>>;
+  static auto DoSetAutoLoad(MYSQL* conn, DatabaseID dbid, uint16_t type_id, bool auto_load)
       -> Result<void>;
-  static auto DoGetMaxDbid(st_mysql* conn, DatabaseID low, DatabaseID high) -> DbidRangeResult;
-  static auto DoReserveEntityIds(st_mysql* conn, uint32_t count) -> Result<EntityIdRange>;
-  static auto DoReadAccountSession(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+  static auto DoGetMaxDbid(MYSQL* conn, DatabaseID low, DatabaseID high) -> DbidRangeResult;
+  static auto DoReserveEntityIds(MYSQL* conn, uint32_t count) -> Result<EntityIdRange>;
+  static auto DoReadAccountSession(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                                    bool for_update = false) -> Result<AccountSession>;
-  static auto DoUpdateAccountSession(st_mysql* conn, const AccountSessionOperation& operation)
+  static auto DoUpdateAccountSession(MYSQL* conn, const AccountSessionOperation& operation)
       -> Result<AccountSession>;
 
-  st_mysql* conn_{nullptr};  // bootstrap + inline (non-deferred) connection
+  MYSQL* conn_{nullptr};  // bootstrap + inline (non-deferred) connection
   const EntityDefRegistry* entity_defs_{nullptr};
   DatabaseConfig config_;
   Sha256Digest storage_schema_{};

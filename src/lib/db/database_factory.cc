@@ -38,9 +38,9 @@ auto CreateDatabase(const DatabaseConfig& config) -> std::unique_ptr<IDatabase> 
   }
 
   using CreateFn = IDatabase* (*)();
-  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV5");
+  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV6");
   if (!fn_result) {
-    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v5 (AtlasCreateDatabaseV5 missing)",
+    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v6 (AtlasCreateDatabaseV6 missing)",
                     lib_path.string());
     return nullptr;
   }

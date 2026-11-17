@@ -19,12 +19,12 @@ Atlas 面向大型、长线在线世界：服务器需要跨进程扩展，模�
 - 面向服务端玩法脚本的嵌入式 .NET 运行时。
 - C# 客户端运行时，提供桌面与 Unity 集成表面；UE MVP 另有 C++ 插件 /
   客户端接入路径。
-- 运行时加载的 MySQL/MariaDB 及显式选择的 SQLite 数据库插件。
+- 运行时加载的 Oracle MySQL 8.4 及显式选择的 SQLite 数据库插件。
 - DBAppMgr range 分片、worker 重建式 manager HA，以及对 CellAppMgr /
   BaseAppMgr / DBAppMgr 的 Reviver 监督。
 - Tracy instrumentation、基线压测驱动与 trace 对比工具。
 
-主要 MySQL/MariaDB 后端已实现。DB 副本、shard auto-rebalance 和完整 session resume
+主要 Oracle MySQL 8.4 后端已实现。DB 副本、shard auto-rebalance 和完整 session resume
 不属于当前生产基线。
 
 ## MVP Unity 示例
@@ -59,7 +59,7 @@ LoginApp ──► BaseAppMgr ──► BaseApp ◄──► CellApp
                   ▼          ▼         CellAppMgr
                 DBAppMgr ─► DBApp
                               │
-                   MySQL/MariaDB / SQLite
+                   Oracle MySQL 8.4 / SQLite
 ```
 
 | 进程 | 职责 |
@@ -103,7 +103,7 @@ DBApp 排空已接纳操作和回调。默认截止时间为 30 秒。
 数据库接纳上限为 4,096 项，包含等待消费的回调。满载在执行前拒绝，返回 `RateLimited` /
 `kOverloaded`；排空时新工作返回 `ReceiverGone` / `kStopping`。`BeginDrain` 和
 `PendingOperations` 提供生命周期接口。checkout 清理及自动加载读写接口均通过 `Result`
-回调传递错误，不能把失败解释为空的成功结果。数据库插件须导出 `AtlasCreateDatabaseV5`。
+回调传递错误，不能把失败解释为空的成功结果。数据库插件须导出 `AtlasCreateDatabaseV6`。
 即时可靠 UDP 发送同样遵守发送窗口。每通道、每可靠性类别的延迟 Bundle 上限为
 256 KiB，满载时返回 `WouldBlock` 且不追加。RPC 调用区分满载 `RateLimited`、重复请求
 `AlreadyExists` 和停服 `ReceiverGone`，被拒绝的请求不发送。
@@ -441,11 +441,17 @@ DBApp 会初始化表结构，须使用空测试库。BaseApp 会话/崩溃验�
 
 ## 数据库
 
-Atlas 通过 database factory 加载 SQLite 和 MySQL/MariaDB 插件。主要开发、联调、正式部署
-和集群验收使用 MySQL/MariaDB，多个 DBApp 共享同一个逻辑数据库。
-`ATLAS_DB_MYSQL` 默认 ON，使用 MariaDB Connector/C 构建插件。SQLite 必须显式选择，
+构建前先运行 `tools\bin\prepare_mysql.bat`（Linux 为 `bash tools/bin/prepare_mysql.sh`），
+准备固定的 Oracle 客户端。参见 [Oracle MySQL 配置与许可](docs/oracle_mysql_CN.md)。
+MySQL 必须配置 `mysql_ssl_ca`（或 `--db-mysql-ssl-ca`），始终验证证书链和配置主机的身份；
+不提供明文或关闭校验的模式。
+
+
+Atlas 通过 database factory 加载 SQLite 和 Oracle MySQL 8.4 插件。主要开发、联调、正式部署
+和集群验收使用 Oracle MySQL 8.4，多个 DBApp 共享同一个逻辑数据库。
+`ATLAS_DB_MYSQL` 默认 ON，使用固定版本的 Oracle libmysqlclient C API 构建插件。SQLite 必须显式选择，
 仅用于单 DBApp 轻量开发、快速冒烟和独立测试，支持 WAL 和 busy-timeout。
-通过 JSON 的 `database.type` 或 `--db-type` 选择 `sqlite` 或 `mysql`（MariaDB 也使用 `mysql`）。
+通过 JSON 的 `database.type` 或 `--db-type` 选择 `sqlite` 或 `mysql`。
 XML 数据库后端已移除。显式选择 `xml` 或其他不支持的类型时，配置校验和工厂创建均明确失败，
 即使程序旁仍有旧插件也不会加载，不会回退到其他后端。现有数据文件不删除，也不提供迁移工具。
 通用 XML 解析、序列化、配置数据及实体定义支持保留。
@@ -591,7 +597,7 @@ MySQL 和 SQLite 还独立于实体 checkout 保存账号会话所有权。带�
 持有者不可达、版本已改变或提交结果不确定时拒绝本次登录，不推断会话已经离线。
 登录检查及接收的撤销请求分别限制为 1024 项；取消登录检查后不能继续 checkout，
 取消等待不撤销已经完成的会话撤销。
-数据库插件须导出 `AtlasCreateDatabaseV5`，需同时重建两个插件及服务器；
+数据库插件须导出 `AtlasCreateDatabaseV6`，需同时重建两个插件及服务器；
 加载器明确拒绝旧接口，避免调用不兼容的虚函数表。
 出生及死亡通知只接受当前 machined 通道。即使仅订阅死亡回调，`MachinedClient` 仍跟踪进程实例；
 相同地址出现新实例时重建内部 RUDP 通道，旧实例的晚到死亡通知被忽略。
@@ -633,7 +639,8 @@ DBApp 配置示例：
     "mysql_port": 3306,
     "mysql_user": "<数据库用户>",
     "mysql_database": "<隔离开发数据库>",
-    "mysql_database_id": "<32位小写十六进制逻辑数据库ID>"
+    "mysql_database_id": "<32位小写十六进制逻辑数据库ID>",
+    "mysql_ssl_ca": "<数据库可信CA.pem>"
   }
 }
 ```
@@ -642,7 +649,7 @@ DBApp 配置示例：
 通过密钥存储或遮蔽输入，在启动进程的环境中设置 `ATLAS_DB_MYSQL_PASSWORD`，不要把凭据
 放入命令、提交的配置或日志。DBApp 在配置密码为空时读取此变量；地址、用户和库名从配置或
 CLI 读取。缺少库名/用户/密码、参数无效、插件不可用或连接失败均停止启动，不回退 SQLite。
-工具还支持 `ATLAS_DB_MYSQL_HOST`、`PORT`、`USER`、`PASSWORD`、`DATABASE`、`DATABASE_ID`、`POOL_SIZE`
+工具还支持 `ATLAS_DB_MYSQL_HOST`、`PORT`、`USER`、`PASSWORD`、`DATABASE`、`DATABASE_ID`、`POOL_SIZE`、`SSL_CA`
 （均带 `ATLAS_DB_MYSQL_` 前缀），或 `--database-config <本地JSON>`。工具通过子进程环境
 传递密码，不将密码写入生成的 JSON。
 
@@ -657,7 +664,7 @@ CLI 读取。缺少库名/用户/密码、参数无效、插件不可用或连�
 `ATLAS_DB_MYSQL_INITIALIZE=true|false`，默认 false。正式启动、恢复和切换保持 false，
 避免误配空库被当作新存储认领。已有库无论是否启用初始化都先校验，不覆盖身份、不升级元数据。
 
-开发恢复工具复用已安装且匹配的 `mariadb`/`mariadb-dump` 或 `mysql`/`mysqldump`；
+开发恢复工具使用固定的 Oracle `mysql`/`mysqldump` 8.4 SDK，或显式指定匹配的 Oracle 工具；
 不在 PATH 时用 `--client`、`--dump-tool` 指定。备份及恢复前停止全部 DBApp 和其他写入者，
 `--quiesced` 表示操作者确认此条件，不提供在线备份协调。使用新的私有备份目录及已有空目标库，
 源、目标配置使用相同逻辑身份。

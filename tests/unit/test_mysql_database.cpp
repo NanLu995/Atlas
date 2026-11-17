@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include "atdf_account_fixture.h"
+#include "db_mysql/mysql_client.h"
 #include "db_mysql/mysql_database.h"
 #include "entitydef/entity_def_registry.h"
 #include "network/socket.h"
@@ -62,15 +63,26 @@ auto make_config() -> DatabaseConfig {
   cfg.mysql_password = env_or("ATLAS_TEST_MYSQL_PASSWORD", "");
   cfg.mysql_database = env_or("ATLAS_TEST_MYSQL_DATABASE", "atlas_test");
   cfg.mysql_database_id = "0123456789abcdef0123456789abcdef";
+  cfg.mysql_ssl_ca = env_or("ATLAS_TEST_MYSQL_SSL_CA", "");
   cfg.mysql_initialize = true;
   return cfg;
 }
 
 auto connect_admin(const DatabaseConfig& cfg) -> std::unique_ptr<MYSQL, decltype(&mysql_close)> {
+  if (!InitializeMysqlThread()) return {nullptr, mysql_close};
   std::unique_ptr<MYSQL, decltype(&mysql_close)> admin(mysql_init(nullptr), mysql_close);
   if (!admin) return admin;
+  unsigned int protocol = MYSQL_PROTOCOL_TCP;
   unsigned int timeout = 5;
-  mysql_options(admin.get(), MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+  enum mysql_ssl_mode mode = SSL_MODE_VERIFY_IDENTITY;
+  if (mysql_options(admin.get(), MYSQL_OPT_PROTOCOL, &protocol) != 0 ||
+      mysql_options(admin.get(), MYSQL_OPT_CONNECT_TIMEOUT, &timeout) != 0 ||
+      mysql_options(admin.get(), MYSQL_OPT_SSL_CA, cfg.mysql_ssl_ca.c_str()) != 0 ||
+      mysql_options(admin.get(), MYSQL_OPT_SSL_MODE, &mode) != 0) {
+    ADD_FAILURE() << "MySQL admin TLS options failed";
+    admin.reset();
+    return admin;
+  }
   if (!mysql_real_connect(admin.get(), cfg.mysql_host.c_str(), cfg.mysql_user.c_str(),
                           cfg.mysql_password.c_str(), cfg.mysql_database.c_str(), cfg.mysql_port,
                           nullptr, 0)) {
@@ -79,6 +91,17 @@ auto connect_admin(const DatabaseConfig& cfg) -> std::unique_ptr<MYSQL, decltype
     admin.reset();
   }
   return admin;
+}
+
+auto HoldSchemaLock(MYSQL* connection) -> bool {
+  if (mysql_query(connection,
+                  "SELECT GET_LOCK(CONCAT('atlas.schema.', LEFT(SHA2(DATABASE(),256),48)),0)") != 0)
+    return false;
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(connection),
+                                                                mysql_free_result);
+  if (!rows) return false;
+  auto row = mysql_fetch_row(rows.get());
+  return row && row[0] && std::string_view(row[0]) == "1";
 }
 
 auto reset_schema(const DatabaseConfig& cfg) -> bool {
@@ -200,15 +223,34 @@ TEST(MysqlConfiguration, LogicalIdentityMustBeExplicitAndWellFormed) {
   }
 }
 
+TEST(MysqlConfiguration, CertificateAuthorityMustBeExplicit) {
+  auto config = make_config();
+  config.mysql_password = "<test-only-password>";
+  config.mysql_ssl_ca.clear();
+  MysqlDatabase database;
+  auto result = database.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kInvalidArgument);
+  EXPECT_NE(result.Error().Message().find("mysql_ssl_ca"), std::string_view::npos);
+}
+
 class MysqlDatabaseTest : public ::testing::Test {
  protected:
+  static inline std::optional<DatabaseConfig> cleanup_config_;
+
+  static void TearDownTestSuite() {
+    if (!cleanup_config_) return;
+    EXPECT_TRUE(reset_schema(*cleanup_config_));
+    cleanup_config_.reset();
+  }
+
   void SetUp() override {
     if (std::getenv("ATLAS_TEST_MYSQL") == nullptr) {
       FAIL() << "MySQL environment blocked: set ATLAS_TEST_MYSQL and all connection settings";
     }
     for (const char* key :
          {"ATLAS_TEST_MYSQL_HOST", "ATLAS_TEST_MYSQL_PORT", "ATLAS_TEST_MYSQL_USER",
-          "ATLAS_TEST_MYSQL_PASSWORD", "ATLAS_TEST_MYSQL_DATABASE"}) {
+          "ATLAS_TEST_MYSQL_PASSWORD", "ATLAS_TEST_MYSQL_DATABASE", "ATLAS_TEST_MYSQL_SSL_CA"}) {
       const char* value = std::getenv(key);
       ASSERT_NE(value, nullptr) << "MySQL environment blocked: missing " << key;
       ASSERT_NE(*value, '\0') << "MySQL environment blocked: empty " << key;
@@ -216,6 +258,7 @@ class MysqlDatabaseTest : public ::testing::Test {
     register_account_entity();
 
     cfg_ = make_config();
+    cleanup_config_ = cfg_;
     ASSERT_TRUE(reset_schema(cfg_))
         << "cannot prepare isolated MySQL schema at " << cfg_.mysql_host << ":" << cfg_.mysql_port;
 
@@ -241,6 +284,95 @@ class MysqlDatabaseTest : public ::testing::Test {
   MysqlDatabase db_;
   DatabaseConfig cfg_;
 };
+
+TEST_F(MysqlDatabaseTest, StartupReportsLockBudgetExhaustionWithoutDisconnecting) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_TRUE(HoldSchemaLock(admin.get()));
+  MysqlDatabase peer;
+  auto result = peer.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kTimeout);
+  EXPECT_EQ(mysql_ping(admin.get()), 0);
+}
+
+TEST_F(MysqlDatabaseTest, StartupWaitsForSchemaLockBeyondTheQueryTimeout) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_TRUE(HoldSchemaLock(admin.get()));
+  std::jthread release([&] {
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    ASSERT_TRUE(InitializeMysqlThread());
+    EXPECT_EQ(
+        mysql_query(admin.get(),
+                    "DO RELEASE_LOCK(CONCAT('atlas.schema.', LEFT(SHA2(DATABASE(),256),48)))"),
+        0);
+  });
+  MysqlDatabase peer;
+  auto result = peer.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_TRUE(result) << result.Error().Message();
+}
+
+TEST_F(MysqlDatabaseTest, LocalhostUsesTheConfiguredTcpPortAndVerifiedTls) {
+  auto config = cfg_;
+  config.mysql_host = "localhost";
+  MysqlDatabase peer;
+  auto result = peer.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_TRUE(result) << result.Error().Message();
+  EXPECT_TRUE(MysqlDatabaseTestAccess::UsesTls(peer));
+}
+
+TEST_F(MysqlDatabaseTest, CachingSha2FullAuthenticationUsesVerifiedTls) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(), "FLUSH PRIVILEGES"), 0);
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(cfg_, EntityDefRegistry::Instance()));
+  EXPECT_TRUE(MysqlDatabaseTestAccess::UsesTls(peer));
+}
+
+TEST_F(MysqlDatabaseTest, RejectsUntrustedCertificateAuthority) {
+  auto config = cfg_;
+  config.mysql_ssl_ca = env_or("ATLAS_TEST_MYSQL_UNTRUSTED_CA", "");
+  ASSERT_FALSE(config.mysql_ssl_ca.empty())
+      << "Provide a different CA for the TLS negative contract";
+  MysqlDatabase database;
+  auto result = database.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kIoError);
+}
+
+TEST_F(MysqlDatabaseTest, RejectsCertificateForAnotherTargetIdentity) {
+  auto listener = Socket::CreateTcp();
+  ASSERT_TRUE(listener);
+  ASSERT_TRUE(listener->Bind(Address("127.0.0.2", 0)));
+  ASSERT_TRUE(listener->Listen(1));
+  auto address = listener->LocalAddress();
+  ASSERT_TRUE(address);
+  auto upstream = Address::Resolve(cfg_.mysql_host, cfg_.mysql_port);
+  ASSERT_TRUE(upstream);
+  std::atomic<bool> armed{false};
+  std::atomic<bool> dropped{false};
+  std::jthread proxy([&](std::stop_token stop) {
+    (void)RelayUntilCommittedReply(std::move(*listener), *upstream, cfg_, stop, armed, dropped);
+  });
+  auto config = cfg_;
+  config.mysql_host = "127.0.0.2";
+  config.mysql_port = address->Port();
+  MysqlDatabase database;
+  auto result = database.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kIoError);
+}
+
+TEST_F(MysqlDatabaseTest, RejectsWrongPasswordWithVerifiedTls) {
+  auto config = cfg_;
+  config.mysql_password += "<incorrect>";
+  MysqlDatabase database;
+  auto result = database.Startup(config, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kIoError);
+}
 
 TEST_F(MysqlDatabaseTest, StartupRejectsSchemaVersionWithoutOverwritingIt) {
   auto admin = connect_admin(cfg_);
@@ -352,6 +484,7 @@ TEST_F(MysqlDatabaseTest, NormalStartupCannotClaimAnUnknownEmptyDatabase) {
   normal.mysql_password = cfg_.mysql_password;
   normal.mysql_database = cfg_.mysql_database;
   normal.mysql_database_id = cfg_.mysql_database_id;
+  normal.mysql_ssl_ca = cfg_.mysql_ssl_ca;
   const auto started = db_.Startup(normal, EntityDefRegistry::Instance());
   EXPECT_FALSE(started.HasValue());
   auto admin = connect_admin(cfg_);

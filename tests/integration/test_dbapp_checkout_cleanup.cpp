@@ -92,7 +92,8 @@ struct DBAppArgv {
                       std::getenv("ATLAS_TEST_MYSQL_USER"), "--db-mysql-password",
                       std::getenv("ATLAS_TEST_MYSQL_PASSWORD"), "--db-mysql-database",
                       std::getenv("ATLAS_TEST_MYSQL_DATABASE"), "--db-mysql-database-id",
-                      "0123456789abcdef0123456789abcdef", "--db-mysql-initialize", "true"});
+                      "0123456789abcdef0123456789abcdef", "--db-mysql-ssl-ca",
+                      std::getenv("ATLAS_TEST_MYSQL_SSL_CA"), "--db-mysql-initialize", "true"});
     }
     for (auto& s : storage) ptrs.push_back(s.data());
   }

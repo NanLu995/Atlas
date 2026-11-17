@@ -250,6 +250,7 @@ class DatabaseToolsTest(unittest.TestCase):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
                        'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
                        'ATLAS_DB_MYSQL_DATABASE': 'isolated_test',
+                       'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>',
                        'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
         with patch.dict(os.environ, environment, clear=True):
             config = database_config(self.args(), Path('unused.sqlite3'))
@@ -266,7 +267,8 @@ class DatabaseToolsTest(unittest.TestCase):
     def test_mysql_identity_is_required_and_never_inferred_from_database_name(self):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
                        'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
-                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test'}
+                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test',
+                       'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>'}
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, 'mysql_database_id'):
                 database_config(self.args(), Path('unused.sqlite3'))
@@ -279,6 +281,7 @@ class DatabaseToolsTest(unittest.TestCase):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
                        'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
                        'ATLAS_DB_MYSQL_DATABASE': 'isolated_test',
+                       'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>',
                        'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
         with patch.dict(os.environ, environment, clear=True):
             self.assertFalse(database_config(self.args(), Path('unused'))['mysql_initialize'])
@@ -321,14 +324,28 @@ class DatabaseRecoveryToolsTest(unittest.TestCase):
     identity = '0123456789abcdef0123456789abcdef'
 
     def test_connection_arguments_are_shared_by_client_and_dump_without_credentials(self):
-        settings = {'mysql_host': '127.0.0.1', 'mysql_port': 3306, 'mysql_user': '<test-user>'}
+        settings = {'mysql_host': '127.0.0.1', 'mysql_port': 3306, 'mysql_user': '<test-user>',
+                    'mysql_ssl_ca': '<test-ca.pem>'}
         with patch.dict(os.environ, {'ATLAS_DB_MYSQL_PASSWORD': '<test-password>'}, clear=True):
-            database = recovery.Database(settings, 'mariadb')
+            database = recovery.Database(settings, 'mysql')
             arguments = database.arguments()
             self.assertEqual(arguments, ['--protocol=tcp', '--host=127.0.0.1', '--port=3306',
-                                         '--user=<test-user>', '--default-character-set=utf8mb4'])
+                                         '--user=<test-user>', '--default-character-set=utf8mb4',
+                                         '--ssl-mode=VERIFY_IDENTITY', '--ssl-ca=<test-ca.pem>',
+                                         '--tls-version=TLSv1.2,TLSv1.3'])
             self.assertNotIn('<test-password>', ' '.join(arguments))
             self.assertEqual(database.env['MYSQL_PWD'], '<test-password>')
+
+    def test_recovery_rejects_wrong_vendor_and_client_series(self):
+        for version in (b'mysql Ver 15.1 Distrib 11.8.6-MariaDB', b'mysql Ver 8.0.45 MySQL'):
+            with patch.object(recovery.shutil, 'which', return_value='candidate'), \
+                 patch.object(recovery.subprocess, 'run', return_value=SimpleNamespace(stdout=version)):
+                with self.assertRaisesRegex(RuntimeError, 'Oracle MySQL 8.4'):
+                    recovery.program('candidate', 'mysql')
+        with patch.object(recovery.shutil, 'which', return_value='candidate'), \
+             patch.object(recovery.subprocess, 'run', return_value=SimpleNamespace(
+                 stdout=b'mysql Ver 8.4.13 MySQL Community Server - GPL')):
+            self.assertEqual(recovery.program('candidate', 'mysql'), 'candidate')
 
     def manifest(self, directory):
         (directory / 'database.sql').write_bytes(b'CREATE TABLE isolated (id INT);')
@@ -389,14 +406,14 @@ class DatabaseRecoveryToolsTest(unittest.TestCase):
 
     def test_backup_rejects_changed_source_and_does_not_publish_manifest(self):
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(recovery.subprocess, 'run', return_value=SimpleNamespace(stdout=b'MariaDB')):
+             patch.object(recovery.subprocess, 'run', return_value=SimpleNamespace(stdout=b'mysqldump  Ver 8.4.13 MySQL Community Server - GPL')):
             root = Path(directory) / 'backup'
             database = Mock(settings={'mysql_database': 'isolated_test'})
             database.inspect.return_value = {}
             database.arguments.return_value = []
             database.fingerprint.side_effect = [{'old': {}}, {'new': {}}]
             with self.assertRaisesRegex(RuntimeError, 'changed during backup'):
-                recovery.backup(database, root, 'mariadb-dump')
+                recovery.backup(database, root, 'mysqldump')
             self.assertFalse((root / 'manifest.json').exists())
 
     def test_recovery_requires_mysql_and_explicit_quiescence(self):

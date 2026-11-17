@@ -1,6 +1,5 @@
 name: MySQL Backend
 
-# Required MySQL database contracts use an isolated MariaDB service.
 on:
   workflow_dispatch:
   push:
@@ -21,6 +20,9 @@ on:
       - 'tests/unit/test_mysql_database.cpp'
       - 'tests/unit/CMakeLists.txt'
       - 'cmake/Dependencies.cmake'
+      - 'cmake/AtlasMySQL.cmake'
+      - 'tools/prepare_mysql.py'
+      - 'tools/test_mysql.py'
       - 'cmake/AtlasRuntimeDeploy.cmake'
       - '.github/workflows/mysql-backend.yml'
   pull_request:
@@ -40,6 +42,9 @@ on:
       - 'tests/CMakeLists.txt'
       - 'tests/unit/test_mysql_database.cpp'
       - 'cmake/Dependencies.cmake'
+      - 'cmake/AtlasMySQL.cmake'
+      - 'tools/prepare_mysql.py'
+      - 'tools/test_mysql.py'
       - 'cmake/AtlasRuntimeDeploy.cmake'
       - '.github/workflows/mysql-backend.yml'
 
@@ -49,23 +54,8 @@ concurrency:
 
 jobs:
   mysql:
-    name: MariaDB service
+    name: Oracle MySQL 8.4.13 TLS
     runs-on: ubuntu-24.04
-    services:
-      mariadb:
-        image: mariadb:11
-        env:
-          MARIADB_ROOT_PASSWORD: atlas_root
-          MARIADB_DATABASE: atlas_test
-          MARIADB_USER: atlas
-          MARIADB_PASSWORD: atlas
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="healthcheck.sh --connect --innodb_initialized"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
 
     steps:
       - name: Checkout
@@ -86,6 +76,9 @@ jobs:
       - name: Build pinned OpenSSL SDK
         run: python tools/build_openssl.py --config Debug
 
+      - name: Prepare pinned Oracle MySQL SDK and source
+        run: python tools/prepare_mysql.py
+
       - name: Configure
         run: cmake --preset debug -DATLAS_DB_MYSQL=ON
 
@@ -93,12 +86,8 @@ jobs:
         run: cmake --build build/debug --config Debug --target test_mysql_database test_dbapp_checkout_cleanup atlas_db_mysql_plugin --parallel 2
 
       - name: Run MySQL backend and DBApp contracts
-        working-directory: build/debug
-        env:
-          ATLAS_TEST_MYSQL: '1'
-          ATLAS_TEST_MYSQL_HOST: 127.0.0.1
-          ATLAS_TEST_MYSQL_PORT: '3306'
-          ATLAS_TEST_MYSQL_USER: atlas
-          ATLAS_TEST_MYSQL_PASSWORD: atlas
-          ATLAS_TEST_MYSQL_DATABASE: atlas_test
-        run: ctest --build-config Debug -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$" --output-on-failure --no-tests=error
+        run: >-
+          python tools/test_mysql.py --docker --
+          ctest --test-dir build/debug --build-config Debug
+          -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$"
+          --output-on-failure --no-tests=error

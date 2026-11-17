@@ -73,18 +73,21 @@ TEST(ServerConfig, InvalidProductionValueCannotSilentlySelectDevelopment) {
 
 TEST(ServerConfig, DatabaseIdentityAndInitializationLoadFromJsonAndCommandLine) {
   const std::string identity = "0123456789abcdef0123456789abcdef";
-  FakeArgv args({"exe", "--db-mysql-database-id", identity, "--db-mysql-initialize", "true"});
+  FakeArgv args({"exe", "--db-mysql-database-id", identity, "--db-mysql-ssl-ca", "ca.pem",
+                 "--db-mysql-initialize", "true"});
   auto config = ServerConfig::FromArgs(args.argc(), args.argv());
   ASSERT_TRUE(config);
   EXPECT_EQ(config->db_mysql_database_id, identity);
   EXPECT_TRUE(config->db_mysql_initialize);
+  EXPECT_EQ(config->db_mysql_ssl_ca, "ca.pem");
   auto path =
       write_temp_json(R"({"database":{"mysql_database_id":"0123456789abcdef0123456789abcdef",
-                                      "mysql_initialize":false}})");
+                                      "mysql_initialize":false,"mysql_ssl_ca":"json-ca.pem"}})");
   config = ServerConfig::FromJsonFile(path);
   ASSERT_TRUE(config);
   EXPECT_EQ(config->db_mysql_database_id, identity);
   EXPECT_FALSE(config->db_mysql_initialize);
+  EXPECT_EQ(config->db_mysql_ssl_ca, "json-ca.pem");
 }
 
 TEST(ProcessType, CaseInsensitive) {

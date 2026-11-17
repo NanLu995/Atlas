@@ -67,6 +67,7 @@ struct ServerConfig {
   std::string db_mysql_password;
   std::string db_mysql_database;
   std::string db_mysql_database_id;
+  std::string db_mysql_ssl_ca;
   bool db_mysql_initialize{false};
   int db_mysql_pool_size{4};
 

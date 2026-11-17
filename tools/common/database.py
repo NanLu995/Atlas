@@ -34,7 +34,7 @@ def database_config(args: argparse.Namespace, sqlite_path: Path) -> dict[str, ob
         settings.setdefault('sqlite_path', str(sqlite_path))
         settings.setdefault('sqlite_foreign_keys', True)
         return settings
-    for field in ('host', 'port', 'user', 'password', 'database', 'database_id', 'pool_size'):
+    for field in ('host', 'port', 'user', 'password', 'database', 'database_id', 'pool_size', 'ssl_ca'):
         key = 'mysql_' + field
         value = os.environ.get('ATLAS_DB_MYSQL_' + field.upper())
         if value is not None and key not in settings:
@@ -42,7 +42,7 @@ def database_config(args: argparse.Namespace, sqlite_path: Path) -> dict[str, ob
     settings.setdefault('mysql_host', '127.0.0.1')
     settings.setdefault('mysql_port', 3306)
     settings.setdefault('mysql_pool_size', 4)
-    missing = [key for key in ('mysql_host', 'mysql_user', 'mysql_password', 'mysql_database', 'mysql_database_id')
+    missing = [key for key in ('mysql_host', 'mysql_user', 'mysql_password', 'mysql_database', 'mysql_database_id', 'mysql_ssl_ca')
                if not isinstance(settings.get(key), str) or not settings[key].strip()]
     if missing:
         raise RuntimeError('MySQL environment blocked: missing ' + ', '.join(missing) +

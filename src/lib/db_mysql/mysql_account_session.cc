@@ -9,7 +9,7 @@
 
 namespace atlas {
 
-auto MysqlDatabase::DoReadAccountSession(st_mysql* conn, DatabaseID dbid, uint16_t type_id,
+auto MysqlDatabase::DoReadAccountSession(MYSQL* conn, DatabaseID dbid, uint16_t type_id,
                                          bool for_update) -> Result<AccountSession> {
   if (conn == nullptr) return Error{ErrorCode::kIoError, "account session database unavailable"};
   if (dbid <= kInvalidDBID || type_id == 0)
@@ -38,7 +38,7 @@ auto MysqlDatabase::DoReadAccountSession(st_mysql* conn, DatabaseID dbid, uint16
   return *session;
 }
 
-auto MysqlDatabase::DoUpdateAccountSession(st_mysql* conn, const AccountSessionOperation& op)
+auto MysqlDatabase::DoUpdateAccountSession(MYSQL* conn, const AccountSessionOperation& op)
     -> Result<AccountSession> {
   if (auto valid = ValidateSessionOperation(op); !valid) return valid.Error();
   auto hash = HashSessionOperation(op);
@@ -135,7 +135,7 @@ void MysqlDatabase::ReadAccountSession(DatabaseID dbid, uint16_t type_id,
                                        std::function<void(Result<AccountSession>)> callback) {
   Dispatch<Result<AccountSession>>(
       type_id, static_cast<uint64_t>(dbid),
-      [dbid, type_id](st_mysql* conn) { return DoReadAccountSession(conn, dbid, type_id); },
+      [dbid, type_id](MYSQL* conn) { return DoReadAccountSession(conn, dbid, type_id); },
       std::move(callback));
 }
 
@@ -143,7 +143,7 @@ void MysqlDatabase::UpdateAccountSession(const AccountSessionOperation& operatio
                                          std::function<void(Result<AccountSession>)> callback) {
   Dispatch<Result<AccountSession>>(
       operation.account_type_id, static_cast<uint64_t>(operation.account_dbid),
-      [operation](st_mysql* conn) { return DoUpdateAccountSession(conn, operation); },
+      [operation](MYSQL* conn) { return DoUpdateAccountSession(conn, operation); },
       std::move(callback));
 }
 

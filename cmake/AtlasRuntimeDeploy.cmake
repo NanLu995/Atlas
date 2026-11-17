@@ -145,6 +145,9 @@ function(atlas_deploy_db_plugins target)
   foreach(_plugin IN ITEMS atlas_db_sqlite_plugin atlas_db_mysql_plugin)
     if(TARGET ${_plugin})
       add_dependencies(${target} ${_plugin})
+      if(_plugin STREQUAL "atlas_db_mysql_plugin")
+        atlas_deploy_mysql_runtime(${target})
+      endif()
       if(WIN32)
         add_custom_command(TARGET ${target} POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -176,5 +179,14 @@ function(atlas_deploy_clr_runtime_if_needed target)
   _atlas_transitively_links(${target} atlas_clrscript _need_clr)
   if(_need_clr)
     atlas_deploy_clr_runtime(${target})
+  endif()
+endfunction()
+
+function(atlas_deploy_mysql_runtime target)
+  if(WIN32 AND ATLAS_DB_MYSQL)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ATLAS_MYSQL_RUNTIME_FILES}
+              "$<TARGET_FILE_DIR:${target}>"
+      VERBATIM)
   endif()
 endfunction()

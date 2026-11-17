@@ -518,8 +518,9 @@ if(ATLAS_DB_MYSQL)
     SOURCES test_mysql_database.cpp
     DEPS atlas_db_mysql atlas_entitydef atlas_platform
   )
+  atlas_deploy_mysql_runtime(test_mysql_database)
   target_include_directories(test_mysql_database PRIVATE
-    "${ATLAS_MARIADB_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../integration")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../integration")
 endif()
 
 atlas_add_test(NAME test_coro_task

@@ -32,6 +32,7 @@ struct DatabaseConfig {
   std::string mysql_password;
   std::string mysql_database;
   std::string mysql_database_id;
+  std::string mysql_ssl_ca;
   bool mysql_initialize{false};
   int mysql_pool_size{4};
 };
