@@ -77,6 +77,14 @@ add_test(NAME test_build_tool
   COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_build.py)
 set_tests_properties(test_build_tool PROPERTIES LABELS "unit")
+add_test(NAME test_client_sdk_tool
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_client_sdk.py)
+set_tests_properties(test_client_sdk_tool PROPERTIES LABELS "unit")
+add_test(NAME test_package_delivery_tool
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/unit" -p test_package_delivery.py)
+set_tests_properties(test_package_delivery_tool PROPERTIES LABELS "unit")
 
 add_test(NAME test_database_tools
   COMMAND "${Python3_EXECUTABLE}" -m unittest discover

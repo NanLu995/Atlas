@@ -9,7 +9,6 @@ FetchContent_Declare(
   googletest
   URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
   URL_HASH SHA256=7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926
-  FIND_PACKAGE_ARGS NAMES GTest
 )
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
@@ -27,6 +26,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   rapidjson
   URL https://github.com/Tencent/rapidjson/archive/ab1842a2dae061284c0a62dca1cc6d5e7e37e346.tar.gz
+    URL_HASH SHA256=39f96f17b40f7201042c9b45d6444cb7eae1b7adfb7455412a86f6140450d32d
   SOURCE_SUBDIR cmake-noop
 )
 
@@ -43,6 +43,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   sqlite3
   URL https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip
+    URL_HASH SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
   SOURCE_SUBDIR cmake-noop
 )
 
@@ -63,6 +64,7 @@ if(ATLAS_HEAP_ALLOCATOR STREQUAL "mimalloc")
   FetchContent_Declare(
     mimalloc
     URL https://github.com/microsoft/mimalloc/archive/refs/tags/v2.3.1.tar.gz
+    URL_HASH SHA256=c734977280f325a24fb61086837ae34eb473c301ef9a764c01bdd50fcfd8d2a3
   )
 endif()
 
@@ -81,20 +83,15 @@ if(ATLAS_ENABLE_RECAST)
   FetchContent_Declare(
     recastnavigation
     URL https://github.com/recastnavigation/recastnavigation/archive/refs/tags/v1.6.0.tar.gz
+    URL_HASH SHA256=d48ca0121962fa0639502c0f56c4e3ae72f98e55d88727225444f500775c0074
   )
 endif()
 
 # ── Tracy 0.13.1 ─────────────────────────────────────────────────────────────
-# Pinned in lockstep with the Tracy-NET 0.13.2 NuGet package referenced
-# from Atlas.Runtime.csproj — Tracy's wire protocol changes between
-# minor versions, and a mismatched native↔managed pair connects but
-# silently drops zones. Tracy-NET (xLuxy fork of the original
-# clibequilibrium/Tracy-CSharp) tracks upstream Tracy actively; if it
-# stalls, prefer freezing here over splitting native and managed
-# protocol versions.
 FetchContent_Declare(
   tracy
   URL https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz
+    URL_HASH SHA256=d4efc50ebcb0bfcfdbba148995aeb75044c0d80f5d91223aebfaa8fa9e563d2b
 )
 
 # ── Make available ───────────────────────────────────────────────────────────

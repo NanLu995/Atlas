@@ -124,6 +124,7 @@ if(ATLAS_BUILD_TRACY_VIEWER)
     if(NOT EXISTS "${_atlas_tracy_viewer_marker}")
       message(STATUS "Atlas: downloading Tracy viewer ${_atlas_tracy_viewer_url}")
       file(DOWNLOAD "${_atlas_tracy_viewer_url}" "${_atlas_tracy_viewer_archive}"
+           EXPECTED_HASH SHA256=ee6db1a7e71a12deb5973a8dbfdf9f36d3635bec0e0b31b1cc74f28de7dac4c9
            SHOW_PROGRESS STATUS _atlas_dl_status)
       list(GET _atlas_dl_status 0 _atlas_dl_code)
       if(NOT _atlas_dl_code EQUAL 0)

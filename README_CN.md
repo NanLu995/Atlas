@@ -1,5 +1,7 @@
 # Atlas Engine
 
+[开发、Godot 接入与交付主流程](docs/development_CN.md)（推荐入口）。Unity/UE 示例和 WSL 属于辅助路线。
+
 > 状态：当前项目入口说明。更细的阶段完成度以
 > [`docs/roadmap/README.md`](docs/roadmap/README.md) 为准。
 >
@@ -118,21 +120,21 @@ LoginApp 在已接纳登录处理期间暂停客户端的 3 秒空闲计时，�
 
 Windows：
 
-- Visual Studio 2026（推荐）或 Visual Studio 2022 17.14+，安装 Desktop development with C++ 工作负载；所有生成器均通过 .NET SDK CLI 构建托管项目
+- Visual Studio 2022 17.14 正式版、MSVC 14.44（允许补丁更新），安装 Desktop development with C++ 工作负载；所有生成器均通过 .NET SDK CLI 构建托管项目
 - CMake 3.28+
 - .NET 10 SDK
-- Python 3.9+
+- Python 3.11.8+
 - Git
 
 Linux：
 
-- GCC 13+ 或支持 C++20 的 Clang
+- Ubuntu 24.04 LTS x86-64、GCC 13（Clang 为辅助路径）
 - CMake 3.28+
 - debug 预设需要 Ninja
 - 使用下方命令构建的固定 OpenSSL 3.5.9 SDK（需要 Perl 与 make）
-- .NET SDK 必须满足 `global.json`（10.0.202 或更新的稳定 feature band）；
-  Ubuntu 26.04 提供的 10.0.1xx SDK 不满足此要求。
-- Python 3.9+
+- .NET SDK 必须满足 `global.json`（精确的 10.0.404）；
+  发行版默认 SDK 也必须通过实际检查，不能代替这一选择。
+- Python 3.11.8+
 - Git
 
 Windows 构建包装脚本会自动加载 MSVC 环境。debug 预设需要 Ninja 时，包装脚本会自动准备。
@@ -252,11 +254,11 @@ cmake --build build/debug --config Debug
 
 支持的平台还提供 sanitizer 预设：`asan`、`asan-msvc`、`tsan`、`ubsan`。
 
-### 在 Windows 下通过 WSL 构建与测试 Linux 版本
+### 辅助路线：Windows 下通过 WSL 构建 Linux
 
 在同一份 Windows clone 上验证 Linux 构建——无需第二份 checkout、无需手动同步。源码就地从 `/mnt/<drive>/...` 读取；构建产物写到 WSL 文件系统的 `~/atlas-builds/<preset>`，避免跨文件系统写入拖慢编译。检测到 `sccache` 时自动启用，与 CI 一致。
 
-前置条件（管理员 PowerShell，仅一次）：`wsl --install -d Ubuntu-26.04`。
+仅用于已配置的 WSL 环境；启用或安装 WSL 需单独授权。Ubuntu 26.04 不代替主平台 Ubuntu 24.04 的验收。
 
 ```bash
 # 一次性安装工具链（g++-13、ninja、.NET 10、sccache、clang-format 等）
@@ -319,10 +321,10 @@ clang-format --dry-run --Werror <changed files>
 machined → BaseAppMgr → CellAppMgr → DBApp → BaseApp → CellApp → LoginApp
 ```
 
-在 Linux 或 Git Bash 下，集群包装脚本会通过 0 客户端的 world-stress 驱动启动同一套进程，并保持运行直到被中断：
+开发集群入口要求显式业务程序集，复用最小集群生命周期，运行至 Ctrl+C：
 
 ```bash
-tools/bin/run_cluster.sh
+tools/bin/run_cluster.sh --base-assembly <你的Base实体程序集>
 ```
 
 脚本化集群验证：

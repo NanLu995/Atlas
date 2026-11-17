@@ -1,5 +1,7 @@
 # Atlas Engine
 
+[Development, Godot and delivery workflow](docs/development.md) is the recommended route. Unity/UE samples and WSL are auxiliary workflows.
+
 > Status: Current project entry point. For detailed phase status, see
 > [`docs/roadmap/README.md`](docs/roadmap/README.md).
 >
@@ -130,21 +132,21 @@ the pending login. This does not add an overall server login deadline.
 
 Windows:
 
-- Visual Studio 2026 (recommended) or Visual Studio 2022 17.14+, with the Desktop development with C++ workload; managed projects use the .NET SDK CLI on every generator
+- Visual Studio 2022 17.14 stable with MSVC 14.44 (patch updates allowed), with the Desktop development with C++ workload; managed projects use the .NET SDK CLI on every generator
 - CMake 3.28+
 - .NET 10 SDK
-- Python 3.9+
+- Python 3.11.8+
 - Git
 
 Linux:
 
-- GCC 13+ or Clang with C++20 support
+- GCC 13 on Ubuntu 24.04 LTS x86-64 (Clang is auxiliary)
 - CMake 3.28+
 - Ninja for the debug preset
 - Pinned OpenSSL 3.5.9 SDK built with the command below (requires Perl and make)
-- .NET SDK satisfying `global.json` (10.0.202 or a later stable feature band);
-  Ubuntu 26.04's 10.0.1xx SDK does not satisfy this requirement.
-- Python 3.9+
+- .NET SDK satisfying `global.json` (exactly 10.0.404);
+  distribution defaults must pass the SDK check rather than replace this selection.
+- Python 3.11.8+
 - Git
 
 The Windows build wrapper loads the MSVC environment automatically. Ninja is provisioned automatically for the Windows debug preset when it is not already available.
@@ -282,11 +284,11 @@ managed and SDK tests.
 
 Sanitizer presets are available where supported: `asan`, `asan-msvc`, `tsan`, and `ubsan`.
 
-### Linux build and test from Windows (WSL)
+### Auxiliary: Linux build from Windows through WSL
 
 Verify the Linux build against the same Windows clone — no second checkout, no manual sync. Source is read in place from `/mnt/<drive>/...`; build artefacts land in `~/atlas-builds/<preset>` inside the WSL filesystem so cross-FS writes don't cap compile speed. `sccache` is picked up automatically when present, mirroring CI.
 
-One-time prerequisite (elevated PowerShell): `wsl --install -d Ubuntu-26.04`.
+Use an already configured WSL environment; enabling/installing WSL requires separate approval. Ubuntu 26.04 does not substitute for Ubuntu 24.04 acceptance.
 
 ```bash
 # One-time toolchain install (g++-13, ninja, .NET 10, sccache, clang-format, ...)
@@ -354,10 +356,10 @@ A development cluster starts in this order:
 machined → BaseAppMgr → CellAppMgr → DBApp → BaseApp → CellApp → LoginApp
 ```
 
-On Linux or Git Bash, the cluster wrapper starts the same stack through the world-stress driver with zero clients and keeps it alive until interrupted:
+On Linux or Git Bash, the cluster wrapper starts an isolated development stack with explicit business assemblies and keeps it alive until interrupted:
 
 ```bash
-tools/bin/run_cluster.sh
+tools/bin/run_cluster.sh --base-assembly <your-base-assembly>
 ```
 
 Scripted cluster validation:

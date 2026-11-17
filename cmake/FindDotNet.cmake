@@ -19,6 +19,17 @@ endif()
 
 # ── Find dotnet executable ───────────────────────────────────────────────────
 find_program(DOTNET_EXECUTABLE dotnet)
+if(ATLAS_BUILD_CSHARP)
+  file(READ "${CMAKE_SOURCE_DIR}/global.json" _sdk_config)
+  string(JSON _sdk_expected GET "${_sdk_config}" sdk version)
+  execute_process(COMMAND "${DOTNET_EXECUTABLE}" --version
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      OUTPUT_VARIABLE _sdk_actual OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _sdk_result)
+  if(NOT _sdk_result EQUAL 0 OR NOT _sdk_actual STREQUAL _sdk_expected)
+    message(FATAL_ERROR "Install .NET SDK ${_sdk_expected}; global.json selects this exact SDK")
+  endif()
+endif()
 
 # ── Find DOTNET_ROOT ─────────────────────────────────────────────────────────
 if(DEFINED ENV{DOTNET_ROOT} AND EXISTS "$ENV{DOTNET_ROOT}")
@@ -64,7 +75,7 @@ if(DOTNET_EXECUTABLE)
   )
   if(_runtimes_result EQUAL 0)
     # Find the latest Microsoft.NETCore.App version
-    string(REGEX MATCHALL "Microsoft\\.NETCore\\.App ([0-9]+\\.[0-9]+\\.[0-9]+)" _matches "${_runtimes_output}")
+    string(REGEX MATCHALL "Microsoft\\.NETCore\\.App (10\\.0\\.[0-9]+)" _matches "${_runtimes_output}")
     if(_matches)
       # Get the last match (latest version)
       list(GET _matches -1 _last_match)
@@ -111,7 +122,7 @@ list(SORT _packs_candidates COMPARE NATURAL ORDER DESCENDING)
 
 set(_native_dir "")
 foreach(_packs_dir IN LISTS _packs_candidates)
-  file(GLOB _version_dirs "${_packs_dir}/*")
+  file(GLOB _version_dirs "${_packs_dir}/10.0.*")
   list(SORT _version_dirs COMPARE NATURAL ORDER DESCENDING)
   foreach(_vdir IN LISTS _version_dirs)
     file(GLOB _rid_dirs "${_vdir}/runtimes/*")

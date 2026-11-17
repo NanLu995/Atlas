@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
                 run(['docker', 'run', '--detach', '--name', name, '-p', f'127.0.0.1:{port}:3306',
                      '-e', 'MYSQL_ROOT_PASSWORD', '-e', 'MYSQL_ROOT_HOST=%', '-e', 'MYSQL_DATABASE=atlas_test',
                      '-v', f'{directory}:/atlas-tls:ro', IMAGE, '--require-secure-transport=ON',
+                     '--log-bin-trust-function-creators=ON',
                      '--ssl-ca=/atlas-tls/ca.pem', '--ssl-cert=/atlas-tls/server.pem',
                      '--ssl-key=/atlas-tls/server.key'], env=docker_env, stdout=log, stderr=log)
             else:
@@ -117,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
                                      'CREATE DATABASE atlas_test;\n')
                 process = subprocess.Popen([server, '--no-defaults', '--basedir=' + str(sdk),
                     '--datadir=' + str(data), '--bind-address=127.0.0.1', f'--port={port}',
-                    '--mysqlx=OFF', '--require-secure-transport=ON', '--ssl-ca=' + str(directory / 'ca.pem'),
+                    '--mysqlx=OFF', '--require-secure-transport=ON',
+                    '--log-bin-trust-function-creators=ON', '--ssl-ca=' + str(directory / 'ca.pem'),
                     '--ssl-cert=' + str(directory / 'server.pem'), '--ssl-key=' + str(directory / 'server.key'),
                     '--init-file=' + str(bootstrap)], stdout=log, stderr=log)
             deadline = time.monotonic() + 90
@@ -131,6 +133,18 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.5)
             if not ready.stdout.strip().startswith(b'8.4.13'):
                 raise RuntimeError('Fixture server version differs from pinned Oracle version')
+            test_password = secrets.token_hex(32)
+            # Contract tests flush auth caches and install rollback-failure triggers.
+            sql = (f"CREATE USER 'atlas_fixture'@'%' IDENTIFIED BY '{test_password}';"
+                   "GRANT ALL PRIVILEGES ON atlas_test.* TO 'atlas_fixture'@'%';"
+                   "GRANT RELOAD ON *.* TO 'atlas_fixture'@'%';")
+            subprocess.run(connection, input=sql.encode(), env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            child_env = dict(env, MYSQL_PWD=test_password,
+                             ATLAS_TEST_MYSQL_USER='atlas_fixture',
+                             ATLAS_DB_MYSQL_USER='atlas_fixture',
+                             ATLAS_TEST_MYSQL_PASSWORD=test_password,
+                             ATLAS_DB_MYSQL_PASSWORD=test_password)
             if not args.docker:
                 bootstrap.write_text('')
                 bootstrap.unlink()
@@ -138,7 +152,15 @@ def main(argv: list[str] | None = None) -> int:
                 'backend': 'Oracle MySQL', 'version': '8.4.13', 'dbapps': 'selected by command',
                 'tls': 'VERIFY_IDENTITY', 'image': IMAGE if args.docker else None}, indent=2) + '\n')
             print(f'Oracle MySQL 8.4.13 fixture ready; TLS VERIFY_IDENTITY; report={directory}', flush=True)
-            return subprocess.run(command, env=env).returncode
+            result = subprocess.run(command, env=child_env)
+            if result.returncode:
+                diagnostic = ('SELECT EVENT_NAME, COUNT_STAR, MAX_TIMER_WAIT/1000000000000 '
+                              'AS max_seconds FROM performance_schema.'
+                              'events_statements_summary_global_by_event_name '
+                              'WHERE COUNT_STAR>0 ORDER BY MAX_TIMER_WAIT DESC LIMIT 10;')
+                print('Isolated MySQL statement timing (no SQL text or values):', flush=True)
+                subprocess.run(connection, input=diagnostic.encode(), env=env, timeout=10)
+            return result.returncode
     finally:
         if args.docker:
             with (directory / 'server.log').open('ab') as log:

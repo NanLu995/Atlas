@@ -8,7 +8,11 @@ function(atlas_dotnet_project)
   )
 
   if(NOT ARG_CONFIGURATION)
-    set(ARG_CONFIGURATION "Release")
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(ARG_CONFIGURATION "Debug")
+    else()
+      set(ARG_CONFIGURATION "Release")
+    endif()
   endif()
 
   if(NOT ARG_TARGET_FRAMEWORK)

@@ -27,7 +27,12 @@ jobs:
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '10.0.x'
+          global-json-file: global.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
 
       - name: Install GCC 13 + Ninja
         run: |
@@ -71,6 +76,7 @@ jobs:
 
       - name: Configure
         env:
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || 'Unix Makefiles' }}
           SCCACHE_DIR: ${{ github.workspace }}/.sccache
           CMAKE_GENERATOR: Ninja
         run: >

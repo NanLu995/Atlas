@@ -23,16 +23,18 @@ jobs:
 
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '10.0.x'
+          global-json-file: global.json
 
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - if: runner.os == 'Windows'
         uses: step-security/msvc-dev-cmd@v1
         with:
           arch: x64
+          vsversion: 2022
+          toolset: 14.44
 
       - if: runner.os == 'Linux'
         run: |
@@ -48,9 +50,11 @@ jobs:
         run: python tools/prepare_mysql.py
 
       - name: Configure
+        env:
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || 'Unix Makefiles' }}
         # ATLAS_BUILD_NET_CLIENT=ON builds libatlas_net_client, the P/Invoke
         # target the real-cluster client tests load at runtime.
-        run: cmake --preset debug -DATLAS_BUILD_NET_CLIENT=ON
+        run: python tools/build.py debug --config-only --cmake-arg=-DATLAS_BUILD_NET_CLIENT=ON
 
       - name: Build
         run: cmake --build build/debug --config Debug

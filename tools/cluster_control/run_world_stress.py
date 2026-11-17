@@ -1148,7 +1148,7 @@ def main() -> int:
     reviver_specs = build_reviver_specs(args)
 
     repo_root = resolve_repo_root()
-    runtime_config = repo_root / "runtime" / "atlas_server.runtimeconfig.json"
+    runtime_config = repo_root / "build" / Path(args.build_dir).name / "runtime" / "atlas_server.runtimeconfig.json"
 
     # bin/ path is keyed on the build directory name, not the CMake config name.
     # AtlasOutputDirectory.cmake routes all artifacts into bin/<build_dir_name>/.

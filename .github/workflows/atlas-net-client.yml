@@ -34,6 +34,8 @@ jobs:
       - name: Set up NDK
         run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
       - name: Configure
+        env:
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || 'Unix Makefiles' }}
         run: cmake --preset net-client-android-arm64
       - name: Build
         run: cmake --build --preset net-client-android-arm64

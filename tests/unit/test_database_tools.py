@@ -207,8 +207,8 @@ class DatabaseToolsTest(unittest.TestCase):
     def test_missing_explicit_assembly_never_starts_cluster(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'runtime').mkdir()
-            (root / 'runtime/atlas_server.runtimeconfig.json').write_text('{}')
+            (root / 'build/debug/runtime').mkdir(parents=True)
+            (root / 'build/debug/runtime/atlas_server.runtimeconfig.json').write_text('{}')
             (root / 'bin/debug').mkdir(parents=True)
             (root / 'bin/debug/Atlas.Runtime.dll').write_bytes(b'')
             missing = root / 'missing-fixture.dll'

@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common.paths import REPO_ROOT
 from common import wsl
+from build import check_environment, ensure_ninja, resolve_cmake
 
 
 PRESET_CONFIGS = {
@@ -62,22 +63,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def cmake_configure_args(preset: str, src: Path, build: Path) -> list[str]:
-    base = [
-        "cmake", "-S", str(src), "-B", str(build),
-        f"-DCMAKE_BUILD_TYPE={PRESET_CONFIGS[preset]}",
-    ]
-    if shutil.which("sccache"):
-        base += ["-DCMAKE_C_COMPILER_LAUNCHER=sccache",
-                 "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"]
-    if preset == "debug":
-        return base + ["-G", "Ninja Multi-Config",
-                       "-DCMAKE_DEFAULT_BUILD_TYPE=Debug"]
-    if preset == "release":
-        return base + ["-DATLAS_ENABLE_PROFILER=OFF",
-                       "-DATLAS_BUILD_TESTS=OFF"]
-    return base + ["-DATLAS_ENABLE_PROFILER=ON",
-                   "-DATLAS_BUILD_TRACY_VIEWER=ON",
-                   "-DATLAS_BUILD_TESTS=OFF"]
+    return ["cmake", "--preset", preset, "-S", str(src), "-B", str(build)]
 
 
 def run_on_linux(args: argparse.Namespace) -> int:
@@ -98,12 +84,20 @@ def run_on_linux(args: argparse.Namespace) -> int:
     t0 = time.monotonic()
 
     configure = cmake_configure_args(args.preset, src, build)
+    env = dict(os.environ)
+    cmake = resolve_cmake(env)
+    check_environment(env, cmake)
+    env['CMAKE_GENERATOR'] = 'Unix Makefiles'
+    env.setdefault('CMAKE_BUILD_PARALLEL_LEVEL', '2')
+    if args.preset == 'debug':
+        ensure_ninja(env)
+    configure[0] = cmake
     log(" ".join(configure))
-    subprocess.run(configure, check=True)
+    subprocess.run(configure, env=env, check=True)
 
-    build_cmd = ["cmake", "--build", str(build), "--config", config]
+    build_cmd = [cmake, "--build", str(build), "--config", config]
     log(" ".join(build_cmd))
-    subprocess.run(build_cmd, check=True)
+    subprocess.run(build_cmd, env=env, check=True)
 
     if shutil.which("sccache"):
         subprocess.run(["sccache", "--show-stats"], check=False)

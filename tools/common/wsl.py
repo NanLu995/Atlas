@@ -49,7 +49,7 @@ def pick_distro() -> str:
     if not candidates:
         raise RuntimeError(
             "no usable WSL distro found. Install one with "
-            "'wsl --install -d Ubuntu-26.04' (elevated PowerShell), "
+            "'wsl --install -d Ubuntu-24.04' (elevated PowerShell), "
             "or override with $ATLAS_WSL_DISTRO."
         )
     for name in candidates:
@@ -73,7 +73,7 @@ def reinvoke_python(script: Path, args: list[str] | None = None) -> int:
     if not is_available():
         raise RuntimeError(
             "wsl.exe not on PATH. Install WSL2: "
-            "'wsl --install -d Ubuntu-26.04' (run from elevated PowerShell)."
+            "'wsl --install -d Ubuntu-24.04' (run from elevated PowerShell)."
         )
     if args is None:
         args = sys.argv[1:]

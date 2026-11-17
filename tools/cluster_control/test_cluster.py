@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtls-certificate", type=Path, help="Public DTLS certificate chain PEM.")
     parser.add_argument("--dtls-private-key", type=Path, help="Public DTLS private key PEM.")
     add_database_options(parser)
+    parser.add_argument('--foreground', action='store_true',
+                        help='Keep the development cluster running until Ctrl+C, independent of stdin.')
     args = parser.parse_args()
     if args.cellapps > 1 and args.cell_assembly is None:
         parser.error("--cellapps 2 requires --cell-assembly <script.dll>")
@@ -196,8 +198,8 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     loginapp_port = port_base + 7
 
     repo_root = resolve_repo_root()
-    bin_name = args.build_dir
-    runtime_config = repo_root / "runtime" / "atlas_server.runtimeconfig.json"
+    bin_name = Path(args.build_dir).name
+    runtime_config = repo_root / "build" / bin_name / "runtime" / "atlas_server.runtimeconfig.json"
     runtime_assembly = repo_root / "bin" / bin_name / "Atlas.Runtime.dll"
     if args.base_assembly is None:
         print("missing --base-assembly; select a compiled game entity assembly with .def definitions",
@@ -392,7 +394,16 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             flush=True,
         )
 
-        for line in iter(sys.stdin.readline, ""):
+        def commands():
+            if not args.foreground:
+                yield from iter(sys.stdin.readline, "")
+                return
+            while True:
+                if any(entry.process.poll() is not None for entry in processes):
+                    raise RuntimeError(f'Cluster process exited; inspect {log_dir}')
+                time.sleep(0.25)
+
+        for line in commands():
             command = line.split()
             if len(command) == 2 and command[0] in ('kill-process', 'restart-process'):
                 index = _process_index(processes, command[1])
