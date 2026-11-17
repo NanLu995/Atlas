@@ -91,7 +91,8 @@ struct DBAppArgv {
                       "--db-mysql-port", std::getenv("ATLAS_TEST_MYSQL_PORT"), "--db-mysql-user",
                       std::getenv("ATLAS_TEST_MYSQL_USER"), "--db-mysql-password",
                       std::getenv("ATLAS_TEST_MYSQL_PASSWORD"), "--db-mysql-database",
-                      std::getenv("ATLAS_TEST_MYSQL_DATABASE")});
+                      std::getenv("ATLAS_TEST_MYSQL_DATABASE"), "--db-mysql-database-id",
+                      "0123456789abcdef0123456789abcdef", "--db-mysql-initialize", "true"});
     }
     for (auto& s : storage) ptrs.push_back(s.data());
   }
@@ -840,7 +841,11 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
                     "--entitydef-bin-path",
                     definitions.string(),
                     "--account-type-id",
-                    "1"};
+                    "1",
+                    "--db-mysql-database-id",
+                    "0123456789abcdef0123456789abcdef",
+                    "--db-mysql-initialize",
+                    "true"};
     return ChildProcess::Start(std::move(options));
   };
   auto first_server = launch(first_addr);

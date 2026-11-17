@@ -252,7 +252,7 @@ struct HealthProbe {
                                    "cellappmgr::HealthProbe",
                                    MessageLengthStyle::kFixed,
                                    static_cast<int>(sizeof(uint64_t) + sizeof(uint8_t)),
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }
@@ -286,7 +286,7 @@ struct HealthProbeAck {
                                    "cellappmgr::HealthProbeAck",
                                    MessageLengthStyle::kFixed,
                                    kSerializedSize,
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }

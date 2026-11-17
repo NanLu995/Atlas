@@ -71,6 +71,22 @@ TEST(ServerConfig, InvalidProductionValueCannotSilentlySelectDevelopment) {
   EXPECT_TRUE(config->is_production);
 }
 
+TEST(ServerConfig, DatabaseIdentityAndInitializationLoadFromJsonAndCommandLine) {
+  const std::string identity = "0123456789abcdef0123456789abcdef";
+  FakeArgv args({"exe", "--db-mysql-database-id", identity, "--db-mysql-initialize", "true"});
+  auto config = ServerConfig::FromArgs(args.argc(), args.argv());
+  ASSERT_TRUE(config);
+  EXPECT_EQ(config->db_mysql_database_id, identity);
+  EXPECT_TRUE(config->db_mysql_initialize);
+  auto path =
+      write_temp_json(R"({"database":{"mysql_database_id":"0123456789abcdef0123456789abcdef",
+                                      "mysql_initialize":false}})");
+  config = ServerConfig::FromJsonFile(path);
+  ASSERT_TRUE(config);
+  EXPECT_EQ(config->db_mysql_database_id, identity);
+  EXPECT_FALSE(config->db_mysql_initialize);
+}
+
 TEST(ProcessType, CaseInsensitive) {
   auto r = ProcessTypeFromName("BaseApp");
   ASSERT_TRUE(r.HasValue());

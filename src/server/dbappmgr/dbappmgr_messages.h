@@ -362,7 +362,7 @@ struct HealthProbe {
                                    "dbappmgr::HealthProbe",
                                    MessageLengthStyle::kFixed,
                                    static_cast<int>(sizeof(uint64_t) + sizeof(uint8_t)),
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }
@@ -393,7 +393,7 @@ struct HealthProbeAck {
                                    "dbappmgr::HealthProbeAck",
                                    MessageLengthStyle::kVariable,
                                    -1,
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }

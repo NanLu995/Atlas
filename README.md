@@ -113,7 +113,7 @@ Database admission is limited to 4,096 operations, including callbacks waiting f
 Capacity rejection precedes execution (`RateLimited` / `kOverloaded`); draining rejects new work
 as `ReceiverGone` / `kStopping`. `BeginDrain` and `PendingOperations` expose this lifecycle.
 Checkout cleanup and automatic-load APIs return `Result` callbacks, including setters, so backend
-errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV4`.
+errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV5`.
 Immediate reliable UDP sends obey the configured send window. Deferred bundles retain at most
 256 KiB per channel and reliability class; full admission returns `WouldBlock` without appending.
 RPC calls distinguish capacity rejection (`RateLimited`), duplicate requests (`AlreadyExists`)
@@ -445,6 +445,10 @@ BaseApp re-registers with its existing app ID on BaseAppMgr birth, clears the bi
 matching death notification, and accepts registration acknowledgements only on its current channel.
 CellApp also retains its app ID across manager death or disconnect and sends it on re-registration,
 so worker identities do not depend on their return order.
+Manager health probes and replies use unreliable datagrams with nonce matching. Their existing
+periods, timeouts and failure thresholds handle loss; late replies do not prove current health.
+This keeps liveness checks independent of a reliable channel's sequence state after recreation.
+
 Reviver restarts an observed target only after its previous local process has exited. It pins local
 process identity before termination and checks exit again before launching; unreadable liveness is
 treated conservatively as still alive. A remote or unconfirmed target becomes `restart_blocked`
@@ -518,7 +522,7 @@ cursor after restart. Backups must retain all three sources; this does not provi
 from arbitrarily removed metadata or make raw backend deletion an ID reclamation operation.
 Concurrent MySQL startup serializes schema initialization with a database-scoped advisory lock.
 Both backends initialize only empty databases. Existing databases must have the matching
-`schema_version` (currently 3); missing or incompatible metadata rejects startup without
+`schema_version` (MySQL 4, SQLite 3); missing or incompatible metadata rejects startup without
 overwriting the version or upgrading the schema. Rebuild matching processes and use a new
 isolated database; no old-format migration is provided. SQLite initializes its schema and
 metadata in one transaction. Interrupted MySQL DDL may leave an incomplete database, which
@@ -568,11 +572,15 @@ unconfirmed result. `Disconnect(Logout)` queues that same exchange; keep polling
 Credentials expire ten minutes after issuance; fetching a cached credential does not renew it.
 Do not log credentials or persist them in ordinary configuration. Password reauthentication,
 logout and a change of controlled entity invalidate the previous credential.
-Protocol version 2, storage schema 3 and database plugin ABI V4 require matching rebuilt
+Protocol version 2, storage schemas MySQL 4 / SQLite 3 and database plugin ABI V5 require matching rebuilt
 processes and an isolated new database; no migration is provided.
 `SessionRecoveryRealTests` requires MySQL and covers live and crashed owners, transferred control,
 persistent target restoration, temporary target refusal, credential rotation and logout revocation.
 SQLite smoke tests do not replace it.
+
+MySQL pool connections recheck the storage schema, blob version and snapshot digest whenever
+they are opened after startup. A mismatch rejects operations without initializing or updating
+that storage; restoring the expected database allows a later connection attempt.
 
 Transaction commit failures report an uncertain outcome rather than success. SQLite
 batch callbacks wait for the transaction result. Checkout distinguishes missing entities
@@ -686,7 +694,7 @@ and ownership version; success is returned after database confirmation. An unava
 changed version or uncertain commit rejects this login instead of assuming the session is offline.
 Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
 login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
-Database plugins must export `AtlasCreateDatabaseV4`; rebuild both plugins and the server.
+Database plugins must export `AtlasCreateDatabaseV5`; rebuild both plugins and the server.
 The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
 Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
 tracks peer process instances even for death-only subscriptions: a new instance at the same
@@ -738,7 +746,8 @@ Example DBApp configuration:
     "mysql_host": "127.0.0.1",
     "mysql_port": 3306,
     "mysql_user": "<database-user>",
-    "mysql_database": "<isolated-development-database>"
+    "mysql_database": "<isolated-development-database>",
+    "mysql_database_id": "<32-lowercase-hex-logical-database-id>"
   }
 }
 ```
@@ -749,9 +758,51 @@ or a masked prompt; do not put credentials in commands, checked-in configs or lo
 DBApp reads this variable when the configured password is empty. Host, user and database
 come from the configuration or CLI. A missing database/user/password, invalid connection
 settings, unavailable plugin or failed connection stops startup; no SQLite fallback occurs.
-The tools also accept `ATLAS_DB_MYSQL_HOST`, `PORT`, `USER`, `PASSWORD`, `DATABASE` and
+The tools also accept `ATLAS_DB_MYSQL_HOST`, `PORT`, `USER`, `PASSWORD`, `DATABASE`, `DATABASE_ID` and
 `POOL_SIZE` (each with the `ATLAS_DB_MYSQL_` prefix) or `--database-config <local-json>`.
 They pass the password through the child environment, excluding it from generated JSON.
+
+`mysql_database_id` is required: generate it once with `tools\bin\database_recovery.bat new-id`
+(or the matching `.sh` wrapper), then keep the same 32 lowercase hexadecimal characters in all
+DBApps sharing that logical database. DBApp also accepts `--db-mysql-database-id`. Initialization
+writes it only to an empty database; startup and every new pool connection reject missing or
+mismatched identity. Copy this identity with backups and replication; do not generate a new one
+when restoring or moving an endpoint. It identifies the logical data, not the physical server,
+and does not prove replication freshness or fence an old primary.
+
+Ordinary startup refuses empty MySQL databases. For the first creation only, explicitly set
+`database.mysql_initialize` to JSON `true` or use `--db-mysql-initialize true`; reset it to false
+after initialization. The launch tools accept `ATLAS_DB_MYSQL_INITIALIZE=true|false` and default
+to false. Keep it false for production startup, restore and endpoint switching so a wrong empty
+database cannot be claimed as new storage. Existing databases are validated even when initialization
+is enabled; this flag never overwrites identity or upgrades metadata.
+
+The development recovery tool uses an installed matching `mariadb`/`mariadb-dump` or
+`mysql`/`mysqldump` pair. Supply `--client` and `--dump-tool` paths if absent from PATH.
+Stop all DBApps and other writers before backup or restore; `--quiesced` asserts this precondition.
+It is not an online backup coordinator. Use a new private backup directory and an existing empty
+target database. The source and target configs must name the same logical identity.
+
+```bat
+tools\bin\database_recovery.bat backup --database-config <source-json> --directory .tmp/db-backup --quiesced
+tools\bin\database_recovery.bat restore --database-config <empty-target-json> --directory .tmp/db-backup --quiesced
+tools\bin\database_recovery.bat verify --database-config <target-json> --directory .tmp/db-backup
+```
+
+Linux uses `bash tools/bin/database_recovery.sh` with the same arguments. The tool retains all
+seven framework tables, including checkout versions, process retirement, operation receipts,
+session credential digests and ID watermarks. It records dump SHA-256 and consistent-snapshot
+row fingerprints, refuses nonempty targets and never deletes partial restores. Failure leaves
+the target isolated for inspection; use another empty target for a new attempt. Only import trusted
+backup files. Dumps contain account records and entity data: keep them private and out of Git.
+Verification compares stored bytes and metadata; normal entity loading still validates snapshot
+contents and entity definitions. Do not admit traffic until native startup and verification pass.
+
+Production backups and replication remain database-managed. Before switching an endpoint,
+fence the old primary and all writers, confirm the promoted database identity and replication
+position, then restart or reconnect DBApps and verify readiness. The framework does not select a
+primary, reconcile divergent databases, erase checkout ownership or retry unconfirmed writes.
+Restore only successfully saved state; a backup cannot reconstruct subsequent transactions.
 
 ```bat
 rem MySQL is the default; use an existing isolated development database and local config.

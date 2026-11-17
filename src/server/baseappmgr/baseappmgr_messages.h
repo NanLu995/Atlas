@@ -188,7 +188,7 @@ struct HealthProbe {
                                    "baseappmgr::HealthProbe",
                                    MessageLengthStyle::kFixed,
                                    static_cast<int>(sizeof(uint64_t) + sizeof(uint8_t)),
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }
@@ -218,12 +218,11 @@ struct HealthProbeAck {
   bool is_active_reviver{false};
 
   static auto Descriptor() -> const MessageDesc& {
-    // kVariable so future trailing fields stay deserialize-compatible.
     static const MessageDesc kDesc{msg_id::Id(msg_id::BaseAppMgr::kHealthProbeAck),
                                    "baseappmgr::HealthProbeAck",
                                    MessageLengthStyle::kVariable,
                                    -1,
-                                   MessageReliability::kReliable,
+                                   MessageReliability::kUnreliable,
                                    MessageUrgency::kImmediate};
     return kDesc;
   }

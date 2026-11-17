@@ -156,9 +156,9 @@ class MysqlDatabase : public IDatabase {
   [[nodiscard]] auto OpenConnection() const -> st_mysql*;
   void RefreshConnection(st_mysql*& conn) const;
 
-  static auto EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) -> Result<void>;
-  static auto EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema)
-      -> Result<void>;
+  auto ValidateSchema(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
+  auto EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
+  auto EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema) const -> Result<void>;
   static auto QueryScalar(st_mysql* conn, std::string_view sql)
       -> Result<std::optional<std::string>>;
   static auto ExecSql(st_mysql* conn, std::string_view sql) -> Result<void>;
@@ -223,6 +223,7 @@ class MysqlDatabase : public IDatabase {
   st_mysql* conn_{nullptr};  // bootstrap + inline (non-deferred) connection
   const EntityDefRegistry* entity_defs_{nullptr};
   DatabaseConfig config_;
+  Sha256Digest storage_schema_{};
   bool started_{false};
   bool stopping_{false};
   bool deferred_mode_{false};

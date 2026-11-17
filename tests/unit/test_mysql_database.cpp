@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <functional>
 #include <optional>
 #include <span>
@@ -60,6 +61,8 @@ auto make_config() -> DatabaseConfig {
   cfg.mysql_user = env_or("ATLAS_TEST_MYSQL_USER", "root");
   cfg.mysql_password = env_or("ATLAS_TEST_MYSQL_PASSWORD", "");
   cfg.mysql_database = env_or("ATLAS_TEST_MYSQL_DATABASE", "atlas_test");
+  cfg.mysql_database_id = "0123456789abcdef0123456789abcdef";
+  cfg.mysql_initialize = true;
   return cfg;
 }
 
@@ -183,6 +186,20 @@ TEST(MysqlConfiguration, MissingSettingsFailBeforeConnecting) {
   EXPECT_NE(result.Error().Message().find("SQLite fallback is disabled"), std::string_view::npos);
 }
 
+TEST(MysqlConfiguration, LogicalIdentityMustBeExplicitAndWellFormed) {
+  auto config = make_config();
+  config.mysql_password = "<test-only-password>";
+  for (const auto& identity : {std::string{}, std::string(31, 'a'), std::string(33, 'a'),
+                               std::string(32, 'A'), std::string(32, 'g')}) {
+    config.mysql_database_id = identity;
+    MysqlDatabase database;
+    auto result = database.Startup(config, EntityDefRegistry::Instance());
+    ASSERT_FALSE(result.HasValue());
+    EXPECT_EQ(result.Error().Code(), ErrorCode::kInvalidArgument);
+    EXPECT_NE(result.Error().Message().find("mysql_database_id"), std::string_view::npos);
+  }
+}
+
 class MysqlDatabaseTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -294,6 +311,116 @@ TEST_F(MysqlDatabaseTest, StartupRejectsMissingSnapshotSchemaDigest) {
   auto started = db_.Startup(cfg_, EntityDefRegistry::Instance());
   ASSERT_FALSE(started.HasValue());
   EXPECT_NE(started.Error().Message().find("storage_schema_digest"), std::string_view::npos);
+}
+
+TEST_F(MysqlDatabaseTest, StartupRejectsAnotherLogicalIdentityWithoutChangingTheDatabase) {
+  auto other = cfg_;
+  other.mysql_database_id = "abcdef0123456789abcdef0123456789";
+  MysqlDatabase peer;
+  auto result = peer.Startup(other, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kPermissionDenied);
+  EXPECT_NE(result.Error().Message().find("logical_database_id"), std::string_view::npos);
+  ASSERT_TRUE(peer.Startup(cfg_, EntityDefRegistry::Instance()));
+}
+
+TEST_F(MysqlDatabaseTest, MissingLogicalIdentityIsNotAutomaticallyRecreated) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(), "DELETE FROM meta WHERE `key`='logical_database_id'"), 0);
+  MysqlDatabase peer;
+  auto result = peer.Startup(cfg_, EntityDefRegistry::Instance());
+  ASSERT_FALSE(result.HasValue());
+  EXPECT_EQ(result.Error().Code(), ErrorCode::kPermissionDenied);
+  ASSERT_EQ(mysql_query(admin.get(), "SELECT COUNT(*) FROM meta WHERE `key`='logical_database_id'"),
+            0);
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(admin.get()),
+                                                                mysql_free_result);
+  ASSERT_TRUE(rows);
+  auto row = mysql_fetch_row(rows.get());
+  ASSERT_NE(row, nullptr);
+  EXPECT_STREQ(row[0], "0");
+}
+
+TEST_F(MysqlDatabaseTest, NormalStartupCannotClaimAnUnknownEmptyDatabase) {
+  db_.Shutdown();
+  ASSERT_TRUE(reset_schema(cfg_));
+  DatabaseConfig normal;
+  normal.mysql_host = cfg_.mysql_host;
+  normal.mysql_port = cfg_.mysql_port;
+  normal.mysql_user = cfg_.mysql_user;
+  normal.mysql_password = cfg_.mysql_password;
+  normal.mysql_database = cfg_.mysql_database;
+  normal.mysql_database_id = cfg_.mysql_database_id;
+  const auto started = db_.Startup(normal, EntityDefRegistry::Instance());
+  EXPECT_FALSE(started.HasValue());
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(), "SHOW TABLES"), 0);
+  std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(admin.get()),
+                                                                mysql_free_result);
+  ASSERT_TRUE(rows);
+  EXPECT_EQ(mysql_num_rows(rows.get()), 0u);
+  ASSERT_TRUE(db_.Startup(cfg_, EntityDefRegistry::Instance()));
+  MysqlDatabase reader;
+  EXPECT_TRUE(reader.Startup(normal, EntityDefRegistry::Instance()));
+}
+
+TEST_F(MysqlDatabaseTest, ReconnectedSessionsRejectChangedStorageMetadata) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  PutResult created;
+  db_.PutEntity(0, 1, WriteFlags::kCreateNew, make_blob("saved"), "reconnect",
+                [&](PutResult value) { created = std::move(value); });
+  ASSERT_TRUE(created.success) << created.error;
+  for (const auto* key :
+       {"schema_version", "blob_format_version", "storage_schema_digest", "logical_database_id"}) {
+    SCOPED_TRACE(key);
+    const auto save =
+        std::format("SET @original = (SELECT `value` FROM meta WHERE `key`='{}')", key);
+    ASSERT_EQ(mysql_query(admin.get(), save.c_str()), 0);
+    const auto change = std::format("UPDATE meta SET `value`='incompatible' WHERE `key`='{}'", key);
+    ASSERT_EQ(mysql_query(admin.get(), change.c_str()), 0);
+    const auto kill =
+        "KILL CONNECTION " + std::to_string(MysqlDatabaseTestAccess::ConnectionId(db_));
+    ASSERT_EQ(mysql_query(admin.get(), kill.c_str()), 0);
+    GetResult result;
+    db_.GetEntity(created.dbid, 1, [&](GetResult value) { result = std::move(value); });
+    EXPECT_FALSE(result.error.empty()) << "disconnected session unexpectedly succeeded";
+    db_.GetEntity(created.dbid, 1, [&](GetResult value) { result = std::move(value); });
+    EXPECT_FALSE(result.error.empty()) << "reconnected session accepted incompatible metadata";
+    const auto restore = std::format("UPDATE meta SET `value`=@original WHERE `key`='{}'", key);
+    ASSERT_EQ(mysql_query(admin.get(), restore.c_str()), 0);
+    db_.GetEntity(created.dbid, 1, [&](GetResult value) { result = std::move(value); });
+    EXPECT_TRUE(result.error.empty()) << result.error;
+  }
+}
+
+TEST_F(MysqlDatabaseTest, WorkerConnectionsRejectChangedStorageMetadataBeforeFirstOperation) {
+  auto admin = connect_admin(cfg_);
+  ASSERT_TRUE(admin);
+  ASSERT_EQ(mysql_query(admin.get(),
+                        "UPDATE meta SET `value`='incompatible' WHERE `key`='schema_version'"),
+            0);
+  db_.SetDeferredMode(true);
+  Result<EntityIdRange> result{Error{ErrorCode::kInternalError}};
+  bool completed = false;
+  auto reserve = [&] {
+    completed = false;
+    db_.ReserveEntityIds(1, [&](Result<EntityIdRange> value) {
+      result = std::move(value);
+      completed = true;
+    });
+    pump_until([&] { return completed; });
+    ASSERT_TRUE(completed);
+  };
+  reserve();
+  EXPECT_FALSE(result.HasValue());
+  ASSERT_EQ(mysql_query(admin.get(), "UPDATE meta SET `value`='4' WHERE `key`='schema_version'"),
+            0);
+  reserve();
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result->first, 1u);
 }
 
 TEST_F(MysqlDatabaseTest, ConcurrentStartupInitializesOneSchemaAndDisjointIdRanges) {

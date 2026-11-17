@@ -303,6 +303,8 @@ auto DBApp::BuildDbConfig() const -> DatabaseConfig {
   db_cfg.mysql_user = cfg.db_mysql_user;
   db_cfg.mysql_password = cfg.db_mysql_password;
   db_cfg.mysql_database = cfg.db_mysql_database;
+  db_cfg.mysql_database_id = cfg.db_mysql_database_id;
+  db_cfg.mysql_initialize = cfg.db_mysql_initialize;
   db_cfg.mysql_pool_size = cfg.db_mysql_pool_size;
   return db_cfg;
 }

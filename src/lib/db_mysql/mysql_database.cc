@@ -16,7 +16,7 @@
 namespace atlas {
 
 namespace {
-constexpr int kMysqlSchemaVersion = 3;
+constexpr int kMysqlSchemaVersion = 4;
 constexpr unsigned int kErDupEntry = 1062;  // MySQL ER_DUP_ENTRY
 
 auto UnixTimeMs() -> int64_t {
@@ -43,11 +43,18 @@ auto MysqlDatabase::Startup(const DatabaseConfig& config, const EntityDefRegistr
                  "MySQL requires host, port, user, password, database and a positive pool size; "
                  "configure MySQL explicitly; SQLite fallback is disabled"};
   }
+  if (config.mysql_database_id.size() != 32 ||
+      config.mysql_database_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+    return Error{ErrorCode::kInvalidArgument,
+                 "MySQL mysql_database_id requires 32 lowercase hexadecimal characters; "
+                 "configure the expected logical database identity explicitly"};
+  }
   stopping_ = false;
   entity_defs_ = &entity_defs;
   config_ = config;
   auto storage_schema = entity_defs.StorageSchemaDigest();
   if (!storage_schema) return storage_schema.Error();
+  storage_schema_ = *storage_schema;
 
   conn_ = OpenConnection();
   if (conn_ == nullptr) {
@@ -141,7 +148,7 @@ auto MysqlDatabase::OpenConnection() const -> st_mysql* {
   return conn;
 }
 
-auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema)
+auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_schema) const
     -> Result<void> {
   constexpr std::string_view kLock = "CONCAT('atlas.schema.', LEFT(SHA2(DATABASE(), 256), 48))";
   auto locked = QueryScalar(conn, std::format("SELECT GET_LOCK({}, 10)", kLock));
@@ -157,38 +164,49 @@ auto MysqlDatabase::EnsureSchema(st_mysql* conn, const Sha256Digest& storage_sch
   return {};
 }
 
-auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema)
+auto MysqlDatabase::ValidateSchema(st_mysql* conn, const Sha256Digest& storage_schema) const
+    -> Result<void> {
+  auto version = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'schema_version'");
+  if (!version)
+    return Error{
+        version.Error().Code(),
+        std::format("MysqlDatabase: cannot read schema_version: {}", version.Error().Message())};
+  if (*version != std::to_string(kMysqlSchemaVersion))
+    return Error{ErrorCode::kInvalidArgument,
+                 "MysqlDatabase: missing or incompatible schema_version; use a new empty "
+                 "database with matching server binaries; automatic upgrade is disabled"};
+  auto identity = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key`='logical_database_id'");
+  if (!identity) return identity.Error();
+  if (*identity != config_.mysql_database_id)
+    return Error{ErrorCode::kPermissionDenied,
+                 "MysqlDatabase: missing or mismatched logical_database_id; database rejected"};
+  auto format = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'blob_format_version'");
+  if (!format) return format.Error();
+  if (*format != std::to_string(kDbBlobVersion))
+    return Error{ErrorCode::kInvalidArgument,
+                 "MysqlDatabase: missing or incompatible blob_format_version"};
+  auto digest = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'storage_schema_digest'");
+  if (!digest) return digest.Error();
+  if (!digest->has_value() ||
+      **digest != std::string_view(reinterpret_cast<const char*>(storage_schema.data()),
+                                   storage_schema.size()))
+    return Error{ErrorCode::kInvalidArgument,
+                 "MysqlDatabase: missing or incompatible storage_schema_digest; "
+                 "database and entity definitions must have the same snapshot schema"};
+  return ExecSql(conn, "SELECT checkout_instance FROM entities LIMIT 0");
+}
+
+auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& storage_schema) const
     -> Result<void> {
   auto existing = QueryScalar(conn,
                               "SELECT TABLE_NAME FROM information_schema.TABLES "
                               "WHERE TABLE_SCHEMA = DATABASE() LIMIT 1");
   if (!existing) return existing.Error();
-  if (existing->has_value()) {
-    auto version = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'schema_version'");
-    if (!version)
-      return Error{
-          version.Error().Code(),
-          std::format("MysqlDatabase: cannot read schema_version: {}", version.Error().Message())};
-    if (*version != std::to_string(kMysqlSchemaVersion))
-      return Error{ErrorCode::kInvalidArgument,
-                   "MysqlDatabase: missing or incompatible schema_version; use a new empty "
-                   "database with matching server binaries; automatic upgrade is disabled"};
-    auto format = QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'blob_format_version'");
-    if (!format) return format.Error();
-    if (*format != std::to_string(kDbBlobVersion))
-      return Error{ErrorCode::kInvalidArgument,
-                   "MysqlDatabase: missing or incompatible blob_format_version"};
-    auto digest =
-        QueryScalar(conn, "SELECT `value` FROM meta WHERE `key` = 'storage_schema_digest'");
-    if (!digest) return digest.Error();
-    if (!digest->has_value() ||
-        **digest != std::string_view(reinterpret_cast<const char*>(storage_schema.data()),
-                                     storage_schema.size()))
-      return Error{ErrorCode::kInvalidArgument,
-                   "MysqlDatabase: missing or incompatible storage_schema_digest; "
-                   "database and entity definitions must have the same snapshot schema"};
-    return ExecSql(conn, "SELECT checkout_instance FROM entities LIMIT 0");
-  }
+  if (existing->has_value()) return ValidateSchema(conn, storage_schema);
+  if (!config_.mysql_initialize)
+    return Error{ErrorCode::kInvalidArgument,
+                 "MysqlDatabase: empty database rejected; initial creation requires explicit "
+                 "mysql_initialize=true; do not enable it during recovery or endpoint switching"};
 
   auto entities = ExecSql(conn,
                           "CREATE TABLE IF NOT EXISTS entities ("
@@ -273,6 +291,11 @@ auto MysqlDatabase::EnsureSchemaLocked(st_mysql* conn, const Sha256Digest& stora
                       "(SELECT 1 FROM meta WHERE `key` = 'entity_id_counter_initialized')");
   if (seed) {
     seed = ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) "
+                                     "VALUES('logical_database_id',{})",
+                                     IdentifierLiteral(config_.mysql_database_id)));
+  }
+  if (seed) {
+    seed = ExecSql(conn, std::format("INSERT INTO meta(`key`,`value`) "
                                      "VALUES('storage_schema_digest',{})",
                                      HexLiteral(storage_schema)));
   }
@@ -324,6 +347,15 @@ void MysqlDatabase::RefreshConnection(st_mysql*& conn) const {
   if (conn == nullptr || mysql_errno(conn) != 0) {
     if (conn != nullptr) mysql_close(conn);
     conn = OpenConnection();
+    if (conn != nullptr) {
+      auto validated = ValidateSchema(conn, storage_schema_);
+      if (!validated) {
+        ATLAS_LOG_ERROR("MysqlDatabase: reconnected storage rejected: {}",
+                        validated.Error().Message());
+        mysql_close(conn);
+        conn = nullptr;
+      }
+    }
   }
 }
 

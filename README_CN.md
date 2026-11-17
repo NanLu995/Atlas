@@ -103,7 +103,7 @@ DBApp 排空已接纳操作和回调。默认截止时间为 30 秒。
 数据库接纳上限为 4,096 项，包含等待消费的回调。满载在执行前拒绝，返回 `RateLimited` /
 `kOverloaded`；排空时新工作返回 `ReceiverGone` / `kStopping`。`BeginDrain` 和
 `PendingOperations` 提供生命周期接口。checkout 清理及自动加载读写接口均通过 `Result`
-回调传递错误，不能把失败解释为空的成功结果。数据库插件须导出 `AtlasCreateDatabaseV4`。
+回调传递错误，不能把失败解释为空的成功结果。数据库插件须导出 `AtlasCreateDatabaseV5`。
 即时可靠 UDP 发送同样遵守发送窗口。每通道、每可靠性类别的延迟 Bundle 上限为
 256 KiB，满载时返回 `WouldBlock` 且不追加。RPC 调用区分满载 `RateLimited`、重复请求
 `AlreadyExists` 和停服 `ReceiverGone`，被拒绝的请求不发送。
@@ -397,6 +397,9 @@ Worker 随后重新登记；分发期间关闭通道会停止处理该 bundle �
 BaseApp 在 BaseAppMgr 出生时携带已有 app_id 重新注册，匹配的死亡通知清理绑定，注册确认只接受
 当前通道，避免 Manager 重启后保留失效通道或使用旧确认。
 CellApp 在 Manager 死亡或断线后也保留已有 app_id，重注册时回报，避免返回顺序改变 Worker 身份。
+Manager 健康探测和回复使用不可靠数据报，以 nonce 匹配；丢包继续由既有周期、超时及失败阈值处理，
+晚到回复不能证明当前健康状态。探测不依赖通道重建前的可靠序列状态。
+
 Reviver 只有确认旧本机进程退出后才重新拉起已观察的目标；终止前固定进程身份，启动前再次检查退出。
 存活状态读取失败保守视为仍存活。远端或无法确认的目标在 `reviver/<manager>/status` 与
 `/restart_blocked` 报告暂停，需运维隔离后恢复。自动监督要求目标位于同机回环地址；
@@ -455,7 +458,7 @@ DBApp 分片游标恢复同时查询左闭右开区间内的现存实体、持�
 删除实体不删除其保留的回执或租约历史，因此这些已确认身份在重启后仍低于恢复的游标。
 备份必须包含这三类数据；此机制不承诺恢复被任意删除的元数据，也不将后端原始删除视为 ID 回收。
 多个 MySQL DBApp 同时启动时，使用数据库范围的命名锁串行初始化结构。
-两个后端只初始化空库。已有库必须包含匹配的 `schema_version`（当前为 3）；
+两个后端只初始化空库。已有库必须包含匹配的 `schema_version`（MySQL 4、SQLite 3）；
 标记缺失或不兼容时拒绝启动，不覆盖版本、不自动升级结构。请重建配套进程并使用新的
 隔离数据库；不提供旧格式迁移。SQLite 在一个事务中初始化结构和元数据。
 MySQL 建表中断可能留下不完整库，应检查处理，框架不会自动修补或写入兼容标记。
@@ -491,9 +494,12 @@ LoginApp 恢复要求非零 `--internal-port` 与注册的集群地址一致，�
 登出成功表示数据库撤销已确认；超时或断线报告结果未确认。`Disconnect(Logout)` 发起同一交换，
 需要继续 Poll 等待结果。凭证签发后十分钟过期，读取缓存不续期；禁止写入日志或普通配置。
 密码重新认证、登出及受控实体变化会使旧凭证失效。
-协议版本 2、存储 schema 3、数据库插件 ABI V4 要求进程配套重建并使用新的隔离数据库，
+协议版本 2、存储 schema MySQL 4 / SQLite 3、数据库插件 ABI V5 要求进程配套重建并使用新的隔离数据库，
 不提供旧格式迁移。`SessionRecoveryRealTests` 必须使用 MySQL，覆盖在线及崩溃恢复、移交后的控制权、
 持久目标装载、临时目标拒绝、凭证轮换和登出撤销；SQLite 冒烟不能替代该验收。
+
+MySQL 连接池在启动后打开连接时重新核对存储 schema、blob 版本和快照摘要。
+不匹配时拒绝操作，不初始化或更新该存档；恢复到预期数据库后允许后续重新连接。
 
 事务提交失败返回结果不确定，不视为成功。SQLite 批量回调等待事务结果。
 Checkout 区分实体不存在与数据库错误。注销使用 `kLogOff` 在同次写入中释放 checkout；
@@ -585,7 +591,7 @@ MySQL 和 SQLite 还独立于实体 checkout 保存账号会话所有权。带�
 持有者不可达、版本已改变或提交结果不确定时拒绝本次登录，不推断会话已经离线。
 登录检查及接收的撤销请求分别限制为 1024 项；取消登录检查后不能继续 checkout，
 取消等待不撤销已经完成的会话撤销。
-数据库插件须导出 `AtlasCreateDatabaseV4`，需同时重建两个插件及服务器；
+数据库插件须导出 `AtlasCreateDatabaseV5`，需同时重建两个插件及服务器；
 加载器明确拒绝旧接口，避免调用不兼容的虚函数表。
 出生及死亡通知只接受当前 machined 通道。即使仅订阅死亡回调，`MachinedClient` 仍跟踪进程实例；
 相同地址出现新实例时重建内部 RUDP 通道，旧实例的晚到死亡通知被忽略。
@@ -626,7 +632,8 @@ DBApp 配置示例：
     "mysql_host": "127.0.0.1",
     "mysql_port": 3306,
     "mysql_user": "<数据库用户>",
-    "mysql_database": "<隔离开发数据库>"
+    "mysql_database": "<隔离开发数据库>",
+    "mysql_database_id": "<32位小写十六进制逻辑数据库ID>"
   }
 }
 ```
@@ -635,9 +642,41 @@ DBApp 配置示例：
 通过密钥存储或遮蔽输入，在启动进程的环境中设置 `ATLAS_DB_MYSQL_PASSWORD`，不要把凭据
 放入命令、提交的配置或日志。DBApp 在配置密码为空时读取此变量；地址、用户和库名从配置或
 CLI 读取。缺少库名/用户/密码、参数无效、插件不可用或连接失败均停止启动，不回退 SQLite。
-工具还支持 `ATLAS_DB_MYSQL_HOST`、`PORT`、`USER`、`PASSWORD`、`DATABASE`、`POOL_SIZE`
+工具还支持 `ATLAS_DB_MYSQL_HOST`、`PORT`、`USER`、`PASSWORD`、`DATABASE`、`DATABASE_ID`、`POOL_SIZE`
 （均带 `ATLAS_DB_MYSQL_` 前缀），或 `--database-config <本地JSON>`。工具通过子进程环境
 传递密码，不将密码写入生成的 JSON。
+
+`mysql_database_id` 为必填项：用 `tools\bin\database_recovery.bat new-id`（Linux 用对应 `.sh`）
+生成一次，所有共享逻辑库的 DBApp 使用同一个 32 位小写十六进制 ID。DBApp 也支持
+`--db-mysql-database-id`。仅空库初始化写入该身份；启动及连接池打开新连接时，身份缺失或
+不匹配均拒绝。备份、复制及恢复保留该 ID，换地址或恢复时不能重新生成。它标识逻辑数据，
+不能证明副本已追平，也不能隔离旧主库。
+
+常规启动拒绝空 MySQL 库。仅首次创建时，显式设置 `database.mysql_initialize` 为 JSON `true`，
+或使用 `--db-mysql-initialize true`，初始化后改回 false。启动工具支持
+`ATLAS_DB_MYSQL_INITIALIZE=true|false`，默认 false。正式启动、恢复和切换保持 false，
+避免误配空库被当作新存储认领。已有库无论是否启用初始化都先校验，不覆盖身份、不升级元数据。
+
+开发恢复工具复用已安装且匹配的 `mariadb`/`mariadb-dump` 或 `mysql`/`mysqldump`；
+不在 PATH 时用 `--client`、`--dump-tool` 指定。备份及恢复前停止全部 DBApp 和其他写入者，
+`--quiesced` 表示操作者确认此条件，不提供在线备份协调。使用新的私有备份目录及已有空目标库，
+源、目标配置使用相同逻辑身份。
+
+```bat
+tools\bin\database_recovery.bat backup --database-config <源配置JSON> --directory .tmp/db-backup --quiesced
+tools\bin\database_recovery.bat restore --database-config <空目标库配置JSON> --directory .tmp/db-backup --quiesced
+tools\bin\database_recovery.bat verify --database-config <目标配置JSON> --directory .tmp/db-backup
+```
+
+Linux 使用 `bash tools/bin/database_recovery.sh` 和相同参数。工具保留全部七张框架表，包括
+checkout 版本、进程退役、操作回执、会话凭证摘要和 ID 水位，记录 dump SHA-256 及一致性快照的
+逐行摘要。非空目标拒绝恢复，不删除失败后的部分数据；失败目标保持隔离，重试选另一个空库。
+只导入可信备份。dump 含账号及实体数据，应私有保存并排除出 Git。校验比较存储字节及元数据，
+实体装载仍会检查快照内容和定义；原生启动及校验通过前不能开放流量。
+
+生产备份和复制仍由数据库负责。切换前隔离旧主库及全部写入者，确认新库身份和复制位置，
+再重启或重连 DBApp 并检查就绪状态。框架不自动选主、不合并分叉数据、不清除 checkout 所有权，
+也不自动重试结果未确认的写入。只能恢复成功保存的状态，备份不包含其后发生的事务。
 
 ```bat
 rem 默认 MySQL；使用现有隔离开发库和本地配置。

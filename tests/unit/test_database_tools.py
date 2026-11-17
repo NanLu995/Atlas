@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from common.database import add_database_options, database_config, record_database_run, wait_for_database_start
 from cluster_control import test_cluster
 from common.cluster import export_entity_definitions, stop_logged_processes, wait_for_registration
+import database_recovery as recovery
 
 
 class DatabaseToolsTest(unittest.TestCase):
@@ -248,16 +249,50 @@ class DatabaseToolsTest(unittest.TestCase):
     def test_mysql_secret_is_inherited_and_not_serialized(self):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
                        'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
-                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test'}
+                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test',
+                       'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
         with patch.dict(os.environ, environment, clear=True):
             config = database_config(self.args(), Path('unused.sqlite3'))
             self.assertNotIn('mysql_password', config)
             self.assertNotIn('sqlite_path', config)
             self.assertEqual(config['mysql_database'], 'isolated_test')
+            self.assertEqual(config['mysql_database_id'], environment['ATLAS_DB_MYSQL_DATABASE_ID'])
+            self.assertFalse(config['mysql_initialize'])
             self.assertEqual(os.environ['ATLAS_DB_MYSQL_PASSWORD'], '<test-password>')
             os.environ['ATLAS_DB_MYSQL_PORT'] = 'invalid'
             with self.assertRaisesRegex(RuntimeError, 'port must be'):
                 database_config(self.args(), Path('unused.sqlite3'))
+
+    def test_mysql_identity_is_required_and_never_inferred_from_database_name(self):
+        environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
+                       'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
+                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test'}
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'mysql_database_id'):
+                database_config(self.args(), Path('unused.sqlite3'))
+            for identity in ('a' * 31, 'a' * 33, 'A' * 32, 'g' * 32):
+                os.environ['ATLAS_DB_MYSQL_DATABASE_ID'] = identity
+                with self.assertRaisesRegex(RuntimeError, '32 lowercase'):
+                    database_config(self.args(), Path('unused.sqlite3'))
+
+    def test_mysql_initialization_requires_explicit_valid_configuration(self):
+        environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
+                       'ATLAS_DB_MYSQL_PASSWORD': '<test-password>',
+                       'ATLAS_DB_MYSQL_DATABASE': 'isolated_test',
+                       'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertFalse(database_config(self.args(), Path('unused'))['mysql_initialize'])
+            os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'true'
+            self.assertTrue(database_config(self.args(), Path('unused'))['mysql_initialize'])
+            os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'yes'
+            with self.assertRaisesRegex(RuntimeError, 'must be true or false'):
+                database_config(self.args(), Path('unused'))
+            os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'false'
+            with tempfile.TemporaryDirectory() as directory:
+                config_path = Path(directory) / 'config.json'
+                config_path.write_text(json.dumps({'database': {'mysql_initialize': 'false'}}))
+                with self.assertRaisesRegex(RuntimeError, 'JSON boolean'):
+                    database_config(self.args('--database-config', str(config_path)), Path('unused'))
 
     def test_configuration_must_match_selected_backend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -280,6 +315,96 @@ class DatabaseToolsTest(unittest.TestCase):
             process.poll = lambda: 1
             with self.assertRaisesRegex(RuntimeError, 'no backend fallback'):
                 wait_for_database_start(process, logs)
+
+
+class DatabaseRecoveryToolsTest(unittest.TestCase):
+    identity = '0123456789abcdef0123456789abcdef'
+
+    def test_connection_arguments_are_shared_by_client_and_dump_without_credentials(self):
+        settings = {'mysql_host': '127.0.0.1', 'mysql_port': 3306, 'mysql_user': '<test-user>'}
+        with patch.dict(os.environ, {'ATLAS_DB_MYSQL_PASSWORD': '<test-password>'}, clear=True):
+            database = recovery.Database(settings, 'mariadb')
+            arguments = database.arguments()
+            self.assertEqual(arguments, ['--protocol=tcp', '--host=127.0.0.1', '--port=3306',
+                                         '--user=<test-user>', '--default-character-set=utf8mb4'])
+            self.assertNotIn('<test-password>', ' '.join(arguments))
+            self.assertEqual(database.env['MYSQL_PWD'], '<test-password>')
+
+    def manifest(self, directory):
+        (directory / 'database.sql').write_bytes(b'CREATE TABLE isolated (id INT);')
+        value = {'format': 1, 'database_id': self.identity,
+                 'dump_sha256': recovery.file_digest(directory / 'database.sql'),
+                 'metadata': {'schema_version': b'4'.hex(), 'blob_format_version': b'2'.hex(),
+                              'entity_id_counter_initialized': b'1'.hex(),
+                              'logical_database_id': self.identity.encode().hex(),
+                              'storage_schema_digest': '0' * 64},
+                 'tables': {name: {'rows': 0, 'sha256': '0' * 64, 'auto_increment': 0}
+                            for name in recovery.TABLES}}
+        (directory / 'manifest.json').write_text(json.dumps(value))
+        return value
+
+    def test_backup_manifest_rejects_damage_wrong_identity_and_missing_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = self.manifest(root)
+            self.assertEqual(recovery.load_backup(root, self.identity), expected)
+            with self.assertRaisesRegex(RuntimeError, 'Invalid'):
+                recovery.load_backup(root, 'a' * 32)
+            (root / 'database.sql').write_bytes(b'corrupted')
+            with self.assertRaisesRegex(RuntimeError, 'Invalid'):
+                recovery.load_backup(root, self.identity)
+            value = self.manifest(root)
+            del value['tables']['atlas_checkout_versions']
+            (root / 'manifest.json').write_text(json.dumps(value))
+            with self.assertRaisesRegex(RuntimeError, 'Invalid'):
+                recovery.load_backup(root, self.identity)
+
+    def test_restore_refuses_nonempty_target_before_importing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.manifest(root)
+            database = Mock(settings={'mysql_database_id': self.identity})
+            database.tables.return_value = {'existing_data'}
+            with self.assertRaisesRegex(RuntimeError, 'empty target'):
+                recovery.restore(database, root)
+            database.run.assert_not_called()
+
+    def test_restore_rejects_checksum_before_contacting_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.manifest(root)
+            (root / 'database.sql').write_bytes(b'truncated')
+            database = Mock(settings={'mysql_database_id': self.identity})
+            with self.assertRaisesRegex(RuntimeError, 'Invalid'):
+                recovery.restore(database, root)
+            database.tables.assert_not_called()
+            database.run.assert_not_called()
+
+    def test_backup_never_overwrites_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Mock()
+            with self.assertRaisesRegex(RuntimeError, 'already exists'):
+                recovery.backup(database, Path(directory), 'unused-dump')
+            database.inspect.assert_not_called()
+
+    def test_backup_rejects_changed_source_and_does_not_publish_manifest(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(recovery.subprocess, 'run', return_value=SimpleNamespace(stdout=b'MariaDB')):
+            root = Path(directory) / 'backup'
+            database = Mock(settings={'mysql_database': 'isolated_test'})
+            database.inspect.return_value = {}
+            database.arguments.return_value = []
+            database.fingerprint.side_effect = [{'old': {}}, {'new': {}}]
+            with self.assertRaisesRegex(RuntimeError, 'changed during backup'):
+                recovery.backup(database, root, 'mariadb-dump')
+            self.assertFalse((root / 'manifest.json').exists())
+
+    def test_recovery_requires_mysql_and_explicit_quiescence(self):
+        with patch.object(recovery, 'database_config') as configure, \
+             patch.object(sys, 'stderr', new_callable=io.StringIO):
+            self.assertEqual(recovery.main(['backup', '--directory', 'unused']), 1)
+            self.assertEqual(recovery.main(['verify', '--db-backend', 'sqlite']), 1)
+            configure.assert_not_called()
 
 
 if __name__ == '__main__':
