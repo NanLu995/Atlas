@@ -282,8 +282,7 @@ def build_baseapp_specs(args: argparse.Namespace) -> list[dict[str, object]]:
 
 def main() -> int:
     args = parse_args()
-    if args.db_backend == 'mysql':
-        database_config(args, Path())
+    database_config(args)
     source_ips = collect_source_ips(args)
     worker_plan = build_worker_plan(args, source_ips)
     baseapp_specs = build_baseapp_specs(args)
@@ -318,11 +317,9 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_root = repo_root / ".tmp" / "login-stress" / timestamp
     log_dir = run_root / "logs"
-    db_dir = run_root / "db"
     db_config_path = run_root / "dbapp.json"
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    db_dir.mkdir(parents=True, exist_ok=True)
     entitydef_path = run_root / "entity_defs.bin"
     try:
         entity_def_digest = export_entity_definitions(
@@ -330,7 +327,7 @@ def main() -> int:
     except RuntimeError as error:
         fail(str(error))
 
-    database = database_config(args, db_dir / 'atlas_login_stress.sqlite3')
+    database = database_config(args)
     record_database_run(run_root, database, baseapps=args.baseapp_count, cellapps=0)
 
     machined_address = f"{args.machined_host}:{args.machined_port}"
@@ -369,6 +366,36 @@ def main() -> int:
             )
         )
         processes[-1].start_order = 1
+        time.sleep(1)
+
+        processes.append(
+            start_logged_process(
+                name="dbapp",
+                file_path=dbapp,
+                working_directory=repo_root,
+                log_directory=log_dir,
+                arguments=[
+                    "--type",
+                    "dbapp",
+                    "--name",
+                    "dbapp",
+                    "--machined",
+                    machined_address,
+                    "--internal-port",
+                    str(args.dbapp_port),
+                    "--config",
+                    str(db_config_path),
+                    "--entitydef-bin-path",
+                    str(entitydef_path),
+                    "--update-hertz",
+                    "50",
+                    "--log-level",
+                    "info",
+                ],
+            )
+        )
+        processes[-1].start_order = 2
+        wait_for_database_start(processes[-1].process, log_dir)
         time.sleep(1)
 
         processes.append(
@@ -415,35 +442,6 @@ def main() -> int:
             processes[-1].start_order = 4
         time.sleep(1)
 
-        processes.append(
-            start_logged_process(
-                name="dbapp",
-                file_path=dbapp,
-                working_directory=repo_root,
-                log_directory=log_dir,
-                arguments=[
-                    "--type",
-                    "dbapp",
-                    "--name",
-                    "dbapp",
-                    "--machined",
-                    machined_address,
-                    "--internal-port",
-                    str(args.dbapp_port),
-                    "--config",
-                    str(db_config_path),
-                    "--entitydef-bin-path",
-                    str(entitydef_path),
-                    "--update-hertz",
-                    "50",
-                    "--log-level",
-                    "info",
-                ],
-            )
-        )
-        processes[-1].start_order = 2
-        wait_for_database_start(processes[-1].process, log_dir)
-        time.sleep(1)
 
         processes.append(
             start_logged_process(
@@ -564,7 +562,7 @@ def main() -> int:
         log("")
         log("Run artifacts:")
         log(f"  logs: {log_dir}")
-        log(f"  db:   {db_dir}")
+        log(f"  database manifest: {run_root / 'database-run.json'}")
 
         if args.keep_cluster:
             log("Keeping cluster alive. Stop the spawned processes manually when done.")

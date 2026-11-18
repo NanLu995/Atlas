@@ -1133,8 +1133,7 @@ def build_reviver_args(
 
 def main() -> int:
     args = parse_args()
-    if args.db_backend == 'mysql':
-        database_config(args, Path())
+    database_config(args)
     if args.cellappmgr_reviver_count < 1:
         fail("--cellappmgr-reviver-count must be >= 1")
     if args.reviver_port_stride <= 0:
@@ -1202,7 +1201,6 @@ def main() -> int:
     git_hash = _git_short(repo_root)
     run_root = repo_root / ".tmp" / "world-stress" / timestamp
     log_dir = run_root / "logs"
-    db_dir = run_root / "db"
     db_config_path = run_root / "dbapp.json"
     revived_cellappmgr_output_path = (
         log_dir / "cellappmgr_revived.log" if args.with_cellappmgr_reviver else None
@@ -1219,7 +1217,6 @@ def main() -> int:
         capture_dir = Path(args.capture_dir)
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    db_dir.mkdir(parents=True, exist_ok=True)
     entitydef_path = run_root / "entity_defs.bin"
     try:
         entity_def_digest = export_entity_definitions(
@@ -1227,7 +1224,7 @@ def main() -> int:
     except RuntimeError as error:
         fail(str(error))
 
-    database = database_config(args, db_dir / 'atlas_world_stress.sqlite3')
+    database = database_config(args)
     record_database_run(run_root, database, baseapps=args.baseapp_count, cellapps=args.cellapp_count)
 
     machined_address = f"{args.machined_host}:{args.machined_port}"
@@ -1270,18 +1267,6 @@ def main() -> int:
 
         processes.append(
             start_logged_process(
-                name="loginapp",
-                file_path=loginapp,
-                working_directory=repo_root,
-                log_directory=log_dir,
-                arguments=build_loginapp_args(args, machined_address),
-            )
-        )
-        processes[-1].start_order = 7
-        time.sleep(1)
-
-        processes.append(
-            start_logged_process(
                 name="dbapp",
                 file_path=dbapp,
                 working_directory=repo_root,
@@ -1309,6 +1294,19 @@ def main() -> int:
         processes[-1].start_order = 2
         wait_for_database_start(processes[-1].process, log_dir)
         time.sleep(1)
+
+        processes.append(
+            start_logged_process(
+                name="loginapp",
+                file_path=loginapp,
+                working_directory=repo_root,
+                log_directory=log_dir,
+                arguments=build_loginapp_args(args, machined_address),
+            )
+        )
+        processes[-1].start_order = 7
+        time.sleep(1)
+
 
         processes.append(
             start_logged_process(
@@ -1664,7 +1662,7 @@ def main() -> int:
         log("")
         log("Run artifacts:")
         log(f"  logs: {log_dir}")
-        log(f"  db:   {db_dir}")
+        log(f"  database manifest: {run_root / 'database-run.json'}")
 
         if movement_verify_errors:
             gate = "script-verify" if args.script_verify else "movement-verify"

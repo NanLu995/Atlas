@@ -656,6 +656,8 @@ void Reviver::RecordTargetHealthFailure(ManagedTarget& t, std::string_view reaso
                                         uint32_t& streak) {
   ++streak;
   ++t.health_failure_count;
+  ATLAS_LOG_WARNING("Reviver: {} pid={} health failure: {} (streak={})", t.slug, t.last_pid,
+                    reason, streak);
   const auto threshold = static_cast<uint32_t>(std::max(1, t.health_failure_threshold));
   if (streak < threshold) return;
 

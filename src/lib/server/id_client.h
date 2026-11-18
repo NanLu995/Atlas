@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 
+#include "foundation/clock.h"
 #include "server/entity_types.h"
 
 namespace atlas {
@@ -25,8 +26,12 @@ class IDClient {
 
   [[nodiscard]] auto NeedsRefill() const -> bool;
 
-  // 0 if above the high watermark.
-  [[nodiscard]] auto IdsToRequest() const -> uint32_t;
+  // 0 until a pending request's retry deadline or above the high watermark.
+  [[nodiscard]] auto IdsToRequest(TimePoint now = Clock::now()) const -> uint32_t;
+
+  void SetRequestPending(bool pending, TimePoint now = Clock::now()) {
+    request_deadline_ = pending ? now + std::chrono::seconds(5) : TimePoint{};
+  }
 
   [[nodiscard]] auto Available() const -> uint64_t { return total_available_; }
   [[nodiscard]] auto IsCriticallyLow() const -> bool { return total_available_ < kCriticallyLow; }
@@ -44,6 +49,7 @@ class IDClient {
   uint64_t total_available_{0};
   EntityID highest_received_id_{0};
   bool ever_received_{false};
+  TimePoint request_deadline_{};
 };
 
 }  // namespace atlas

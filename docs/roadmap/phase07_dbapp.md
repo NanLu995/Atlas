@@ -1,16 +1,16 @@
 # Phase 7: DBApp + 数据库层
 
-**Status:** ✅ SQLite / Oracle MySQL 8.4 后端可用；SQLite 用于单 DBApp 开发和测试，
+**Status:** ✅ Oracle MySQL 8.4 后端可用；开发、联调与生产使用同一主线，
 Oracle MySQL 8.4 支持多个 DBApp 共享同一个逻辑数据库。
 **前置依赖:** Phase 5、Phase 6、脚本层 EntityDef 元数据（[`docs/scripting/`](../scripting/)）
 **BigWorld 参考:** `server/dbapp/`, `lib/db_storage/idatabase.hpp`
 
 ## 目标
 
-把 Phase 7 层面的数据库能力收敛成可持续演进的**单 DBApp 架构**：
+把 Phase 7 层面的数据库能力收敛成可持续演进的**数据库代理架构**：
 
-- `DBApp` 作为唯一数据库代理进程，隔离 `BaseApp` / `LoginApp` 与底层存储
-- `IDatabase` 屏蔽 SQLite / Oracle MySQL 8.4 后端差异
+- `DBApp` 作为数据库代理进程，隔离 `BaseApp` / `LoginApp` 与底层存储
+- `IDatabase` 隔离上层业务与 Oracle MySQL 8.4 存储实现
 - 实体 CRUD、`lookup_by_name`、`checkout / clear_checkout`、`auto_load`
   语义稳定
 - 支撑当前登录主链路与 `checkin / checkout / relogin rollback` 场景
@@ -20,7 +20,6 @@ Oracle MySQL 8.4 支持多个 DBApp 共享同一个逻辑数据库。
 | 子阶段 | 主题 | 状态 |
 |---|---|---|
 | P7.1 | 基线收敛 | ✅ |
-| P7.2 | SQLite backend，显式单 DBApp 开发/测试 | ✅ |
 | P7.3 | DBApp 集成补强（登录回滚 / BaseApp 故障路径） | ✅ |
 | P7.4 | MySQL backend 正式实现（Oracle libmysqlclient + 线程池 + CI 契约） | ✅ |
 
@@ -28,7 +27,7 @@ Oracle MySQL 8.4 支持多个 DBApp 共享同一个逻辑数据库。
 
 ### 后端策略
 
-Oracle MySQL 8.4 默认用于主要开发、联调、部署及多 DBApp 共享存储验收；SQLite 显式用于单 DBApp 冒烟及独立测试。
+Oracle MySQL 8.4 统一用于开发、联调、集成测试、部署及多 DBApp 共享存储验收；显式 SQLite 存档选择会被拒绝。
 XML 数据库后端已移除，显式选择 `xml` 时配置及工厂均报错，不提供后端回退或数据迁移。
 通用 XML 解析、配置及实体定义支持不受影响，既有数据文件保留。
 BaseApp checkout 绑定每次启动的安全随机进程实例身份。死亡回收在事务中退役该身份并清理
@@ -62,12 +61,11 @@ CheckinEntity[Ack] / DeleteEntity[Ack] / LookupEntity[Ack] / AbortCheckout[Ack]
    BaseApp 死亡回收。
 3. **Fail-safe 清理** — 覆盖 `AbortCheckout`、`WriteFlags::LogOff`、
    `CheckinEntity`、BaseApp 死亡、DBApp 关闭。
-4. **后端切换不影响上层协议**。
+4. **数据库错误不得被当作实体不存在或触发存储回退**。
 
 ### 配置
 
-`ServerConfig` 支持 `db_sqlite_path / wal / busy_timeout_ms / foreign_keys`、
-`db_mysql_*` 系列字段。`database.type` 和 `--db-type` 仅接受 `sqlite` 或 `mysql`，
+`ServerConfig` 支持 `db_mysql_*` 系列字段。`database.type` 和 `--db-type` 仅接受 `mysql`，
 `db_type` 默认值为 `mysql`。
 
 ## 已落地与剩余工作
@@ -75,15 +73,15 @@ CheckinEntity[Ack] / DeleteEntity[Ack] / LookupEntity[Ack] / AbortCheckout[Ack]
 ### P7.3 — DBApp 集成补强 ✅
 
 主链路（`AuthLogin`、`AbortCheckout`、`CheckinEntity`、BaseApp death
-回收）已有集成与单测覆盖；SQLite / MySQL 路径下 `WriteFlags::LogOff` 与
+回收）已有集成与单测覆盖；MySQL 路径下 `WriteFlags::LogOff` 与
 `auto_load` 也有回归测试；DBApp watcher 已注册。后续新增数据库行为时
-继续补齐多后端契约一致性验证。
+继续补齐 MySQL 契约验证。
 
 ### P7.4 — MySQL backend ✅
 
 `atlas_db_mysql` 插件使用固定的 Oracle MySQL 8.4.13 C API，共享客户端库，
 `ATLAS_DB_MYSQL` 默认 ON。构建准备、开源交付条件和启动方式见
-[Oracle MySQL](../oracle_mysql_CN.md)。MySQL 仅支持 Oracle 8.4 LTS；SQLite 保持单 DBApp 辅助用途。
+[Oracle MySQL](../oracle_mysql_CN.md)。MySQL 仅支持 Oracle 8.4 LTS。
 
 数据模型保持 InnoDB、二进制 blob、事务 checkout、稳定操作去重、所有权版本和原子 ID 区间预留。
 Deferred 模式每 worker 独立连接，按实体 hash 保序，`ProcessResults()` 在主线程交付回调。
@@ -96,7 +94,7 @@ Deferred 模式每 worker 独立连接，按实体 hash 保序，`ProcessResults
 ## 边界
 
 **本文档负责：** DBApp 角色与边界、后端策略、`IDatabase` 语义、单 DBApp
-实施路线、SQLite/Oracle MySQL 8.4 后端范围。
+实施路线、Oracle MySQL 8.4 后端范围。
 
 **不负责：** 多 LoginApp / LoginAppMgr 设计、登录入口负载均衡、BaseApp 重复
 登录状态机、CellApp / Space 持久化策略。

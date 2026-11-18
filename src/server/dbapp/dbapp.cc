@@ -86,7 +86,6 @@ auto DBApp::Init(int argc, char* argv[]) -> bool {
     return false;
   }
   database_->SetDeferredMode(true);
-  database_->BeginBatch();
 
   auto& table = Network().InterfaceTable();
 
@@ -206,7 +205,6 @@ void DBApp::Fini() {
   StopAuthentication();
   authentication_tasks_.reset();
   if (database_) {
-    database_->EndBatch();
     database_->ProcessResults();
     database_->Shutdown();
     database_.reset();
@@ -218,9 +216,7 @@ void DBApp::Fini() {
 void DBApp::OnTickComplete() {
   ManagerApp::OnTickComplete();
   if (database_) {
-    database_->EndBatch();        // Commit batched writes from this tick
-    database_->ProcessResults();  // Pump deferred callbacks
-    database_->BeginBatch();      // Open batch for next tick
+    database_->ProcessResults();
   }
   std::vector<std::pair<Address, uint64_t>> ready;
   for (const auto& process : process_retirements_) {
@@ -294,10 +290,6 @@ auto DBApp::BuildDbConfig() const -> DatabaseConfig {
   const auto& cfg = Config();
   DatabaseConfig db_cfg;
   db_cfg.type = cfg.db_type;
-  db_cfg.sqlite_path = cfg.db_sqlite_path;
-  db_cfg.sqlite_wal = cfg.db_sqlite_wal;
-  db_cfg.sqlite_busy_timeout_ms = cfg.db_sqlite_busy_timeout_ms;
-  db_cfg.sqlite_foreign_keys = cfg.db_sqlite_foreign_keys;
   db_cfg.mysql_host = cfg.db_mysql_host;
   db_cfg.mysql_port = cfg.db_mysql_port;
   db_cfg.mysql_user = cfg.db_mysql_user;
@@ -1196,7 +1188,9 @@ void DBApp::OnGetEntityIds(const Address& src, Channel* ch, const dbapp::GetEnti
       ATLAS_LOG_ERROR("DBApp: EntityID reservation failed: {}", range.Error().Message());
     }
     if (auto* reply_ch = ResolveReplyChannel(reply_addr)) {
-      (void)reply_ch->SendMessage(ack);
+      if (auto sent = reply_ch->SendMessage(ack); !sent) {
+        ATLAS_LOG_WARNING("DBApp: EntityID reply send failed: {}", sent.Error().Message());
+      }
     }
   });
 }

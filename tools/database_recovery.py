@@ -218,10 +218,10 @@ def main(argv: list[str] | None = None) -> int:
             print(secrets.token_hex(16))
             return 0
         if args.db_backend != 'mysql':
-            raise RuntimeError('Recovery tool requires Oracle MySQL 8.4; SQLite is single-DBApp smoke only')
+            raise RuntimeError('SQLite entity persistence is no longer supported; use Oracle MySQL 8.4')
         if args.action != 'verify' and (not args.quiesced or args.directory is None):
             raise RuntimeError('backup/restore require --directory and --quiesced; stop all writers first')
-        settings = database_config(args, Path('unused.sqlite3'))
+        settings = database_config(args)
         database = Database(settings, program(args.client, 'mysql'))
         if args.action == 'backup':
             backup(database, args.directory, program(args.dump_tool, 'mysqldump'))

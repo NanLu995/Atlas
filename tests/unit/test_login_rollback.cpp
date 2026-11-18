@@ -5608,4 +5608,18 @@ TEST_F(DBAppRollbackTest, CheckinReadbackCannotClearCurrentOrNewerLocalOwner) {
   EXPECT_EQ(db().get_entity_calls, 2);
 }
 
+TEST(DatabaseInterface, DefaultOperationImplementationRejectsUnsupportedWrites) {
+  FakeDatabase db;
+  DatabaseWriteOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.expected_owner = CheckoutInfo{Address("127.0.0.1", 10001), 3, 9, 1};
+  const auto rejected = [](PutResult r) {
+    EXPECT_FALSE(r.success);
+    EXPECT_EQ(r.error, "write_operation_not_supported");
+  };
+  db.IDatabase::PutEntityWithOperation(operation, 42, 1, WriteFlags::kNone, {}, "", rejected);
+  operation.expected_owner.reset();
+  db.IDatabase::PutEntityWithOperation(operation, 42, 1, WriteFlags::kNone, {}, "", rejected);
+}
+
 }  // namespace atlas

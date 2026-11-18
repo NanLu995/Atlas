@@ -1,5 +1,6 @@
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -382,11 +383,7 @@ TEST(ServerConfig, FromJsonFile) {
             "runtime_config": "atlas.runtimeconfig.json"
         },
         "database": {
-            "type": "sqlite",
-            "sqlite_path": "data/dev.sqlite3",
-            "sqlite_wal": false,
-            "sqlite_busy_timeout_ms": 1234,
-            "sqlite_foreign_keys": false
+            "type": "mysql"
         }
     })");
 
@@ -405,11 +402,7 @@ TEST(ServerConfig, FromJsonFile) {
   EXPECT_EQ(r->login_rate_limit_trusted_cidrs[1], "10.0.0.0/8");
   EXPECT_EQ(r->script_assembly, std::filesystem::path("Atlas.Runtime.dll"));
   EXPECT_EQ(r->runtime_config, std::filesystem::path("atlas.runtimeconfig.json"));
-  EXPECT_EQ(r->db_type, "sqlite");
-  EXPECT_EQ(r->db_sqlite_path, std::filesystem::path("data/dev.sqlite3"));
-  EXPECT_FALSE(r->db_sqlite_wal);
-  EXPECT_EQ(r->db_sqlite_busy_timeout_ms, 1234);
-  EXPECT_FALSE(r->db_sqlite_foreign_keys);
+  EXPECT_EQ(r->db_type, "mysql");
   EXPECT_NE(r->raw_config, nullptr);
 }
 
@@ -439,11 +432,7 @@ TEST(ServerConfig, LoadCliOverridesJson) {
         "update_hertz": 10,
         "log_level": "info",
         "database": {
-            "type": "mysql",
-            "sqlite_path": "data/from_json.sqlite3",
-            "sqlite_wal": true,
-            "sqlite_busy_timeout_ms": 5000,
-            "sqlite_foreign_keys": true
+            "type": "mysql"
         },
         "authentication": {
             "rate_limit": {
@@ -455,41 +444,18 @@ TEST(ServerConfig, LoadCliOverridesJson) {
         }
     })");
 
-  FakeArgv args({"exe",
-                 "--config",
-                 path.string(),
-                 "--update-hertz",
-                 "30",
-                 "--log-level",
-                 "debug",
-                 "--db-type",
-                 "sqlite",
-                 "--db-sqlite-path",
-                 "data/from_cli.sqlite3",
-                 "--db-sqlite-wal",
-                 "false",
-                 "--db-sqlite-busy-timeout-ms",
-                 "2222",
-                 "--db-sqlite-foreign-keys",
-                 "false",
-                 "--login-rate-limit-per-ip",
-                 "77",
-                 "--login-rate-limit-global",
-                 "88",
-                 "--login-rate-limit-window-sec",
-                 "99",
-                 "--login-rate-limit-trusted-cidr",
+  FakeArgv args({"exe", "--config", path.string(), "--update-hertz", "30", "--log-level", "debug",
+                 "--db-type", "mysql",
+
+                 "--login-rate-limit-per-ip", "77", "--login-rate-limit-global", "88",
+                 "--login-rate-limit-window-sec", "99", "--login-rate-limit-trusted-cidr",
                  "192.168.1.0/24"});
   auto r = ServerConfig::Load(args.argc(), args.argv());
   ASSERT_TRUE(r.HasValue()) << r.Error().Message();
 
   EXPECT_EQ(r->update_hertz, 30);
   EXPECT_EQ(r->log_level, LogLevel::kDebug);
-  EXPECT_EQ(r->db_type, "sqlite");
-  EXPECT_EQ(r->db_sqlite_path, std::filesystem::path("data/from_cli.sqlite3"));
-  EXPECT_FALSE(r->db_sqlite_wal);
-  EXPECT_EQ(r->db_sqlite_busy_timeout_ms, 2222);
-  EXPECT_FALSE(r->db_sqlite_foreign_keys);
+  EXPECT_EQ(r->db_type, "mysql");
   EXPECT_EQ(r->login_rate_limit_per_ip, 77);
   EXPECT_EQ(r->login_rate_limit_global, 88);
   EXPECT_EQ(r->login_rate_limit_window_sec, 99);
@@ -512,7 +478,6 @@ TEST(ServerConfig, FromArgsRejectsUnsupportedDatabaseType) {
     FakeArgv args({"exe", "--db-type", type});
     auto result = ServerConfig::FromArgs(args.argc(), args.argv());
     ASSERT_FALSE(result.HasValue()) << type;
-    EXPECT_NE(result.Error().Message().find("sqlite"), std::string_view::npos);
     EXPECT_NE(result.Error().Message().find("mysql"), std::string_view::npos);
   }
 }
@@ -522,7 +487,6 @@ TEST(ServerConfig, FromJsonRejectsRemovedXmlDatabase) {
   auto result = ServerConfig::FromJsonFile(path);
   ASSERT_FALSE(result.HasValue());
   EXPECT_NE(result.Error().Message().find("xml"), std::string_view::npos);
-  EXPECT_NE(result.Error().Message().find("sqlite"), std::string_view::npos);
   FakeArgv args({"exe", "--config", path.string()});
   EXPECT_FALSE(ServerConfig::Load(args.argc(), args.argv()).HasValue());
 }
@@ -534,15 +498,10 @@ TEST(ServerConfig, FromArgsSupportsMysqlDatabase) {
   EXPECT_EQ(result->db_type, "mysql");
 }
 
-TEST(ServerConfig, SqlitePathDoesNotImplicitlySelectSqlite) {
+TEST(ServerConfig, RemovedSqliteArgumentsAreRejected) {
   FakeArgv args({"exe", "--db-sqlite-path", "unused.sqlite3"});
   auto cli = ServerConfig::FromArgs(args.argc(), args.argv());
-  ASSERT_TRUE(cli.HasValue());
-  EXPECT_EQ(cli->db_type, "mysql");
-  const auto path = write_temp_json(R"({"database":{"sqlite_path":"unused.sqlite3"}})");
-  auto json = ServerConfig::FromJsonFile(path);
-  ASSERT_TRUE(json.HasValue());
-  EXPECT_EQ(json->db_type, "mysql");
+  EXPECT_FALSE(cli.HasValue());
   const auto empty_type = write_temp_json(R"({"database":{"type":""}})");
   EXPECT_FALSE(ServerConfig::FromJsonFile(empty_type).HasValue());
 }
@@ -602,4 +561,27 @@ TEST(ServerAppOption, RegisterWatcherReadWrite) {
 
   EXPECT_TRUE(reg.Set("test/rw_opt", "50"));
   EXPECT_EQ(reg.Get("test/rw_opt").value_or(""), "50");
+}
+
+TEST(ServerConfig, RejectsSqliteEntityPersistenceFromArgsAndJson) {
+  FakeArgv args({"exe", "--db-type", "sqlite"});
+  auto cli = ServerConfig::FromArgs(args.argc(), args.argv());
+  ASSERT_FALSE(cli.HasValue());
+  EXPECT_NE(cli.Error().Message().find("SQLite entity persistence is no longer supported"),
+            std::string_view::npos);
+  const auto path = write_temp_json(R"({"database":{"type":"sqlite"}})");
+  auto json = ServerConfig::FromJsonFile(path);
+  ASSERT_FALSE(json.HasValue());
+  EXPECT_NE(json.Error().Message().find("SQLite entity persistence is no longer supported"),
+            std::string_view::npos);
+}
+
+TEST(ServerConfig, RejectsRemovedSqliteSettings) {
+  for (const char* key :
+       {"sqlite_path", "sqlite_wal", "sqlite_busy_timeout_ms", "sqlite_foreign_keys"}) {
+    const auto path = write_temp_json(std::format(R"({{"database":{{"{}":true}}}})", key));
+    auto result = ServerConfig::FromJsonFile(path);
+    ASSERT_FALSE(result.HasValue());
+    EXPECT_NE(result.Error().Message().find(key), std::string_view::npos);
+  }
 }

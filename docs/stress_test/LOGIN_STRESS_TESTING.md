@@ -130,7 +130,7 @@ tools\bin\run_login_stress.bat `
 
 - `timeout_fail` 是否持续上升
 - `invalid_session`
-- SQLite `entities.checked_out` 是否在结束后仍残留大量 checkout
+- MySQL `entities.checked_out` 是否在结束后仍残留大量 checkout
 
 ### 4.3 多 BaseApp 极限短线重登压测
 
@@ -256,9 +256,8 @@ tools\bin\run_login_stress.bat `
 - `logs/`
   - 各服务和各 worker 的 stdout / stderr
 
-- `db/`
-  - SQLite 数据目录
-  - 默认生成 `atlas_login_stress.sqlite3`
+- `database-run.json`
+  - 记录 MySQL 后端和拓扑，数据库连接指向显式配置的隔离 MySQL
   - 可用于检查压测结束后的账号/checkout 落库状态
 
 - `dbapp.json`
@@ -269,7 +268,7 @@ tools\bin\run_login_stress.bat `
 - `.tmp/login-stress/<timestamp>/logs/loginapp.stdout.log`
 - `.tmp/login-stress/<timestamp>/logs/baseapp.stderr.log`
 - `.tmp/login-stress/<timestamp>/logs/login_stress_worker_00.stdout.log`
-- `.tmp/login-stress/<timestamp>/db/atlas_login_stress.sqlite3`
+- `.tmp/login-stress/<timestamp>/database-run.json`
 
 ---
 
@@ -325,7 +324,7 @@ tools\bin\run_login_stress.bat `
 
 2. `timeout_fail` 高
    - 优先看 BaseApp / DBApp / LoginApp 日志时间线
-   - 再看 SQLite `entities.checked_out` 是否有大量残留
+   - 再看 MySQL `entities.checked_out` 是否有大量残留
 
 3. `unexpected_disc` 高
    - 优先看网络层问题、进程退出、RUDP 通道状态和服务端主动断开
@@ -334,9 +333,9 @@ tools\bin\run_login_stress.bat `
 
 文件:
 
-- `.tmp/login-stress/<timestamp>/db/atlas_login_stress.sqlite3`
+- `.tmp/login-stress/<timestamp>/database-run.json`
 
-如果压测结束后 SQLite 中仍有大量 `entities.checked_out = 1`，通常说明:
+如果压测结束后 MySQL 中仍有大量 `entities.checked_out = 1`，通常说明:
 
 - 旧 Proxy / entity 所有权未释放
 - `writeback -> checkin -> recheckout` 链路没有收敛
@@ -413,7 +412,7 @@ tools\bin\run_login_stress.bat `
 2. 跑 `shortline-pct=0` 的常规登录压测
 3. 跑单 BaseApp 的短线重登压测
 4. 跑多 BaseApp 的极限短线重登压测
-5. 检查 `logs/` 与 `db/atlas_login_stress.sqlite3`
+5. 检查 `logs/`、`database-run.json` 与隔离 MySQL 的实体数据
 6. 按需把新基线数字回填到本说明
 
 这样可以避免一上来只看极端压测，把基础功能回归和多进程极限问题混在一起。

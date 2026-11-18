@@ -17,9 +17,13 @@ namespace atlas {
 namespace {
 
 auto ValidateDatabaseType(std::string_view type) -> Result<void> {
-  if (type != "sqlite" && type != "mysql") {
+  if (type == "sqlite") {
+    return Error{ErrorCode::kNotSupported,
+                 "SQLite entity persistence is no longer supported; use Oracle MySQL 8.4"};
+  }
+  if (type != "mysql") {
     return Error{ErrorCode::kInvalidArgument,
-                 std::format("unsupported database backend '{}'; use sqlite or mysql", type)};
+                 std::format("unsupported database backend '{}'; use mysql", type)};
   }
   return {};
 }
@@ -107,10 +111,6 @@ static const CliField kCliFields[] = {
     {"runtime-config",             &ServerConfig::runtime_config},
     {"entitydef-bin-path",         &ServerConfig::entitydef_bin_path},
     {"db-type",                    &ServerConfig::db_type},
-    {"db-sqlite-path",             &ServerConfig::db_sqlite_path},
-    {"db-sqlite-wal",              &ServerConfig::db_sqlite_wal},
-    {"db-sqlite-busy-timeout-ms",  &ServerConfig::db_sqlite_busy_timeout_ms},
-    {"db-sqlite-foreign-keys",     &ServerConfig::db_sqlite_foreign_keys},
     {"db-mysql-host",              &ServerConfig::db_mysql_host},
     {"db-mysql-port",              &ServerConfig::db_mysql_port},
     {"db-mysql-user",              &ServerConfig::db_mysql_user},
@@ -335,12 +335,15 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
     if (!edef_bin.empty()) cfg.entitydef_bin_path = edef_bin;
 
     if (db->Child("type")) cfg.db_type = db->ReadString("type", "");
+    if (auto valid = ValidateDatabaseType(cfg.db_type); !valid) return valid.Error();
 
-    cfg.db_sqlite_path = db->ReadString("sqlite_path", cfg.db_sqlite_path.string());
-    cfg.db_sqlite_wal = db->ReadBool("sqlite_wal", cfg.db_sqlite_wal);
-    cfg.db_sqlite_busy_timeout_ms =
-        db->ReadInt("sqlite_busy_timeout_ms", cfg.db_sqlite_busy_timeout_ms);
-    cfg.db_sqlite_foreign_keys = db->ReadBool("sqlite_foreign_keys", cfg.db_sqlite_foreign_keys);
+    for (const char* key :
+         {"sqlite_path", "sqlite_wal", "sqlite_busy_timeout_ms", "sqlite_foreign_keys"}) {
+      if (db->Child(key)) {
+        return Error{ErrorCode::kNotSupported,
+                     std::format("removed SQLite entity persistence setting '{}'", key)};
+      }
+    }
     cfg.db_mysql_host = db->ReadString("mysql_host", cfg.db_mysql_host);
     cfg.db_mysql_port = static_cast<uint16_t>(db->ReadUint("mysql_port", cfg.db_mysql_port));
     cfg.db_mysql_user = db->ReadString("mysql_user", cfg.db_mysql_user);
@@ -385,7 +388,12 @@ auto ServerConfig::FromJsonFile(const std::filesystem::path& path) -> Result<Ser
 auto ServerConfig::FromArgs(int argc, char* argv[]) -> Result<ServerConfig> {
   ServerConfig cfg;
 
-  for (int i = 1; i < argc - 1; ++i) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]).starts_with("--db-sqlite-")) {
+      return Error{ErrorCode::kNotSupported,
+                   "SQLite entity persistence is no longer supported; use Oracle MySQL 8.4"};
+    }
+    if (i + 1 >= argc) break;
     std::string_view key = argv[i];
     std::string_view val = argv[i + 1];
 

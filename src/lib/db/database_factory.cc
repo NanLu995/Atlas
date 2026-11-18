@@ -10,9 +10,12 @@
 namespace atlas {
 
 auto CreateDatabase(const DatabaseConfig& config) -> std::unique_ptr<IDatabase> {
-  if (config.type != "sqlite" && config.type != "mysql") {
-    ATLAS_LOG_ERROR("CreateDatabase: unsupported database backend '{}'; use sqlite or mysql",
-                    config.type);
+  if (config.type == "sqlite") {
+    ATLAS_LOG_ERROR("SQLite entity persistence is no longer supported; use Oracle MySQL 8.4");
+    return nullptr;
+  }
+  if (config.type != "mysql") {
+    ATLAS_LOG_ERROR("CreateDatabase: unsupported database backend '{}'; use mysql", config.type);
     return nullptr;
   }
   // dlopen on Linux searches neither the exe directory nor the lib*.so
@@ -38,9 +41,9 @@ auto CreateDatabase(const DatabaseConfig& config) -> std::unique_ptr<IDatabase> 
   }
 
   using CreateFn = IDatabase* (*)();
-  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV6");
+  auto fn_result = lib_result->GetSymbol<CreateFn>("AtlasCreateDatabaseV7");
   if (!fn_result) {
-    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v6 (AtlasCreateDatabaseV6 missing)",
+    ATLAS_LOG_ERROR("CreateDatabase: backend '{}' requires ABI v7 (AtlasCreateDatabaseV7 missing)",
                     lib_path.string());
     return nullptr;
   }

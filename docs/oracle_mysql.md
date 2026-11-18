@@ -1,7 +1,9 @@
 # Oracle MySQL setup and FOSS delivery
 
 The target is Oracle MySQL 8.4.13 LTS with its C API, not Connector/C++.
-SQLite remains an explicitly selected single-DBApp development and smoke backend.
+Oracle MySQL is the only entity persistence backend in development, integration tests and production.
+Explicit SQLite selections and removed settings fail; existing files are not deleted or migrated.
+No design/configuration database system is added.
 Oracle database acceptance must be recorded separately from historical MariaDB results.
 
 ```bat
@@ -61,7 +63,7 @@ wrong credentials, trust/identity failures and incompatible storage reject start
 SQLite fallback. Server test fixtures enforce encrypted transport and caching_sha2_password.
 
 ```bat
-tools\bin\test_mysql.bat -- ctest --test-dir build/debug -C Debug -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$" -V --output-on-failure
+tools\bin\test_mysql.bat -- ctest --test-dir build/debug -C Debug -L mysql -V --output-on-failure
 ```
 
 Linux uses the matching `.sh` wrapper. `--docker` uses the exact Oracle 8.4.13 image and digest
@@ -73,3 +75,7 @@ It never reuses an existing directory. Data and logs remain for inspection; do n
 test CA keys or backups. Use only the dedicated fixture database: native database tests reset
 its Atlas tables. `mysql`/`mysqldump` discovery prefers the pinned SDK and rejects MariaDB or
 other version series. Production capacity, remote CI and HA are separate acceptance steps.
+
+Offline checks use `ctest --test-dir build/debug -C Debug -L unit -LE mysql --output-on-failure --no-tests=error`.
+Database configuration checks remain offline; `mysql`-labelled tests require the isolated fixture.
+All plugins must be rebuilt for database ABI V7; the storage schema and blob format are unchanged.

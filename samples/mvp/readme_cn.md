@@ -42,6 +42,10 @@ tools\bin\run_mvp_cluster.bat
 # 4. 在 Unity Hub 中打开 samples/mvp/UnityClient，然后点击 Play。
 ```
 
+开发与生产的实体存档统一使用 Oracle MySQL 8.4。先按 [MySQL 准备说明](../../docs/oracle_mysql_CN.md)
+配置 `--database-config` 或 `ATLAS_DB_MYSQL_*`，再启动集群。启动器先等待 DBApp 初始化，再启动使用方。
+显式 SQLite 存档选择会被拒绝；已有文件不会自动删除或迁移。
+
 两端默认使用 LoginApp 端口 `20018`。集群中 CellApp 与 BaseApp 以 20 Hz 运行（50 ms tick）。`UnityClient/Assets/Scenes/Main.unity` 已经包含运行时 `Bootstrap` 对象。
 
 **改了 `Atlas.Mvp.{Client,Cell,Base}/*.cs`、`entity_defs/*` 或 `src/csharp/Atlas.Client*/*.cs` 后，必须重跑 `tools\bin\setup_mvp_unity.bat`（或 .sh）再回 Unity Editor**。Unity 项目下有两条 staged 路径，都由 `setup_mvp_unity` 从源头重生成：

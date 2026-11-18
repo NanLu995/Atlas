@@ -147,7 +147,7 @@ TEST(ServerAppDeathTest, RemovedDatabaseBackendReportsErrorBeforeRuntimeStarts) 
   char backend[] = "xml";
   char* args[] = {executable, option, backend};
   EXPECT_EXIT(std::exit(app.RunApp(3, args)), ::testing::ExitedWithCode(1),
-              "unsupported database backend 'xml'; use sqlite or mysql");
+              "unsupported database backend 'xml'; use mysql");
 }
 
 TEST(ServerApp, InitRunFiniOrder) {

@@ -16,6 +16,7 @@
 #include "atdf_account_fixture.h"
 #include "baseapp/baseapp_messages.h"
 #include "loginapp/login_messages.h"
+#include "mysql_test_fixture.h"
 #include "network/event_dispatcher.h"
 #include "network/network_interface.h"
 #include "network/reliable_udp.h"
@@ -361,9 +362,6 @@ auto format_process_entries(const std::vector<machined::ProcessInfo>& entries) -
 }  // namespace
 
 TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
-#if !defined(_WIN32)
-  GTEST_SKIP() << "Windows-only process harness";
-#else
   const auto runtime_cfg = runtime_config_path();
   const auto runtime_dll = runtime_assembly_path();
   if (!std::filesystem::exists(runtime_cfg) || !std::filesystem::exists(runtime_dll)) {
@@ -387,8 +385,7 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   auto loaded_definitions = definitions.RegisterFromBinaryFile(entity_defs);
   ASSERT_TRUE(loaded_definitions.HasValue()) << loaded_definitions.Error().Message();
   const auto baseapp_config = write_baseapp_config_json(runtime_cfg, runtime_dll);
-  const auto sqlite_path = std::filesystem::temp_directory_path() / "atlas_login_flow.sqlite3";
-  std::filesystem::remove(sqlite_path);
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
 
   const uint16_t machined_port = reserve_tcp_port();
   const uint16_t dbapp_port = reserve_udp_port();
@@ -423,29 +420,35 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
            socket->Connect(Address("127.0.0.1", machined_port)).HasValue();
   })) << machined.diagnostic();
 
-  ChildProcess dbapp = ChildProcess::launch(dbapp_exe,
-                                            {L"--type",
-                                             L"dbapp",
-                                             L"--name",
-                                             L"dbapp_login_flow_test",
-                                             L"--update-hertz",
-                                             L"100",
-                                             L"--internal-port",
-                                             std::to_wstring(dbapp_port),
-                                             L"--machined",
-                                             machined_addr,
-                                             L"--entitydef-bin-path",
-                                             entity_defs.wstring(),
-                                             L"--db-type",
-                                             L"sqlite",
-                                             L"--db-sqlite-path",
-                                             sqlite_path.wstring(),
-                                             L"--account-type-id",
-                                             L"1",
-                                             L"--auto-create-accounts",
-                                             L"true"},
-                                            server_bin_dir(), "dbapp");
+  std::vector<std::wstring> dbapp_arguments{L"--type",
+                                            L"dbapp",
+                                            L"--name",
+                                            L"dbapp_login_flow_test",
+                                            L"--update-hertz",
+                                            L"100",
+                                            L"--internal-port",
+                                            std::to_wstring(dbapp_port),
+                                            L"--machined",
+                                            machined_addr,
+                                            L"--entitydef-bin-path",
+                                            entity_defs.wstring(),
+                                            L"--account-type-id",
+                                            L"1",
+                                            L"--auto-create-accounts",
+                                            L"true"};
+  for (const auto& argument : test_fixtures::MysqlTestArguments()) {
+    dbapp_arguments.push_back(std::filesystem::path(argument).wstring());
+  }
+  ChildProcess dbapp = ChildProcess::launch(dbapp_exe, dbapp_arguments, server_bin_dir(), "dbapp");
   ASSERT_TRUE(dbapp.is_running()) << dbapp.diagnostic();
+  EventDispatcher startup_dispatcher{"database_startup"};
+  ASSERT_TRUE(poll_until(
+      startup_dispatcher,
+      [&] {
+        return dbapp.diagnostic().find("DBApp: initialised (backend=mysql,") != std::string::npos;
+      },
+      std::chrono::seconds(60)))
+      << dbapp.diagnostic();
 
   ChildProcess baseappmgr = ChildProcess::launch(
       baseappmgr_exe,
@@ -586,7 +589,6 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   dbapp.terminate();
   machined.terminate();
 
-  std::filesystem::remove(sqlite_path);
   std::filesystem::remove(entity_defs);
   std::filesystem::remove(baseapp_config);
   machined.remove_log();
@@ -594,5 +596,4 @@ TEST(LoginFlowIntegration, ClientCanLoginAndAuthenticateThroughFullStack) {
   baseappmgr.remove_log();
   baseapp.remove_log();
   loginapp.remove_log();
-#endif
 }

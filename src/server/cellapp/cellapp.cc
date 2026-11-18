@@ -416,6 +416,7 @@ auto CellApp::Init(int argc, char* argv[]) -> bool {
           ATLAS_LOG_WARNING("CellApp: DBApp died, clearing dbapp channel");
         }
         dbapp_channel_ = nullptr;
+        id_client_.SetRequestPending(false);
       });
 
   // Track BaseApp peers so Cell RPC forwards can reject spoofed senders.
@@ -2096,6 +2097,7 @@ void CellApp::OnOutboundChannelDeath(Channel& dying) {
   if (&dying == dbapp_channel_) {
     ATLAS_LOG_WARNING("CellApp: dbapp channel down (RUDP dead link), clearing");
     dbapp_channel_ = nullptr;
+    id_client_.SetRequestPending(false);
   }
   if (&dying == cellappmgr_channel_) {
     ATLAS_LOG_WARNING("CellApp: cellappmgr channel down (RUDP dead link), clearing");
@@ -3006,7 +3008,8 @@ void CellApp::MaybeRequestMoreIds() {
   if (count == 0) return;
   dbapp::GetEntityIds req;
   req.count = count;
-  (void)dbapp_channel_->SendMessage(req);
+  if (!dbapp_channel_->SendMessage(req)) return;
+  id_client_.SetRequestPending(true);
   ATLAS_LOG_DEBUG("CellApp: requested {} EntityIDs from DBApp", count);
 }
 

@@ -24,7 +24,7 @@ class DeliveryTest(unittest.TestCase):
                 'CMAKE_BUILD_TYPE:STRING=Release\nATLAS_BUILD_TESTS:BOOL=ON\n')
             (release / 'runtime').mkdir()
             (release / 'runtime/atlas_server.runtimeconfig.json').write_text('{}')
-            for name in ('googletest', 'pugixml', 'rapidjson', 'zlib', 'sqlite3', 'mimalloc',
+            for name in ('googletest', 'pugixml', 'rapidjson', 'zlib', 'mimalloc',
                          'jolt', 'recastnavigation', 'tracy'):
                 source = release / '_deps' / (name + '-src')
                 source.mkdir(parents=True)
@@ -35,7 +35,8 @@ class DeliveryTest(unittest.TestCase):
                          'atlas_dbapp', 'atlas_cellappmgr', 'atlas_cellapp', 'atlas_tool'):
                 (binary / (name + ('.exe' if sys.platform == 'win32' else ''))).touch()
             for name in ('Atlas.Shared.dll', 'Atlas.ClrHost.dll', 'Atlas.Runtime.dll',
-                         'Business.dll', 'obsolete.dll'):
+                         'Business.dll', 'obsolete.dll', 'atlas_db_mysql.dll',
+                         'libatlas_db_mysql.so', 'atlas_db_sqlite.dll', 'libatlas_db_sqlite.so'):
                 (binary / name).touch()
             bundle = root / 'sdk'
             bundle.mkdir()
@@ -67,6 +68,10 @@ class DeliveryTest(unittest.TestCase):
             with zipfile.ZipFile(root / 'delivery.zip') as archive:
                 self.assertIn('server/Business.dll', archive.namelist())
                 self.assertNotIn('server/obsolete.dll', archive.namelist())
+                for name in ('atlas_db_mysql.dll', 'libatlas_db_mysql.so'):
+                    self.assertIn('server/' + name, archive.namelist())
+                for name in ('atlas_db_sqlite.dll', 'libatlas_db_sqlite.so'):
+                    self.assertNotIn('server/' + name, archive.namelist())
                 self.assertIn('sha256', json.loads(archive.read('delivery.json')))
                 self.assertIn('source/source.cc', archive.namelist())
                 self.assertNotIn('source/picture.png', archive.namelist())

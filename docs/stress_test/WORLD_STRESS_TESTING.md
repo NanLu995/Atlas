@@ -773,7 +773,7 @@ world_stress 断开只做 `network_.reset()`，不发 RUDP FIN。BaseApp 靠 10 
 每次运行会在 `.tmp/world-stress/<timestamp>/` 生成：
 
 - `logs/` — 所有进程的 stdout / stderr
-- `db/atlas_world_stress.sqlite3` — DBApp 的 SQLite 库
+- `database-run.json` — MySQL 后端和拓扑记录
 - `dbapp.json` — 本次生成的 DBApp 运行配置
 - `ha/` — Reviver 模式下的临时 HA 诊断目录
 - `logs/cellappmgr_revived.log` — Reviver 拉起的新 CellAppMgr stdout/stderr
@@ -791,8 +791,7 @@ world_stress 断开只做 `network_.reset()`，不发 RUDP FIN。BaseApp 靠 10 
 │   ├── baseappmgr.stdout.log
 │   ├── cellappmgr.stdout.log
 │   └── machined.stdout.log
-└── db/
-    └── atlas_world_stress.sqlite3
+└── database-run.json
 ```
 
 ## 8. 结果判读

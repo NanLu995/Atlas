@@ -23,6 +23,7 @@ On Ubuntu use `bash tools/bin/<name>.sh` with the same arguments. Install prereq
 explicitly; the build never changes system settings. `setup_linux` installs system packages
 and is an administrator tool, not an automatic build step. WSL/other distributions are auxiliary.
 `--build-dir build/<unique-name>` isolates a build. Use a fresh name when changing toolchains.
+If MSVC header dependency metadata is rejected, use a fresh build directory to rebuild all objects.
 Debug is daily development; Release is delivery; Profile and Sanitizers are diagnostic builds.
 Keep one configuration per build directory. CI and local builds share the SDK declaration.
 
@@ -36,6 +37,8 @@ The fixture starts only its own pinned MySQL server, creates a dedicated databas
 provides TLS settings to its child command and shuts its server down afterwards. It retains
 its isolated data/log directory for diagnosis; do not distribute its keys or backups.
 Linux CI uses the pinned Docker fixture. This does not connect to an existing development database.
+If workspace storage exceeds MySQL timeout budgets, use `--directory <new-local-directory>`
+on faster local storage; keep the existing timeouts and assertions.
 See [Oracle setup and license boundaries](oracle_mysql.md). Fixture-only RELOAD and trusted function creation support authentication-cache and fault-trigger tests; they are not production account requirements.
 
 For an existing isolated developer database, supply `--database-config <local.json>` or
@@ -44,10 +47,24 @@ For an existing isolated developer database, supply `--database-config <local.js
 not committed JSON. CA, host identity and logical database ID are mandatory. Missing settings
 or failed connections stop startup without SQLite fallback.
 
-SQLite is explicit single-DBApp smoke coverage: `--db-backend sqlite` for cluster tools,
-or `ATLAS_TEST_DB_BACKEND=sqlite` for managed real-cluster tests. Its results do not validate MySQL.
-Quick checks are the relevant unit/tool tests; formal acceptance includes database contracts,
-managed tests, cluster readiness/shutdown, Godot round trips and formatting checks.
+Explicit SQLite entity persistence selections are rejected; existing files are not removed or migrated.
+No design/configuration database system is added.
+
+Cluster launchers wait for MySQL-backed DBApp initialization before starting LoginApp and BaseApp consumers.
+
+The VS Code `CMake: Test All` task also uses this isolated MySQL fixture; individual public unit tests remain offline.
+Single-test selections fail if no matching test exists on the selected platform.
+
+The native full-login test is registered only on Windows. Both platform test workflows execute
+the existing managed real-login test and require exactly one passed result, with no skips:
+
+```bat
+tools\bin\test_mysql.bat -- python tools/verify_real_login.py --build debug
+```
+
+On Linux use `bash tools/bin/test_mysql.sh -- python3 tools/verify_real_login.py --build debug`.
+The tool selects `Atlas.RpcFixture.Base.dll` from that build, honoring `ATLAS_TEST_BASE_ASSEMBLY`.
+It prints its retained TRX report path; missing MySQL or build artifacts fail verification.
 
 ## Development cluster and Godot
 

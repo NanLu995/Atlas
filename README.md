@@ -21,7 +21,7 @@ Atlas is aimed at large, long-running online worlds where the server must scale 
 - Embedded .NET runtime for server-side gameplay scripting.
 - C# client runtime with desktop and Unity integration surfaces, plus the UE MVP
   C++ plugin/client path.
-- Runtime-loaded Oracle MySQL 8.4 and explicitly selected SQLite database plugins.
+- Runtime-loaded Oracle MySQL 8.4 entity persistence plugin.
 - DBAppMgr range sharding, worker-rebuilt manager HA, and Reviver supervision for
   CellAppMgr, BaseAppMgr, and DBAppMgr.
 - Tracy instrumentation, baseline stress drivers, and trace comparison tools.
@@ -65,7 +65,7 @@ LoginApp ──► BaseAppMgr ──► BaseApp ◄──► CellApp
                   ▼          ▼         CellAppMgr
                 DBAppMgr ─► DBApp
                               │
-                   Oracle MySQL 8.4 / SQLite
+                   Oracle MySQL 8.4
 ```
 
 | Process | Responsibility |
@@ -115,7 +115,7 @@ Database admission is limited to 4,096 operations, including callbacks waiting f
 Capacity rejection precedes execution (`RateLimited` / `kOverloaded`); draining rejects new work
 as `ReceiverGone` / `kStopping`. `BeginDrain` and `PendingOperations` expose this lifecycle.
 Checkout cleanup and automatic-load APIs return `Result` callbacks, including setters, so backend
-errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV6`.
+errors cannot become empty successful results. Database plugins require `AtlasCreateDatabaseV7`.
 Immediate reliable UDP sends obey the configured send window. Deferred bundles retain at most
 256 KiB per channel and reliability class; full admission returns `WouldBlock` without appending.
 RPC calls distinguish capacity rejection (`RateLimited`), duplicate requests (`AlreadyExists`)
@@ -312,8 +312,8 @@ Override the build dir with `ATLAS_LINUX_BUILD_DIR` if you want it elsewhere.
 ## Test
 
 ```bash
-ctest --test-dir build/debug -C Debug --label-regex unit --output-on-failure
-ctest --test-dir build/debug -C Debug --label-regex integration --output-on-failure
+ctest --test-dir build/debug -C Debug --label-regex unit -LE mysql --output-on-failure
+ctest --test-dir build/debug -C Debug --label-regex integration -LE mysql --output-on-failure
 ctest --test-dir build/debug -C Debug --label-regex managed --output-on-failure
 ctest --test-dir build/debug -C Debug -R test_math --output-on-failure
 ```
@@ -328,8 +328,12 @@ Windows process tests use server executables and the deployed runtime beside the
 binary; CTest supplies the runtime configuration. Missing artifacts fail the test.
 Building a target that uses the database factory also builds every enabled database
 plugin on both platforms; Windows deploys those DLLs beside the executable.
-The login, CellApp and Manager/Reviver process harnesses currently run only on Windows;
-their explicit Linux skips do not validate Linux process recovery.
+The native full-login target is Windows-only. Both platform test workflows run the existing
+managed real-login test through `verify_real_login`, requiring one passed result and no skips.
+Run MySQL-labelled checks through `tools/bin/test_mysql`; see the platform commands in
+[development checks](docs/development.md#isolated-database-and-checks).
+The CellApp and Manager/Reviver native process harnesses retain explicit Linux skips;
+those skips do not validate Linux process recovery.
 
 `AtomicReplaceFile` replaces a same-volume path without promising crash-durable storage.
 On Windows, existing targets use `ReplaceFileW`, preserving target metadata and allowing readers
@@ -507,12 +511,12 @@ MySQL connections require `mysql_ssl_ca` (`--db-mysql-ssl-ca`) and always verify
 and the configured host identity. There is no plaintext or unverified mode.
 
 
-Atlas loads SQLite and Oracle MySQL 8.4 plugins through the database factory. Oracle MySQL 8.4
-is the default for development, integration, deployment and cluster acceptance, with multiple
-DBApps sharing one logical database. `ATLAS_DB_MYSQL` defaults to ON and builds the plugin
-using the pinned Oracle libmysqlclient C API. SQLite requires explicit selection and is limited to single-DBApp
-lightweight development, quick smoke checks and independent tests, with WAL and busy-timeout support.
-Use `database.type` in JSON or `--db-type` with `sqlite` or `mysql`.
+Atlas loads the Oracle MySQL 8.4 entity persistence plugin through the database factory.
+Development, integration tests and production use the same database backend. `ATLAS_DB_MYSQL`
+defaults to ON and uses the pinned Oracle libmysqlclient C API; OFF is only a build exclusion,
+not an alternate storage backend. JSON `database.type` and `--db-type` default to `mysql`.
+Explicit `sqlite` selections fail with "SQLite entity persistence is no longer supported";
+removed SQLite settings are rejected. No connection or startup failure selects other storage.
 The XML database backend has been removed. Explicit `xml` or other unsupported backend
 types fail configuration validation and factory creation, even if an old plugin remains
 beside the executable; there is no fallback. Existing data files are not removed or migrated.
@@ -529,11 +533,10 @@ its retained receipt or lease history, so those confirmed identities remain belo
 cursor after restart. Backups must retain all three sources; this does not provide recovery
 from arbitrarily removed metadata or make raw backend deletion an ID reclamation operation.
 Concurrent MySQL startup serializes schema initialization with a database-scoped advisory lock.
-Both backends initialize only empty databases. Existing databases must have the matching
-`schema_version` (MySQL 4, SQLite 3); missing or incompatible metadata rejects startup without
+MySQL initializes only explicitly selected empty databases. Existing databases must have the matching
+`schema_version` (MySQL 4); missing or incompatible metadata rejects startup without
 overwriting the version or upgrading the schema. Rebuild matching processes and use a new
-isolated database; no old-format migration is provided. SQLite initializes its schema and
-metadata in one transaction. Interrupted MySQL DDL may leave an incomplete database, which
+isolated database; no old-format migration is provided. Interrupted MySQL DDL may leave an incomplete database, which
 must be inspected rather than automatically repaired or stamped as compatible.
 Startup also checks the SHA-256 `storage_schema_digest`. It covers registered entity fields,
 component inheritance and slots, structs, nested containers and their ordering; RPC declarations
@@ -556,8 +559,7 @@ Account-session payload version 2 stores recovery credential digests, controlled
 identity and expiry. Grant issuance, consumption with rotation, and revocation share the ownership/version and
 operation receipt transaction. An expired grant or a replay with a new operation ID is rejected;
 a retry of the same confirmed operation returns its recorded result. Digest comparison uses
-the existing OpenSSL constant-time primitive. Issuance expires after ten minutes using MySQL server time or the SQLite
-host clock; clients cannot supply the expiry. Release or control ownership changes revoke grants.
+the existing OpenSSL constant-time primitive. Issuance expires after ten minutes using MySQL server time; clients cannot supply the expiry. Release or control ownership changes revoke grants.
 A crash recovery claim additionally requires confirmed retirement of the old process and current
 checkouts of both the account and persistent controlled entity in the claiming process. Missing
 retirement or stale checkout versions refuse the claim; temporary entities cannot be claimed.
@@ -580,18 +582,16 @@ unconfirmed result. `Disconnect(Logout)` queues that same exchange; keep polling
 Credentials expire ten minutes after issuance; fetching a cached credential does not renew it.
 Do not log credentials or persist them in ordinary configuration. Password reauthentication,
 logout and a change of controlled entity invalidate the previous credential.
-Protocol version 2, storage schemas MySQL 4 / SQLite 3 and database plugin ABI V5 require matching rebuilt
-processes and an isolated new database; no migration is provided.
+Protocol version 2 and storage schema MySQL 4 remain unchanged. Database plugin ABI V7
+requires matching rebuilt plugins and processes; removing SQLite does not reset MySQL data.
 `SessionRecoveryRealTests` requires MySQL and covers live and crashed owners, transferred control,
 persistent target restoration, temporary target refusal, credential rotation and logout revocation.
-SQLite smoke tests do not replace it.
 
 MySQL pool connections recheck the storage schema, blob version and snapshot digest whenever
 they are opened after startup. A mismatch rejects operations without initializing or updating
 that storage; restoring the expected database allows a later connection attempt.
 
-Transaction commit failures report an uncertain outcome rather than success. SQLite
-batch callbacks wait for the transaction result. Checkout distinguishes missing entities
+Transaction commit failures report an uncertain outcome rather than success. Checkout distinguishes missing entities
 from database errors. Logoff writes with `kLogOff` and releases checkout in that write;
 BaseApp retains the entity if saving fails.
 
@@ -632,12 +632,7 @@ one second. An unresolved entity remains fenced against new persistence and logo
 destruction. Late success can confirm it; exhaustion logs an error and requires a process
 restart if confirmation never arrives. Ordinary failures before uncertainty complete as failures.
 
-The SQLite backend stores increasing checkout versions and supports conditional release
-against the complete owner. Its limit is `INT64_MAX`; exhaustion and invalid stored
-versions fail. Version history survives deletion and restart in `atlas_checkout_versions`
-and must be retained in backups. Failed commits do not return an acquired version or a
-successful release. Versioned writes, logoff and standalone deletes validate every owner
-field in the same transaction as the existing entity's modification.
+
 
 For every backend, DBApp binds checkout ownership to the source channel and waits for
 conditional database release before removing its local lease. Cancellation resolves the
@@ -658,7 +653,7 @@ Cached successful checkout replies recheck database ownership, and changed reque
 the same cached result. Named checkout cancellation uses the resolved database ID.
 
 Durable operation receipts cover `WriteEntity`, `DeleteEntity`, and `CheckoutEntity` on
-both backends. SQLite stores the SHA-256 request digest and result in `atlas_write_receipts`
+MySQL. MySQL stores the SHA-256 request digest and result in `atlas_write_receipts`
 in the modification's transaction.
 Backups must retain these receipts. Receipts do not expire automatically.
 Request digests use [Windows CNG](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcrypthash)
@@ -673,13 +668,13 @@ DBApp can reject a conflicting holder earlier using its local checkout state. Na
 remain bound to the original entity even after it is renamed.
 Reusing an operation ID for another kind, target, holder, or payload is rejected.
 Unreadable receipts report an uncertain outcome instead of being treated as absent.
-SQLite DBApp first saves persist the entity and its lease in the same
+MySQL DBApp first saves persist the entity and its lease in the same
 transaction; replies expose the owner
 only after persistence succeeds. Invalid creators and exhausted lease versions fail
 without creating an entity. Plugins without a durable operation implementation return
 `write_operation_not_supported` or `checkout_operation_not_supported`; unsupported checkout
 resolution returns `checkout_resolution_not_supported`.
-MySQL and SQLite also persist account session ownership independently of entity checkout.
+MySQL also persists account session ownership independently of entity checkout.
 Versioned session operations and their receipts commit together; changed operation payloads,
 retired processes and superseded ownership cannot reuse a previous grant. A lost commit reply
 returns `CommitUnknown`; corrupt records fail instead of becoming offline sessions. An account
@@ -702,7 +697,7 @@ and ownership version; success is returned after database confirmation. An unava
 changed version or uncertain commit rejects this login instead of assuming the session is offline.
 Login checks and incoming revocations each have a limit of 1024 outstanding requests. Cancelled
 login checks cannot continue into checkout; cancelling a wait does not undo a completed revocation.
-Database plugins must export `AtlasCreateDatabaseV6`; rebuild both plugins and the server.
+Database plugins must export `AtlasCreateDatabaseV7`; rebuild the MySQL plugin and the server.
 The loader rejects earlier plugin interfaces instead of invoking an incompatible vtable.
 Birth and death notifications are accepted only on the current machined channel. `MachinedClient`
 tracks peer process instances even for death-only subscriptions: a new instance at the same
@@ -731,11 +726,10 @@ Shared-storage failover has not completed acceptance.
 Use newly initialized databases and rebuild all participating processes; old formats and
 mixed process versions have no compatibility layer. Startup format validation remains incomplete.
 
-The MySQL CI job runs backend and real DBApp checkout network tests with a temporary
-database. Local shared-storage tests need all `ATLAS_TEST_MYSQL_*` settings; otherwise
-required MySQL cases fail with an environment-blocked message. SQLite success never substitutes
-for MySQL acceptance. The general Windows/Linux CI jobs explicitly use `ATLAS_DB_MYSQL=OFF`
-and SQLite smoke scope; the separate MySQL job exercises the database/network contracts.
+Windows and Linux CI run offline unit tests without a database, and backend and login
+integration contracts through `tools/bin/test_mysql` with a fresh isolated Oracle MySQL
+8.4.13 TLS fixture. Missing database prerequisites fail explicitly; no checks fall back.
+The separate MySQL job also runs the database/network contracts.
 The lost-checkout-reply case starts two real DBApp subprocesses. After suppressing delivery
 of a successful reply, it forcibly terminates the original DBApp and retries through the other
 process, including duplicate cancellation and expired-lease checks. This verifies that failure
@@ -818,18 +812,11 @@ rem MySQL is the default; use an existing isolated development database and loca
 tools\bin\test_cluster.bat --database-config <local-dbapp-json> --base-assembly <your-base-assembly>
 tools\bin\run_login_stress.bat --database-config <local-dbapp-json>
 tools\bin\run_world_stress.bat --database-config <local-dbapp-json>
-rem Explicit single-DBApp quick smoke; this is not MySQL acceptance.
-tools\bin\test_cluster.bat --db-backend sqlite --base-assembly <your-base-assembly>
-dotnet build/debug/csharp/Atlas.Tools.DefDump.dll --assembly <your-base-assembly> --out .tmp/sqlite-smoke/entity_defs.bin
-bin\debug\atlas_dbapp.exe --type dbapp --db-type sqlite --db-sqlite-path .tmp/sqlite-smoke/store.sqlite3 --entitydef-bin-path .tmp/sqlite-smoke/entity_defs.bin
 ```
 
 Linux uses the matching `tools/bin/*.sh` wrappers and `bin/debug/atlas_dbapp` with the same
-arguments. SQLite-only builds may explicitly set `-DATLAS_DB_MYSQL=OFF`; rebuild the selected
-output directory before running. The real-cluster C# fixture defaults to MySQL; an explicit
-`ATLAS_TEST_DB_BACKEND=sqlite` selects smoke coverage. Tools emit `database-run.json` with the
-backend, topology and scope, and include the backend in console/READY output. A smoke result
-is marked `sqlite_smoke_only`, never a capacity or shared-storage acceptance result.
+arguments. C# real-cluster tests accept only `ATLAS_TEST_DB_BACKEND=mysql` (the default).
+Tools emit `database-run.json` with MySQL backend, topology and `mysql_validation` scope.
 
 DBApp requires a nonempty ATDF definition file with a nonzero entity-definition digest before
 opening the database. The cluster tools export it from their selected Base assembly into the run
@@ -840,13 +827,9 @@ DefDump checks the generated offline-export contract before loading an assembly,
 generated native registration only inside its own process. Older generated assemblies require a
 rebuild. Export only trusted assemblies: other user-written module initializers can still run.
 
-SQLite uses an OS-held lock beside the canonical local database path for the connection's
-lifetime. A second Atlas opener of the same store fails before schema/data access; process exit
-releases the lock, while the `.atlas-lock` file remains. Use a local filesystem, do not remove
-or replace an active lock file, and stop the owner before external database maintenance.
-Separate SQLite files remain independent; shared files, replication and production HA are
-unsupported. SQLite use for design/configuration data is separate from entity persistence;
-this project does not add a configuration system or connect it to `IDatabase`.
+Existing SQLite files and their sidecars are neither deleted nor migrated. SQLite for
+static design/configuration data is a separate concern; this change adds no configuration
+system and does not connect configuration reading to `IDatabase`.
 
 ## C# Gameplay and Client Runtime
 

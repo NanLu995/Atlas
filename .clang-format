@@ -98,7 +98,7 @@ SortIncludes: CaseInsensitive
 IncludeBlocks: Regroup
 IncludeCategories:
   # Third-party libraries (matched first to avoid .h confusion with C system)
-  - Regex: '^<(gtest|gmock|rapidjson|pugixml|hostfxr|nethost|coreclr_delegates|zlib|liburing|sqlite3|spdlog|fmt|asio|boost)'
+  - Regex: '^<(gtest|gmock|rapidjson|pugixml|hostfxr|nethost|coreclr_delegates|zlib|liburing|spdlog|fmt|asio|boost)'
     Priority: 4
   # C system headers (.h extension, not matched above)
   - Regex: '^<.*\.h>'

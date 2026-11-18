@@ -505,19 +505,21 @@ atlas_add_test(NAME test_database_types
   SOURCES test_database_types.cpp
   DEPS atlas_db
 )
-add_dependencies(test_database_types atlas_db_sqlite_plugin)
-
-atlas_add_test(NAME test_sqlite_database
-  SOURCES test_sqlite_database.cpp
-  DEPS atlas_db_sqlite atlas_entitydef atlas_platform
-)
-target_include_directories(test_sqlite_database PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../integration")
+target_compile_definitions(test_database_types
+  PRIVATE ATLAS_TEST_MYSQL_ENABLED=$<BOOL:${ATLAS_DB_MYSQL}>)
 
 if(ATLAS_DB_MYSQL)
+  add_dependencies(test_database_types atlas_db_mysql_plugin)
   atlas_add_test(NAME test_mysql_database
     SOURCES test_mysql_database.cpp
+    ARGS --gtest_filter=MysqlDatabaseTest.*
     DEPS atlas_db_mysql atlas_entitydef atlas_platform
   )
+  set_tests_properties(test_mysql_database PROPERTIES
+    LABELS "unit;mysql" RUN_SERIAL TRUE)
+  add_test(NAME test_mysql_configuration COMMAND test_mysql_database
+    --gtest_filter=MysqlConfiguration.*)
+  set_tests_properties(test_mysql_configuration PROPERTIES LABELS "unit")
   atlas_deploy_mysql_runtime(test_mysql_database)
   target_include_directories(test_mysql_database PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../integration")

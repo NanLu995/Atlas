@@ -18,35 +18,38 @@ atlas_add_test(NAME test_baseappmgr_registration
   LABEL integration
 )
 
-atlas_add_test(NAME test_dbapp_login_flow
-  SOURCES test_dbapp_login_flow.cpp
-  DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform
-  LABEL integration
-)
-
-atlas_add_test(NAME test_dbapp_checkout_cleanup
-  SOURCES test_dbapp_checkout_cleanup.cpp
-  DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform sqlite3
-  LABEL integration
-)
-target_compile_definitions(test_dbapp_checkout_cleanup
-  PRIVATE ATLAS_TEST_MYSQL_ENABLED=$<BOOL:${ATLAS_DB_MYSQL}>)
 if(ATLAS_DB_MYSQL)
+  atlas_add_test(NAME test_dbapp_login_flow
+    SOURCES test_dbapp_login_flow.cpp
+    DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform atlas_db_mysql
+    LABEL integration
+  )
+
+  atlas_add_test(NAME test_dbapp_checkout_cleanup
+    SOURCES test_dbapp_checkout_cleanup.cpp
+    DEPS atlas_dbapp_lib atlas_server atlas_network atlas_platform atlas_db_mysql
+    LABEL integration
+  )
   add_executable(dbapp_test_process dbapp_test_process.cpp)
   target_link_libraries(dbapp_test_process PRIVATE atlas_dbapp_lib atlas_platform)
   atlas_set_output_dir("" dbapp_test_process)
   atlas_deploy_clr_runtime(dbapp_test_process)
   atlas_deploy_db_plugins(dbapp_test_process)
   add_dependencies(test_dbapp_checkout_cleanup dbapp_test_process)
-endif()
 
-atlas_add_test(NAME test_login_flow
-  SOURCES test_login_flow.cpp
-  DEPS atlas_baseapp_lib atlas_baseappmgr_lib atlas_dbapp_lib
-       atlas_loginapp_lib atlas_machined_lib atlas_server
-       atlas_network atlas_platform
-  LABEL integration
-)
+  set_tests_properties(test_dbapp_login_flow test_dbapp_checkout_cleanup
+    PROPERTIES LABELS "integration;mysql" RUN_SERIAL TRUE)
+  if(WIN32)
+    atlas_add_test(NAME test_login_flow
+      SOURCES test_login_flow.cpp
+      DEPS atlas_baseapp_lib atlas_baseappmgr_lib atlas_dbapp_lib
+           atlas_loginapp_lib atlas_machined_lib atlas_server
+           atlas_network atlas_platform atlas_db_mysql
+      LABEL integration
+    )
+    set_tests_properties(test_login_flow PROPERTIES LABELS "integration;mysql" RUN_SERIAL TRUE)
+  endif()
+endif()
 
 if(ATLAS_BUILD_NET_CLIENT)
   # Shared FakeCluster for the C++ integration test and the C# IntegrationTests
@@ -98,15 +101,17 @@ atlas_add_test(NAME test_cellappmgr_process
 )
 
 if(WIN32)
-  add_dependencies(test_login_flow machined atlas_dbapp atlas_baseappmgr atlas_baseapp atlas_loginapp)
+  if(TARGET test_login_flow)
+    add_dependencies(test_login_flow machined atlas_dbapp atlas_baseappmgr atlas_baseapp atlas_loginapp)
+    set_tests_properties(test_login_flow PROPERTIES
+      ENVIRONMENT "ATLAS_RUNTIME_CONFIG_RLOC=${CMAKE_BINARY_DIR}/runtime/atlas_server.runtimeconfig.json"
+    )
+    if(TARGET atlas_runtime_dll_deploy)
+      add_dependencies(test_login_flow atlas_runtime_dll_deploy)
+    endif()
+  endif()
   add_dependencies(test_cellapp_integration machined atlas_cellappmgr atlas_cellapp)
   add_dependencies(test_cellappmgr_process machined atlas_cellappmgr atlas_reviver)
-  set_tests_properties(test_login_flow PROPERTIES
-    ENVIRONMENT "ATLAS_RUNTIME_CONFIG_RLOC=${CMAKE_BINARY_DIR}/runtime/atlas_server.runtimeconfig.json"
-  )
-  if(TARGET atlas_runtime_dll_deploy)
-    add_dependencies(test_login_flow atlas_runtime_dll_deploy)
-  endif()
 endif()
 
 atlas_add_test(NAME test_distributed_space

@@ -6,7 +6,6 @@ on:
     branches: [main]
     paths:
       - 'src/lib/db_mysql/**'
-      - 'src/lib/db_sqlite/**'
       - 'src/lib/db/**'
       - 'src/lib/server/server_config.*'
       - 'tools/common/database.py'
@@ -14,7 +13,9 @@ on:
       - 'CMakeLists.txt'
       - 'src/server/dbapp/**'
       - 'src/server/baseapp/**'
-      - 'tests/integration/test_dbapp_checkout_cleanup.cpp'
+      - 'tests/integration/test_dbapp*'
+      - 'tests/integration/mysql_test_fixture.h'
+      - 'tests/integration/test_login_flow.cpp'
       - 'tests/integration/CMakeLists.txt'
       - 'tests/CMakeLists.txt'
       - 'tests/unit/test_mysql_database.cpp'
@@ -29,7 +30,6 @@ on:
     branches: [main]
     paths:
       - 'src/lib/db_mysql/**'
-      - 'src/lib/db_sqlite/**'
       - 'src/lib/db/**'
       - 'src/lib/server/server_config.*'
       - 'tools/common/database.py'
@@ -37,7 +37,9 @@ on:
       - 'CMakeLists.txt'
       - 'src/server/dbapp/**'
       - 'src/server/baseapp/**'
-      - 'tests/integration/test_dbapp_checkout_cleanup.cpp'
+      - 'tests/integration/test_dbapp*'
+      - 'tests/integration/mysql_test_fixture.h'
+      - 'tests/integration/test_login_flow.cpp'
       - 'tests/integration/CMakeLists.txt'
       - 'tests/CMakeLists.txt'
       - 'tests/unit/test_mysql_database.cpp'
@@ -90,11 +92,11 @@ jobs:
         run: python tools/build.py debug --config-only --cmake-arg=-DATLAS_DB_MYSQL=ON
 
       - name: Build MySQL backend and DBApp tests
-        run: cmake --build build/debug --config Debug --target test_mysql_database test_dbapp_checkout_cleanup atlas_db_mysql_plugin --parallel 2
+        run: cmake --build build/debug --config Debug --target test_mysql_database test_dbapp_checkout_cleanup test_dbapp_login_flow atlas_db_mysql_plugin --parallel 2
 
       - name: Run MySQL backend and DBApp contracts
         run: >-
           python tools/test_mysql.py --docker --
           ctest --test-dir build/debug --build-config Debug
-          -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$"
+          -L mysql
           --output-on-failure --no-tests=error

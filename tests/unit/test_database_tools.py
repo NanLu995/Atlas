@@ -17,6 +17,7 @@ from common.database import add_database_options, database_config, record_databa
 from cluster_control import test_cluster
 from common.cluster import export_entity_definitions, stop_logged_processes, wait_for_registration
 import database_recovery as recovery
+import verify_real_login as real_login
 
 
 class DatabaseToolsTest(unittest.TestCase):
@@ -186,6 +187,45 @@ class DatabaseToolsTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     test_cluster.parse_args()
 
+    def test_cluster_topologies_use_distinct_ports_within_the_reserved_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / 'build/debug/runtime/atlas_server.runtimeconfig.json'
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text('{}')
+            assembly = root / 'bin/debug/Atlas.Runtime.dll'
+            assembly.parent.mkdir(parents=True)
+            assembly.touch()
+            for baseapps in (1, 2):
+                for cellapps in (1, 2):
+                    with self.subTest(baseapps=baseapps, cellapps=cellapps), \
+                         patch.object(sys, 'argv', ['test_cluster.py', '--base-assembly', str(assembly),
+                             '--cell-assembly', str(assembly), '--baseapps', str(baseapps),
+                             '--cellapps', str(cellapps)]), \
+                         patch.object(test_cluster, 'resolve_repo_root', return_value=root), \
+                         patch.object(test_cluster, 'resolve_program', return_value=assembly), \
+                         patch.object(test_cluster, 'export_entity_definitions'), \
+                         patch.object(test_cluster, 'database_config', return_value={'type': 'mysql'}), \
+                         patch.object(test_cluster, 'wait_for_database_start'), \
+                         patch.object(test_cluster, 'wait_for_registration', return_value=True), \
+                         patch.object(test_cluster, 'stop_logged_processes'), \
+                         patch.object(test_cluster.time, 'sleep'), \
+                         patch.object(sys, 'stdin', io.StringIO('')), \
+                         patch.object(sys, 'stdout', io.StringIO()), \
+                         patch.object(test_cluster, 'start_logged_process') as start:
+                        start.side_effect = lambda **kw: SimpleNamespace(
+                            name=kw['name'], process=SimpleNamespace(poll=lambda: None))
+                        args = test_cluster.parse_args()
+                        self.assertEqual(test_cluster._spawn_cluster(args, 25000), 0)
+                        ports = [25001, 25002]
+                        for call in start.call_args_list:
+                            arguments = call.kwargs['arguments']
+                            for option in ('--internal-port', '--external-port'):
+                                if option in arguments:
+                                    ports.append(int(arguments[arguments.index(option) + 1]))
+                        self.assertEqual(len(ports), len(set(ports)), ports)
+                        self.assertTrue(all(25000 <= port < 25016 for port in ports))
+
     def test_registration_matches_the_whole_process_name(self):
         outputs = [SimpleNamespace(returncode=0, stdout='baseapp baseapp-2 127.0.0.1:25001'),
                    SimpleNamespace(returncode=0, stdout='baseapp baseapp 127.0.0.1:25002')]
@@ -234,16 +274,18 @@ class DatabaseToolsTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(self.args().db_backend, 'mysql')
             with self.assertRaisesRegex(RuntimeError, 'MySQL environment blocked'):
-                database_config(self.args(), Path('unused.sqlite3'))
+                database_config(self.args())
 
-    def test_sqlite_is_explicit_and_records_smoke_scope(self):
+    def test_sqlite_is_explicitly_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'SQLite entity persistence is no longer supported'):
+            database_config(self.args('--db-backend', 'sqlite'))
+
+    def test_mysql_records_validation_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = database_config(self.args('--db-backend', 'sqlite'), root / 'smoke.sqlite3')
-            self.assertEqual(config['type'], 'sqlite')
-            record_database_run(root, config, baseapps=2)
+            record_database_run(root, {'type': 'mysql'}, baseapps=2)
             result = json.loads((root / 'database-run.json').read_text())
-            self.assertEqual(result['scope'], 'sqlite_smoke_only')
+            self.assertEqual(result['scope'], 'mysql_validation')
             self.assertEqual(result['topology']['dbapps'], 1)
 
     def test_mysql_secret_is_inherited_and_not_serialized(self):
@@ -253,7 +295,7 @@ class DatabaseToolsTest(unittest.TestCase):
                        'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>',
                        'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
         with patch.dict(os.environ, environment, clear=True):
-            config = database_config(self.args(), Path('unused.sqlite3'))
+            config = database_config(self.args())
             self.assertNotIn('mysql_password', config)
             self.assertNotIn('sqlite_path', config)
             self.assertEqual(config['mysql_database'], 'isolated_test')
@@ -262,7 +304,7 @@ class DatabaseToolsTest(unittest.TestCase):
             self.assertEqual(os.environ['ATLAS_DB_MYSQL_PASSWORD'], '<test-password>')
             os.environ['ATLAS_DB_MYSQL_PORT'] = 'invalid'
             with self.assertRaisesRegex(RuntimeError, 'port must be'):
-                database_config(self.args(), Path('unused.sqlite3'))
+                database_config(self.args())
 
     def test_mysql_identity_is_required_and_never_inferred_from_database_name(self):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
@@ -271,11 +313,11 @@ class DatabaseToolsTest(unittest.TestCase):
                        'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>'}
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, 'mysql_database_id'):
-                database_config(self.args(), Path('unused.sqlite3'))
+                database_config(self.args())
             for identity in ('a' * 31, 'a' * 33, 'A' * 32, 'g' * 32):
                 os.environ['ATLAS_DB_MYSQL_DATABASE_ID'] = identity
                 with self.assertRaisesRegex(RuntimeError, '32 lowercase'):
-                    database_config(self.args(), Path('unused.sqlite3'))
+                    database_config(self.args())
 
     def test_mysql_initialization_requires_explicit_valid_configuration(self):
         environment = {'ATLAS_DB_MYSQL_USER': '<test-user>',
@@ -284,28 +326,28 @@ class DatabaseToolsTest(unittest.TestCase):
                        'ATLAS_DB_MYSQL_SSL_CA': '<test-ca.pem>',
                        'ATLAS_DB_MYSQL_DATABASE_ID': '0123456789abcdef0123456789abcdef'}
         with patch.dict(os.environ, environment, clear=True):
-            self.assertFalse(database_config(self.args(), Path('unused'))['mysql_initialize'])
+            self.assertFalse(database_config(self.args())['mysql_initialize'])
             os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'true'
-            self.assertTrue(database_config(self.args(), Path('unused'))['mysql_initialize'])
+            self.assertTrue(database_config(self.args())['mysql_initialize'])
             os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'yes'
             with self.assertRaisesRegex(RuntimeError, 'must be true or false'):
-                database_config(self.args(), Path('unused'))
+                database_config(self.args())
             os.environ['ATLAS_DB_MYSQL_INITIALIZE'] = 'false'
             with tempfile.TemporaryDirectory() as directory:
                 config_path = Path(directory) / 'config.json'
                 config_path.write_text(json.dumps({'database': {'mysql_initialize': 'false'}}))
                 with self.assertRaisesRegex(RuntimeError, 'JSON boolean'):
-                    database_config(self.args('--database-config', str(config_path)), Path('unused'))
+                    database_config(self.args('--database-config', str(config_path)))
 
     def test_configuration_must_match_selected_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / 'db.json'
             config.write_text(json.dumps({'database': {'type': 'sqlite'}}))
-            with self.assertRaisesRegex(RuntimeError, 'must match'):
-                database_config(self.args('--database-config', str(config)), Path('unused.sqlite3'))
+            with self.assertRaisesRegex(RuntimeError, 'SQLite entity persistence is no longer supported'):
+                database_config(self.args('--database-config', str(config)))
             config.write_text('{}')
             with self.assertRaisesRegex(RuntimeError, 'database object'):
-                database_config(self.args('--database-config', str(config)), Path('unused.sqlite3'))
+                database_config(self.args('--database-config', str(config)))
 
     def test_database_registration_does_not_imply_readiness(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -318,6 +360,14 @@ class DatabaseToolsTest(unittest.TestCase):
             process.poll = lambda: 1
             with self.assertRaisesRegex(RuntimeError, 'no backend fallback'):
                 wait_for_database_start(process, logs)
+
+    def test_removed_sqlite_fields_fail_without_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'database.json'
+            for key in ('sqlite_path', 'sqlite_wal', 'sqlite_busy_timeout_ms', 'sqlite_foreign_keys'):
+                config.write_text(json.dumps({'database': {'type': 'mysql', key: True}}))
+                with self.assertRaisesRegex(RuntimeError, 'Removed SQLite'):
+                    database_config(self.args('--database-config', str(config)))
 
 
 class DatabaseRecoveryToolsTest(unittest.TestCase):
@@ -422,6 +472,65 @@ class DatabaseRecoveryToolsTest(unittest.TestCase):
             self.assertEqual(recovery.main(['backup', '--directory', 'unused']), 1)
             self.assertEqual(recovery.main(['verify', '--db-backend', 'sqlite']), 1)
             configure.assert_not_called()
+
+
+class RealLoginVerificationTest(unittest.TestCase):
+    def test_runner_selects_the_built_entity_fixture_and_checks_the_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'bin' / 'selected'
+            binary.mkdir(parents=True)
+            assembly = binary / 'Atlas.RpcFixture.Base.dll'
+            assembly.touch()
+
+            def execute(command, **kwargs):
+                self.assertEqual(kwargs['env']['ATLAS_TEST_BASE_ASSEMBLY'], str(assembly.resolve()))
+                self.assertEqual(kwargs['env']['ATLAS_BIN_DIR'], str(binary))
+                self.assertIn('FullyQualifiedName=' + real_login.TEST_NAME, command)
+                report = Path(command[command.index('--results-directory') + 1]) / 'real-login.trx'
+                report.write_text('<TestRun><Results><UnitTestResult testName="'
+                                  + real_login.TEST_NAME + '" outcome="Passed"/></Results></TestRun>',
+                                  encoding='utf-8')
+                return SimpleNamespace(returncode=0)
+
+            with patch.dict(os.environ, {'ATLAS_TEST_MYSQL': '1'}, clear=True), \
+                    patch.object(real_login, 'REPO_ROOT', root), \
+                    patch.object(real_login, 'bin_dir', return_value=binary), \
+                    patch.object(real_login.subprocess, 'run', side_effect=execute) as run:
+                self.assertEqual(real_login.main(['--build', 'selected']), 0)
+                run.assert_called_once()
+                with patch.dict(os.environ, {'ATLAS_TEST_BASE_ASSEMBLY': str(root / 'missing.dll')}), \
+                        patch.object(sys, 'stderr', new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit):
+                        real_login.main(['--build', 'selected'])
+                run.assert_called_once()
+
+    def test_requires_exactly_one_passed_real_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'login.trx'
+            for count, name, outcome in (
+                    (1, real_login.TEST_NAME, 'Passed'),
+                    (0, real_login.TEST_NAME, 'Passed'),
+                    (2, real_login.TEST_NAME, 'Passed'),
+                    (1, real_login.TEST_NAME, 'NotExecuted'),
+                    (1, real_login.TEST_NAME, 'Failed'),
+                    (1, 'AnotherTest', 'Passed')):
+                result = f'<UnitTestResult testName="{name}" outcome="{outcome}"/>'
+                report.write_text('<TestRun xmlns="urn:trx"><Results>' + result * count
+                                  + '</Results></TestRun>', encoding='utf-8')
+                if count == 1 and name == real_login.TEST_NAME and outcome == 'Passed':
+                    real_login.verify_report(report)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'exactly once'):
+                        real_login.verify_report(report)
+
+    def test_missing_mysql_environment_fails_before_running_dotnet(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(real_login.subprocess, 'run') as run, \
+                patch.object(sys, 'stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as result:
+                real_login.main([])
+            self.assertNotEqual(result.exception.code, 0)
+            run.assert_not_called()
 
 
 if __name__ == '__main__':

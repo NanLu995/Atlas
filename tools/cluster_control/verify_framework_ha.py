@@ -27,7 +27,7 @@ def parse_args(argv=None):
     add_database_options(parser)
     args = parser.parse_args(argv)
     if args.db_backend != 'mysql':
-        parser.error('Framework recovery acceptance requires MySQL; SQLite is only for single-DBApp smoke')
+        parser.error('SQLite entity persistence is no longer supported; use Oracle MySQL 8.4')
     if Path(args.build).name != args.build or args.build in ('.', '..'):
         parser.error('--build must be a single directory name under bin/')
     return args
@@ -80,7 +80,7 @@ def collect_diagnostics(control):
 
 def main():
     args = parse_args()
-    database_config(args, Path())
+    database_config(args)
     run = root/'.tmp'/('framework-ha-' + uuid.uuid4().hex)
     run.mkdir(parents=True)
     binary = root/'bin'/args.build

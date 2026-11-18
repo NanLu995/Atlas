@@ -78,8 +78,13 @@ public sealed class RealClusterFixture : IDisposable
             arguments.Add("--dtls-private-key");
             arguments.Add(privateKey!);
         }
+        var backend = Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql";
+        if (backend != "mysql")
+            throw new InvalidOperationException(backend == "sqlite"
+                ? "SQLite entity persistence is no longer supported; use Oracle MySQL 8.4"
+                : "Unsupported database backend; use mysql");
         arguments.Add("--db-backend");
-        arguments.Add(Environment.GetEnvironmentVariable("ATLAS_TEST_DB_BACKEND") ?? "mysql");
+        arguments.Add(backend);
         arguments.Add("--baseapps");
         arguments.Add(baseapps.ToString());
         arguments.Add("--build-dir");

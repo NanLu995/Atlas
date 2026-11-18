@@ -19,7 +19,7 @@ P15 前的 Atlas 基线只有单 DBApp:
 
 - BaseApp / LoginApp 通过 machined registry 找到唯一一台 DBApp 直接发
   `CheckoutEntity` / `WriteEntity`。
-- DBApp 持有 `database_`（SQLite / Oracle MySQL 8.4）、
+- DBApp 持有 `database_`（Oracle MySQL 8.4）、
   `id_allocator_`、
   `checkout_mgr_`、`pending_checkout_requests_` —— 全是单点。
 - 单 DBApp 写吞吐 / 容量 / 故障域都是单点。
@@ -157,7 +157,7 @@ Reviver multi-target 已接入 `dbappmgr_target_`，支持
   Atlas 当前 entity 模型每个 entity 一个 dbid,不跨行;不需要分布式
   事务。
 - **DBApp 副本(replication)** — Phase 15 不做主从复制；Oracle MySQL 8.4 支持共享
-  同一逻辑数据库，复制由数据库自身负责。SQLite 仅用于单 DBApp 开发和测试。
+  同一逻辑数据库，复制由数据库自身负责。开发与生产均使用 MySQL。
 - **shard rebalance** — DBApp 死亡时 reassign 已接入；手动 ops 触发
   rebalance 和按负载自动迁移 shard 均推到 Phase 16+。
 - **历史数据迁移工具** — 从单 DBApp 升到多 DBApp 的迁移脚本。当前
@@ -218,7 +218,7 @@ Phase 13 的 "Manager HA 三件套" 已齐:CellAppMgr / BaseAppMgr / DBAppMgr
 
 ## 8. 不会做的事(明确归档)
 
-- 不会在 Phase 15 里把当前 SQLite / Oracle MySQL 8.4 后端替换为
+- 不会在 Phase 15 里把当前 Oracle MySQL 8.4 后端替换为
   分布式 DB(如 TiDB)。
 - 不会改 Phase 7 已经稳定的 DBApp <-> DB 接口。
 - 不会强制 LoginApp 必须经过 DBAppMgr — LoginApp 直连唯一 DBApp 的

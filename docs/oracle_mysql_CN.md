@@ -1,7 +1,8 @@
 # Oracle MySQL 配置与开源交付
 
 目标为 Oracle MySQL 8.4.13 LTS 及其 C API，不使用 Connector/C++。
-SQLite 保持显式选择的单 DBApp 开发与冒烟用途。
+开发、联调、集成测试和生产的实体存档统一使用 Oracle MySQL。
+显式 SQLite 类型和已移除字段明确失败；已有文件不会删除或迁移。本次不新增策划配置系统。
 Oracle 验收须单独记录，不能沿用历史 MariaDB 结果。
 
 ```bat
@@ -52,7 +53,7 @@ INFO_SRC、INFO_BIN、包与源码校验信息，以及匹配的 MySQL/OpenSSL �
 不回退 SQLite。测试夹具服务端强制加密，使用 caching_sha2_password。
 
 ```bat
-tools\bin\test_mysql.bat -- ctest --test-dir build/debug -C Debug -R "^(test_mysql_database|test_dbapp_checkout_cleanup)$" -V --output-on-failure
+tools\bin\test_mysql.bat -- ctest --test-dir build/debug -C Debug -L mysql -V --output-on-failure
 ```
 
 Linux 使用同名 `.sh`。`--docker` 使用夹具中固定补丁版本及摘要的 Oracle 8.4.13 镜像；
@@ -61,3 +62,7 @@ Linux 使用同名 `.sh`。`--docker` 使用夹具中固定补丁版本及摘要
 服务端，不复用已有目录。保留数据和日志供排查，不分发测试 CA 私钥或备份。原生数据库
 测试会重置测试库的框架表，只能使用专用夹具数据库。`mysql`/`mysqldump` 优先从固定 SDK
 查找，拒绝 MariaDB 和其他版本系列。生产容量、远端 CI 和 HA 仍需单独验收。
+
+离线检查使用 `ctest --test-dir build/debug -C Debug -L unit -LE mysql --output-on-failure --no-tests=error`。
+连接配置校验仍可离线执行；带 `mysql` 标签的测试必须使用隔离夹具。
+全部插件须配套重建至数据库 ABI V7；存储 schema 和 blob 格式保持不变。

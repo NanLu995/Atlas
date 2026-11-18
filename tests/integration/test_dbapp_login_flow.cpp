@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -13,10 +14,13 @@
 #include "dbapp/dbapp.h"
 #include "dbapp/dbapp_messages.h"
 #include "loginapp/login_messages.h"
+#include "mysql_test_fixture.h"
 #include "network/event_dispatcher.h"
 #include "network/network_interface.h"
+#include "network/packet_filter.h"
 #include "network/reliable_udp.h"
 #include "network/socket.h"
+#include "server/id_client.h"
 
 using namespace atlas;
 
@@ -49,8 +53,7 @@ auto write_entity_defs_bin() -> std::filesystem::path {
 }
 
 struct DBAppArgv {
-  DBAppArgv(uint16_t internal_port, const std::filesystem::path& entitydef_bin_path,
-            const std::filesystem::path& sqlite_path)
+  DBAppArgv(uint16_t internal_port, const std::filesystem::path& entitydef_bin_path)
       : storage{"dbapp",
                 "--type",
                 "dbapp",
@@ -64,15 +67,13 @@ struct DBAppArgv {
                 "127.0.0.1:1",
                 "--entitydef-bin-path",
                 entitydef_bin_path.string(),
-                "--db-type",
-                "sqlite",
-                "--db-sqlite-path",
-                sqlite_path.string(),
                 "--account-type-id",
                 "1",
                 "--auto-create-accounts",
                 "true"} {
-    for (auto& s : storage) ptrs.push_back(s.data());
+    auto database = test_fixtures::MysqlTestArguments();
+    storage.insert(storage.end(), database.begin(), database.end());
+    for (auto& value : storage) ptrs.push_back(value.data());
   }
 
   int argc() { return static_cast<int>(ptrs.size()); }
@@ -85,8 +86,12 @@ struct DBAppArgv {
 class TestDBApp final : public DBApp {
  public:
   TestDBApp(EventDispatcher& dispatcher, NetworkInterface& network, std::promise<Address>& addr,
-            std::stop_token stop)
-      : DBApp(dispatcher, network), addr_promise_(addr), stop_(stop) {}
+            std::stop_token stop, Address reply_address = {}, PacketFilterPtr reply_filter = {})
+      : DBApp(dispatcher, network),
+        addr_promise_(addr),
+        stop_(stop),
+        reply_address_(reply_address),
+        reply_filter_(std::move(reply_filter)) {}
 
  protected:
   auto Init(int argc, char* argv[]) -> bool override {
@@ -102,6 +107,11 @@ class TestDBApp final : public DBApp {
   }
 
   void OnTickComplete() override {
+    if (reply_filter_) {
+      if (auto* channel = Network().FindChannel(reply_address_)) {
+        channel->SetPacketFilter(std::move(reply_filter_));
+      }
+    }
     DBApp::OnTickComplete();
     if (stop_.stop_requested()) Shutdown();
   }
@@ -109,6 +119,18 @@ class TestDBApp final : public DBApp {
  private:
   std::promise<Address>& addr_promise_;
   std::stop_token stop_;
+  Address reply_address_;
+  PacketFilterPtr reply_filter_;
+};
+
+class RejectFirstReply final : public PacketFilter {
+ public:
+  auto SendFilter(std::span<const std::byte> data) -> Result<std::vector<std::byte>> override {
+    if (!rejected.exchange(true)) return Error{ErrorCode::kWouldBlock, "injected send window full"};
+    return std::vector<std::byte>(data.begin(), data.end());
+  }
+
+  std::atomic<bool> rejected{false};
 };
 
 struct DBAppClient {
@@ -137,14 +159,67 @@ struct DBAppClient {
 
 }  // namespace
 
+TEST(DBAppIntegration, EntityIdRetrySurvivesFailedReplyOnLiveConnection) {
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
+  const auto definitions = write_entity_defs_bin();
+  DBAppClient client{"id_retry_client"};
+  client.start_local_rudp(reserve_udp_port());
+  const auto client_address = client.network.RudpAddress();
+  auto filter = std::make_shared<RejectFirstReply>();
+  std::promise<Address> ready;
+  auto address = ready.get_future();
+  std::jthread server([&](std::stop_token stop) {
+    EventDispatcher dispatcher{"id_retry_server"};
+    dispatcher.SetMaxPollWait(Milliseconds(1));
+    NetworkInterface network(dispatcher);
+    TestDBApp app(dispatcher, network, ready, stop, client_address, filter);
+    DBAppArgv args(reserve_udp_port(), definitions);
+    EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
+  });
+  const auto server_address = address.get();
+  ASSERT_NE(server_address.Port(), 0u);
+  auto channel = client.network.ConnectRudpNocwnd(server_address);
+  ASSERT_TRUE(channel);
+  IDClient ids;
+  std::vector<dbapp::GetEntityIdsAck> replies;
+  ASSERT_TRUE(client.network.InterfaceTable().RegisterTypedHandler<dbapp::GetEntityIdsAck>(
+      [&](const Address&, Channel*, const dbapp::GetEntityIdsAck& reply) {
+        ids.AddIds(reply.start, reply.end);
+        replies.push_back(reply);
+      }));
+  const auto sent_at = Clock::now();
+  dbapp::GetEntityIds request;
+  request.count = ids.IdsToRequest(sent_at);
+  ASSERT_EQ(request.count, IDClient::kDesired);
+  ASSERT_TRUE((*channel)->SendMessage(request));
+  ids.SetRequestPending(true, sent_at);
+  ASSERT_TRUE(poll_until(client.dispatcher, [&] { return filter->rejected.load(); }));
+  EXPECT_TRUE(replies.empty());
+  EXPECT_EQ(ids.Available(), 0u);
+  EXPECT_FALSE((*channel)->IsCondemned());
+  const auto retry_at = sent_at + std::chrono::seconds(5);
+  EXPECT_EQ(ids.IdsToRequest(retry_at - std::chrono::nanoseconds(1)), 0u);
+  request.count = ids.IdsToRequest(retry_at);
+  ASSERT_EQ(request.count, IDClient::kDesired);
+  ASSERT_TRUE((*channel)->SendMessage(request));
+  ids.SetRequestPending(true, retry_at);
+  ASSERT_TRUE(poll_until(client.dispatcher, [&] { return !replies.empty(); }));
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_GT(replies.front().start, IDClient::kDesired);
+  EXPECT_EQ(ids.Available(), IDClient::kDesired);
+  EXPECT_EQ(ids.AllocateId(), replies.front().start);
+  EXPECT_FALSE((*channel)->IsCondemned());
+  server.request_stop();
+  server.join();
+  std::filesystem::remove(definitions);
+}
+
 TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) {
   const uint16_t port = reserve_udp_port();
   ASSERT_NE(port, 0u);
 
   const auto entity_defs = write_entity_defs_bin();
-  const auto sqlite_path =
-      std::filesystem::temp_directory_path() / "atlas_dbapp_login_flow.sqlite3";
-  std::filesystem::remove(sqlite_path);
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
 
   std::promise<Address> addr_promise;
   auto addr_future = addr_promise.get_future();
@@ -153,7 +228,7 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
     dispatcher.SetMaxPollWait(Milliseconds(1));
     NetworkInterface network(dispatcher);
     TestDBApp app(dispatcher, network, addr_promise, stop);
-    DBAppArgv args(port, entity_defs, sqlite_path);
+    DBAppArgv args(port, entity_defs);
     EXPECT_EQ(app.RunApp(args.argc(), args.argv()), 0);
   });
 
@@ -255,6 +330,5 @@ TEST(DBAppIntegration, AuthLoginRejectsMissingAccountThenAutoCreatesAndReauths) 
   app_thread.request_stop();
   app_thread.join();
 
-  std::filesystem::remove(sqlite_path);
   std::filesystem::remove(entity_defs);
 }

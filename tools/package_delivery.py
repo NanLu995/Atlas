@@ -86,10 +86,10 @@ def main():
         entries['server/' + path.name] = path
     for pattern in ('*.dll', '*.so*'):
         for path in binary.glob(pattern):
-            if not path.name.startswith(('atlas_engine.', 'atlas_db_mysql_plugin.',
-                                          'atlas_db_sqlite_plugin.', 'mimalloc', 'TracyClient.',
+            if not path.name.startswith(('atlas_engine.', 'atlas_db_mysql.',
+                                          'mimalloc', 'TracyClient.',
                                           'libmysql', 'libssl', 'libcrypto', 'nethost.',
-                                          'libatlas_engine.', 'libatlas_db_', 'libmimalloc',
+                                          'libatlas_engine.', 'libatlas_db_mysql.', 'libmimalloc',
                                           'libTracyClient', 'libnethost.')):
                 continue
             entries['server/' + path.name] = path
@@ -122,7 +122,7 @@ def main():
         args.build_dir / 'runtime/atlas_server.runtimeconfig.json')
     entries['server/entity_defs.bin'] = args.sdk / 'entity_defs.bin'
     values = cache(args.build_dir)
-    for dependency in ('googletest', 'pugixml', 'rapidjson', 'zlib', 'sqlite3', 'mimalloc',
+    for dependency in ('googletest', 'pugixml', 'rapidjson', 'zlib', 'mimalloc',
                        'jolt', 'recastnavigation', 'tracy'):
         source = Path(values.get('FETCHCONTENT_SOURCE_DIR_' + dependency.upper() + ':PATH', '')
                       or args.build_dir / '_deps' / (dependency + '-src'))

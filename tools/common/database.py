@@ -11,29 +11,28 @@ from common.json_io import write_json_atomic
 
 def add_database_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--db-backend', choices=('mysql', 'sqlite'), default='mysql',
-                        help='mysql for development/acceptance; sqlite for single-DBApp smoke only')
+                        help='Oracle MySQL 8.4 entity persistence; sqlite is rejected')
     parser.add_argument('--database-config', type=Path,
                         help='Existing JSON configuration containing a database object')
 
 
-def database_config(args: argparse.Namespace, sqlite_path: Path) -> dict[str, object]:
+def database_config(args: argparse.Namespace) -> dict[str, object]:
+    if args.db_backend == 'sqlite':
+        raise RuntimeError('SQLite entity persistence is no longer supported; use Oracle MySQL 8.4')
     settings: dict[str, object] = {}
     if args.database_config:
         try:
             settings = json.loads(args.database_config.read_text(encoding='utf-8'))['database']
         except (OSError, ValueError, KeyError, TypeError):
             raise RuntimeError('Cannot read database configuration; provide JSON with a database object') from None
+        if isinstance(settings, dict) and settings.get('type') == 'sqlite':
+            raise RuntimeError('SQLite entity persistence is no longer supported; use Oracle MySQL 8.4')
         if not isinstance(settings, dict) or settings.get('type', args.db_backend) != args.db_backend:
             raise RuntimeError('--database-config backend must match --db-backend')
         settings = dict(settings)
+    if any(key.startswith('sqlite_') for key in settings):
+        raise RuntimeError('Removed SQLite entity persistence settings are not supported')
     settings['type'] = args.db_backend
-    if args.db_backend == 'sqlite':
-        settings = {key: value for key, value in settings.items()
-                    if key in ('type', 'sqlite_path', 'sqlite_wal', 'sqlite_busy_timeout_ms',
-                               'sqlite_foreign_keys')}
-        settings.setdefault('sqlite_path', str(sqlite_path))
-        settings.setdefault('sqlite_foreign_keys', True)
-        return settings
     for field in ('host', 'port', 'user', 'password', 'database', 'database_id', 'pool_size', 'ssl_ca'):
         key = 'mysql_' + field
         value = os.environ.get('ATLAS_DB_MYSQL_' + field.upper())
@@ -75,7 +74,7 @@ def record_database_run(run_root: Path, settings: dict[str, object], *,
     topology = {'dbapps': 1, 'baseapps': baseapps, 'cellapps': cellapps}
     write_json_atomic(run_root / 'database-run.json', {
         'backend': backend, 'topology': topology,
-        'scope': 'mysql_validation' if backend == 'mysql' else 'sqlite_smoke_only',
+        'scope': 'mysql_validation',
     })
     print(f'Database backend={backend} topology={topology}; manifest={run_root / "database-run.json"}',
           flush=True)

@@ -1,4 +1,4 @@
-name: Linux SQLite Smoke Tests
+name: Linux MySQL Tests
 
 # Runs after a successful Linux Build and rebuilds debug for test binaries.
 # sccache should make the rebuild incremental instead of a full compile.
@@ -70,6 +70,9 @@ jobs:
       - name: Build pinned OpenSSL SDK
         run: python tools/build_openssl.py --config Debug
 
+      - name: Prepare Oracle MySQL SDK
+        run: python tools/prepare_mysql.py
+
       - name: Configure
         env:
           CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || 'Unix Makefiles' }}
@@ -81,7 +84,7 @@ jobs:
           --cmake-arg=-DCMAKE_C_COMPILER_LAUNCHER=sccache
           --cmake-arg=-DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           --cmake-arg=-DATLAS_BUILD_NET_CLIENT=ON
-          --cmake-arg=-DATLAS_DB_MYSQL=OFF
+          --cmake-arg=-DATLAS_DB_MYSQL=ON
 
       - name: Build
         env:
@@ -129,7 +132,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          ctest --build-config Debug --label-regex unit --output-on-failure 2>&1 | tee unit-tests.log
+          ctest --build-config Debug --label-regex unit -LE mysql --output-on-failure --no-tests=error 2>&1 | tee unit-tests.log
           status=${PIPESTATUS[0]}
           if [[ "$status" -ne 0 ]]; then
             {
@@ -146,7 +149,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          ctest --build-config Debug --label-regex integration --output-on-failure 2>&1 | tee integration-tests.log
+          ctest --build-config Debug --label-regex integration -LE mysql --output-on-failure --no-tests=error 2>&1 | tee integration-tests.log
           status=${PIPESTATUS[0]}
           if [[ "$status" -ne 0 ]]; then
             {
@@ -158,17 +161,22 @@ jobs:
             exit "$status"
           fi
 
+      - name: MySQL backend and integration contracts
+        run: python tools/test_mysql.py --docker -- ctest --test-dir build/debug -C Debug -L mysql --output-on-failure --no-tests=error
+
       - name: C# Unit Tests
         run: ctest --test-dir build/debug -C Debug --label-regex managed --output-on-failure --no-tests=error
+
+      - name: Real MySQL login
+        run: python tools/test_mysql.py --docker -- python tools/verify_real_login.py --build debug
 
       - name: C# IntegrationTests
         env:
           ATLAS_BIN_DIR: ${{ github.workspace }}/bin/debug
-          ATLAS_TEST_DB_BACKEND: sqlite
         shell: bash
         run: |
           set +e
-          dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter "Category!=Nightly" --nologo \
+          python tools/test_mysql.py --docker -- dotnet test tests/csharp/Atlas.Client.IntegrationTests --filter "Category!=Nightly" --nologo \
             2>&1 | tee csharp-integration-tests.log
           status=${PIPESTATUS[0]}
           if [[ "$status" -ne 0 ]]; then

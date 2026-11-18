@@ -2082,3 +2082,446 @@ TEST_F(MysqlDatabaseTest, RetirementFencesConcurrentAcquisitionsAcrossDatabaseIn
   }
   peer.Shutdown();
 }
+
+TEST_F(MysqlDatabaseTest, OperationWriteAndDeleteFenceStaleAndMissingOwners) {
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("saved"),
+                "owned", [](PutResult r) { ASSERT_TRUE(r.success) << r.error; });
+  CheckoutInfo owner{Address("127.0.0.1", 10001), 3, 9};
+  db_.CheckoutEntity(42, 1, owner, [&](GetResult r) {
+    ASSERT_TRUE(r.success) << r.error;
+    owner.ownership_version = r.checkout_version;
+  });
+  DatabaseWriteOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.requested_dbid = 42;
+  operation.entity_id = owner.entity_id;
+  for (auto flags : {WriteFlags::kNone, WriteFlags::kLogOff, WriteFlags::kDelete}) {
+    operation.requested_flags = flags;
+    for (int field = 0; field < 6; ++field) {
+      operation.expected_owner = owner;
+      if (field == 0) operation.expected_owner.reset();
+      if (field == 1) operation.expected_owner->ownership_version = 0;
+      if (field == 2) ++operation.expected_owner->ownership_version;
+      if (field == 3) ++operation.expected_owner->app_id;
+      if (field == 4) ++operation.expected_owner->entity_id;
+      if (field == 5) operation.expected_owner->base_addr = Address("127.0.0.1", 10002);
+      db_.PutEntityWithOperation(operation, 42, 1, flags, make_blob("stale"), "", [](PutResult r) {
+        EXPECT_FALSE(r.success);
+        EXPECT_EQ(r.error_kind, DatabaseErrorKind::kOwnershipConflict);
+      });
+    }
+  }
+  db_.GetEntity(42, 1, [&](GetResult r) {
+    ASSERT_TRUE(r.success) << r.error;
+    ASSERT_TRUE(r.checked_out_by);
+    EXPECT_EQ(r.checked_out_by->ownership_version, owner.ownership_version);
+    EXPECT_EQ(r.data.blob, make_blob("saved"));
+  });
+  operation.expected_owner = owner;
+  operation.requested_flags = WriteFlags::kNone;
+  db_.PutEntityWithOperation(operation, 42, 1, WriteFlags::kNone, make_blob("updated"), "",
+                             [](PutResult r) { EXPECT_TRUE(r.success) << r.error; });
+  operation.id[0] = std::byte{2};
+  operation.requested_flags = WriteFlags::kDelete;
+  db_.PutEntityWithOperation(operation, 42, 1, WriteFlags::kDelete, {}, "", [](PutResult r) {
+    EXPECT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.dbid, 42);
+  });
+  db_.GetEntity(42, 1, [](GetResult r) {
+    EXPECT_FALSE(r.success);
+    EXPECT_EQ(r.error_kind, DatabaseErrorKind::kNotFound);
+  });
+}
+
+TEST_F(MysqlDatabaseTest, ConditionalReleaseChecksEveryOwnerField) {
+  PutResult created;
+  db_.PutEntity(0, 1, WriteFlags::kCreateNew, make_blob("saved"), "owner_fields",
+                [&](PutResult result) { created = std::move(result); });
+  ASSERT_TRUE(created.success);
+  CheckoutInfo owner{Address("127.0.0.1", 10001), 3, 9};
+  GetResult acquired;
+  db_.CheckoutEntity(created.dbid, 1, owner,
+                     [&](GetResult result) { acquired = std::move(result); });
+  ASSERT_TRUE(acquired.success);
+  owner.ownership_version = acquired.checkout_version;
+  for (int field = 0; field < 6; ++field) {
+    auto wrong = owner;
+    if (field == 0) wrong.base_addr = Address("127.0.0.2", 10001);
+    if (field == 1) wrong.base_addr = Address("127.0.0.1", 10002);
+    if (field == 2) ++wrong.app_id;
+    if (field == 3) ++wrong.entity_id;
+    if (field == 4) wrong.ownership_version = 0;
+    if (field == 5) wrong.ownership_version = UINT64_MAX;
+    bool called = false;
+    db_.ReleaseCheckout(created.dbid, 1, wrong, [&](Result<void> result) {
+      called = true;
+      EXPECT_FALSE(result.HasValue());
+    });
+    ASSERT_TRUE(called);
+  }
+  GetResult loaded;
+  db_.GetEntity(created.dbid, 1, [&](GetResult result) { loaded = std::move(result); });
+  ASSERT_TRUE(loaded.success);
+  ASSERT_TRUE(loaded.checked_out_by);
+  EXPECT_EQ(loaded.checked_out_by->ownership_version, owner.ownership_version);
+  db_.ReleaseCheckout(created.dbid, 1, owner,
+                      [](Result<void> result) { ASSERT_TRUE(result.HasValue()); });
+  db_.ReleaseCheckout(created.dbid, 1, owner,
+                      [](Result<void> result) { EXPECT_FALSE(result.HasValue()); });
+}
+
+TEST_F(MysqlDatabaseTest, ClosedDatabaseIsNotReportedAsMissingEntity) {
+  db_.Shutdown();
+  GetResult result;
+  db_.GetEntity(1, 1, [&](GetResult r) { result = std::move(r); });
+  EXPECT_FALSE(result.success);
+  EXPECT_NE(result.error_kind, DatabaseErrorKind::kNotFound);
+  EXPECT_FALSE(result.error.empty());
+  db_.CheckoutEntity(1, 1, CheckoutInfo{}, [&](GetResult r) { result = std::move(r); });
+  EXPECT_FALSE(result.success);
+  EXPECT_NE(result.error_kind, DatabaseErrorKind::kNotFound);
+  EXPECT_FALSE(result.error.empty());
+}
+
+TEST_F(MysqlDatabaseTest, FailedConditionalMutationsPreserveDataAndLease) {
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("saved"),
+                "owned", [](PutResult r) { ASSERT_TRUE(r.success); });
+  CheckoutInfo owner{Address("127.0.0.1", 10001), 3, 9};
+  db_.CheckoutEntity(42, 1, owner, [&](GetResult r) {
+    ASSERT_TRUE(r.success);
+    owner.ownership_version = r.checkout_version;
+  });
+  auto admin = connect_admin(cfg_);
+  ASSERT_NE(admin, nullptr);
+  for (const char* sql : {"CREATE TRIGGER reject_update BEFORE UPDATE ON entities FOR EACH ROW "
+                          "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected'",
+                          "CREATE TRIGGER reject_delete BEFORE DELETE ON entities FOR EACH ROW "
+                          "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected'"}) {
+    ASSERT_EQ(mysql_query(admin.get(), sql), 0);
+  }
+  DatabaseWriteOperation operation;
+  operation.id[0] = std::byte{1};
+  operation.requested_dbid = 42;
+  operation.expected_owner = owner;
+  for (auto flags : {WriteFlags::kLogOff, WriteFlags::kDelete}) {
+    operation.requested_flags = flags;
+    db_.PutEntityWithOperation(operation, 42, 1, flags, make_blob("uncommitted"), "",
+                               [](PutResult r) { EXPECT_FALSE(r.success); });
+  }
+  db_.GetEntity(42, 1, [&](GetResult r) {
+    ASSERT_TRUE(r.success);
+    EXPECT_EQ(r.data.blob, make_blob("saved"));
+    ASSERT_TRUE(r.checked_out_by);
+    EXPECT_EQ(*r.checked_out_by, owner);
+  });
+  ASSERT_EQ(mysql_query(admin.get(), "DROP TRIGGER reject_update"), 0);
+  ASSERT_EQ(mysql_query(admin.get(), "DROP TRIGGER reject_delete"), 0);
+}
+
+TEST_F(MysqlDatabaseTest, SessionCallbacksPublishOnlyConfirmedState) {
+  auto claim = atlas::test_support::CreateSessionAccount(db_);
+  ASSERT_TRUE(claim.HasValue());
+  auto admin = connect_admin(cfg_);
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(
+      mysql_query(admin.get(),
+                  "CREATE TRIGGER reject_session_callback BEFORE UPDATE ON atlas_write_receipts "
+                  "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected'"),
+      0);
+  db_.SetDeferredMode(true);
+  int callbacks = 0;
+  db_.UpdateAccountSession(*claim, [&](Result<AccountSession> value) {
+    EXPECT_FALSE(value.HasValue());
+    ++callbacks;
+  });
+  EXPECT_EQ(callbacks, 0);
+  pump_until([&] { return callbacks != 0; });
+  ASSERT_EQ(callbacks, 1);
+  ASSERT_EQ(mysql_query(admin.get(), "DROP TRIGGER reject_session_callback"), 0);
+  MysqlDatabase observer;
+  ASSERT_TRUE(observer.Startup(cfg_, EntityDefRegistry::Instance()));
+  db_.UpdateAccountSession(*claim, [&](Result<AccountSession> value) {
+    ASSERT_TRUE(value.HasValue());
+    observer.ReadAccountSession(claim->account_dbid, 1, [&](Result<AccountSession> stored) {
+      ASSERT_TRUE(stored.HasValue());
+      EXPECT_EQ(*stored, *value);
+    });
+    ++callbacks;
+  });
+  EXPECT_EQ(callbacks, 1);
+  pump_until([&] { return callbacks == 2; });
+  ASSERT_EQ(callbacks, 2);
+  db_.ProcessResults();
+  EXPECT_EQ(callbacks, 2);
+  observer.Shutdown();
+}
+
+TEST_F(MysqlDatabaseTest, FirstSaveAndCheckoutCallbacksPublishCommittedOwners) {
+  MysqlDatabase observer;
+  ASSERT_TRUE(observer.Startup(cfg_, EntityDefRegistry::Instance()));
+  db_.SetDeferredMode(true);
+  DatabaseWriteOperation create;
+  create.id[0] = std::byte{1};
+  create.requested_flags = WriteFlags::kCreateNew;
+  create.entity_id = 9001;
+  create.create_owner = CheckoutInfo{Address("127.0.0.1", 24991), 7, 9001, 0, 111};
+  PutResult saved;
+  bool done = false;
+  db_.PutEntityWithOperation(create, 0, 1, WriteFlags::kCreateNew, make_blob("saved"),
+                             "callback_owner", [&](PutResult result) {
+                               saved = std::move(result);
+                               if (saved.success) {
+                                 observer.GetEntity(saved.dbid, 1, [&](GetResult stored) {
+                                   EXPECT_TRUE(stored.success);
+                                   EXPECT_EQ(stored.checked_out_by, saved.checkout_owner);
+                                   EXPECT_EQ(stored.data.blob, make_blob("saved"));
+                                 });
+                               }
+                               done = true;
+                             });
+  EXPECT_FALSE(done);
+  pump_until([&] { return done; });
+  ASSERT_TRUE(done);
+  ASSERT_TRUE(saved.success);
+  ASSERT_TRUE(saved.checkout_owner);
+  observer.ReleaseCheckout(saved.dbid, 1, *saved.checkout_owner,
+                           [](Result<void> result) { ASSERT_TRUE(result); });
+  done = false;
+  db_.CheckoutEntity(saved.dbid, 1, *create.create_owner, [&](GetResult result) {
+    EXPECT_TRUE(result.success);
+    observer.GetEntity(saved.dbid, 1, [&](GetResult stored) {
+      ASSERT_TRUE(stored.success);
+      ASSERT_TRUE(stored.checked_out_by);
+      EXPECT_EQ(stored.checked_out_by->ownership_version, result.checkout_version);
+    });
+    done = true;
+  });
+  EXPECT_FALSE(done);
+  pump_until([&] { return done; });
+  EXPECT_TRUE(done);
+  observer.Shutdown();
+}
+
+TEST_F(MysqlDatabaseTest, LostReservationCommitReplyDoesNotIssueIds) {
+  auto upstream = Address::Resolve(cfg_.mysql_host, cfg_.mysql_port);
+  ASSERT_TRUE(upstream);
+  auto listener = Socket::CreateTcp();
+  ASSERT_TRUE(listener);
+  ASSERT_TRUE(listener->Bind(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(listener->Listen());
+  auto local = listener->LocalAddress();
+  ASSERT_TRUE(local);
+  std::atomic<bool> armed{false};
+  std::atomic<bool> dropped{false};
+  std::string proxy_error;
+  std::jthread proxy([&, socket = std::move(*listener)](std::stop_token stop) mutable {
+    auto result =
+        RelayUntilCommittedReply(std::move(socket), *upstream, cfg_, stop, armed, dropped,
+                                 "SELECT next_id > 100 FROM atlas_entity_id_counter WHERE id=1");
+    if (!result) proxy_error = result.Error().Message();
+  });
+  auto config = cfg_;
+  config.mysql_port = local->Port();
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(config, EntityDefRegistry::Instance()));
+  armed.store(true);
+  int callbacks = 0;
+  peer.ReserveEntityIds(100, [&](Result<EntityIdRange> result) {
+    ++callbacks;
+    ASSERT_FALSE(result.HasValue());
+    EXPECT_EQ(result.Error().Code(), ErrorCode::kCommitUnknown);
+  });
+  peer.Shutdown();
+  proxy.request_stop();
+  proxy.join();
+  EXPECT_TRUE(proxy_error.empty()) << proxy_error;
+  EXPECT_TRUE(dropped.load());
+  EXPECT_EQ(callbacks, 1);
+  db_.ReserveEntityIds(1, [](Result<EntityIdRange> range) {
+    ASSERT_TRUE(range.HasValue());
+    EXPECT_GT(range->first, 100u);
+  });
+}
+
+TEST_F(MysqlDatabaseTest, RetirementFailureRollsBackFenceAndLeaseBeforeCallback) {
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("saved"),
+                "retirement_rollback", [](PutResult result) { ASSERT_TRUE(result.success); });
+  CheckoutInfo owner{Address("127.0.0.1", 24991), 7, 9, 0, 111};
+  db_.CheckoutEntity(42, 1, owner, [&](GetResult result) {
+    ASSERT_TRUE(result.success);
+    owner.ownership_version = result.checkout_version;
+  });
+  auto admin = connect_admin(cfg_);
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(mysql_query(admin.get(),
+                        "CREATE TRIGGER reject_retirement BEFORE UPDATE ON entities FOR EACH ROW "
+                        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected retirement failure'"),
+            0);
+  db_.SetDeferredMode(true);
+  int callbacks = 0;
+  db_.RetireCheckoutProcess(owner.base_addr, owner.process_instance, [&](Result<int> result) {
+    EXPECT_FALSE(result);
+    ++callbacks;
+  });
+  EXPECT_EQ(callbacks, 0);
+  pump_until([&] { return callbacks != 0; });
+  ASSERT_EQ(callbacks, 1);
+  db_.ProcessResults();
+  EXPECT_EQ(callbacks, 1);
+  db_.SetDeferredMode(false);
+  MysqlDatabase observer;
+  ASSERT_TRUE(observer.Startup(cfg_, EntityDefRegistry::Instance()));
+  observer.GetEntity(42, 1, [&](GetResult result) {
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.data.blob, make_blob("saved"));
+    ASSERT_TRUE(result.checked_out_by);
+    EXPECT_EQ(*result.checked_out_by, owner);
+  });
+  ASSERT_EQ(
+      mysql_query(admin.get(), "SELECT COUNT(*) FROM atlas_checkout_processes WHERE retired=1"), 0);
+  {
+    std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> rows(mysql_store_result(admin.get()),
+                                                                  mysql_free_result);
+    ASSERT_NE(rows, nullptr);
+    auto row = mysql_fetch_row(rows.get());
+    ASSERT_NE(row, nullptr);
+    EXPECT_STREQ(row[0], "0");
+  }
+  ASSERT_EQ(mysql_query(admin.get(), "DROP TRIGGER reject_retirement"), 0);
+  db_.RetireCheckoutProcess(owner.base_addr, owner.process_instance, [](Result<int> result) {
+    ASSERT_TRUE(result);
+    EXPECT_EQ(*result, 1);
+  });
+  observer.GetEntity(42, 1, [](GetResult result) {
+    ASSERT_TRUE(result.success);
+    EXPECT_FALSE(result.checked_out_by);
+  });
+  observer.Shutdown();
+}
+
+TEST_F(MysqlDatabaseTest, LostRetirementCommitReplyKeepsConfirmedFenceAndCanRetry) {
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("saved"),
+                "retirement_unknown", [](PutResult result) { ASSERT_TRUE(result.success); });
+  const CheckoutInfo owner{Address("127.0.0.1", 24991), 7, 9, 0, 111};
+  db_.CheckoutEntity(42, 1, owner, [](GetResult result) { ASSERT_TRUE(result.success); });
+  auto upstream = Address::Resolve(cfg_.mysql_host, cfg_.mysql_port);
+  ASSERT_TRUE(upstream);
+  auto listener = Socket::CreateTcp();
+  ASSERT_TRUE(listener);
+  ASSERT_TRUE(listener->Bind(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(listener->Listen());
+  auto local = listener->LocalAddress();
+  ASSERT_TRUE(local);
+  std::atomic<bool> armed{false};
+  std::atomic<bool> dropped{false};
+  std::string proxy_error;
+  std::jthread proxy([&, socket = std::move(*listener)](std::stop_token stop) mutable {
+    auto result =
+        RelayUntilCommittedReply(std::move(socket), *upstream, cfg_, stop, armed, dropped,
+                                 "SELECT COUNT(*) FROM atlas_checkout_processes WHERE retired=1");
+    if (!result) proxy_error = result.Error().Message();
+  });
+  auto config = cfg_;
+  config.mysql_port = local->Port();
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(config, EntityDefRegistry::Instance()));
+  armed.store(true);
+  int callbacks = 0;
+  peer.RetireCheckoutProcess(owner.base_addr, owner.process_instance, [&](Result<int> result) {
+    ++callbacks;
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.Error().Code(), ErrorCode::kCommitUnknown);
+  });
+  peer.Shutdown();
+  proxy.request_stop();
+  proxy.join();
+  ASSERT_TRUE(proxy_error.empty()) << proxy_error;
+  ASSERT_TRUE(dropped.load());
+  ASSERT_EQ(callbacks, 1);
+  db_.GetEntity(42, 1, [](GetResult result) {
+    ASSERT_TRUE(result.success);
+    EXPECT_FALSE(result.checked_out_by);
+  });
+  db_.CheckoutEntity(42, 1, owner, [](GetResult result) {
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.error_kind, DatabaseErrorKind::kOwnershipConflict);
+  });
+  db_.RetireCheckoutProcess(owner.base_addr, owner.process_instance, [](Result<int> result) {
+    ASSERT_TRUE(result);
+    EXPECT_EQ(*result, 0);
+  });
+}
+
+TEST_F(MysqlDatabaseTest, LostDeleteCommitReplyReplaysWithoutDeletingNewOwner) {
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("saved"),
+                "delete_unknown", [](PutResult result) { ASSERT_TRUE(result.success); });
+  CheckoutInfo owner{Address("127.0.0.1", 24991), 7, 9, 0, 111};
+  db_.CheckoutEntity(42, 1, owner, [&](GetResult result) {
+    ASSERT_TRUE(result.success);
+    owner.ownership_version = result.checkout_version;
+  });
+  auto upstream = Address::Resolve(cfg_.mysql_host, cfg_.mysql_port);
+  ASSERT_TRUE(upstream);
+  auto listener = Socket::CreateTcp();
+  ASSERT_TRUE(listener);
+  ASSERT_TRUE(listener->Bind(Address("127.0.0.1", 0)));
+  ASSERT_TRUE(listener->Listen());
+  auto local = listener->LocalAddress();
+  ASSERT_TRUE(local);
+  std::atomic<bool> armed{false};
+  std::atomic<bool> dropped{false};
+  std::string proxy_error;
+  std::jthread proxy([&, socket = std::move(*listener)](std::stop_token stop) mutable {
+    auto result = RelayUntilCommittedReply(
+        std::move(socket), *upstream, cfg_, stop, armed, dropped,
+        "SELECT EXISTS(SELECT 1 FROM atlas_write_receipts WHERE result_dbid=42) "
+        "AND NOT EXISTS(SELECT 1 FROM entities WHERE dbid=42)");
+    if (!result) proxy_error = result.Error().Message();
+  });
+  auto config = cfg_;
+  config.mysql_port = local->Port();
+  MysqlDatabase peer;
+  ASSERT_TRUE(peer.Startup(config, EntityDefRegistry::Instance()));
+  DatabaseWriteOperation operation;
+  operation.id[0] = std::byte{0x7D};
+  operation.requested_dbid = 42;
+  operation.requested_flags = WriteFlags::kDelete;
+  operation.expected_owner = owner;
+  armed.store(true);
+  int callbacks = 0;
+  peer.PutEntityWithOperation(operation, 42, 1, WriteFlags::kDelete, {}, "", [&](PutResult result) {
+    ++callbacks;
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.error_kind, DatabaseErrorKind::kCommitUnknown);
+  });
+  peer.Shutdown();
+  proxy.request_stop();
+  proxy.join();
+  ASSERT_TRUE(proxy_error.empty()) << proxy_error;
+  ASSERT_TRUE(dropped.load());
+  ASSERT_EQ(callbacks, 1);
+  db_.GetEntity(42, 1, [](GetResult result) {
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.error_kind, DatabaseErrorKind::kNotFound);
+  });
+  db_.PutEntity(42, 1, WriteFlags::kCreateNew | WriteFlags::kExplicitDbid, make_blob("replacement"),
+                "new_owner", [](PutResult result) { ASSERT_TRUE(result.success); });
+  CheckoutInfo next{Address("127.0.0.1", 24991), 7, 10, 0, 222};
+  db_.CheckoutEntity(42, 1, next, [&](GetResult result) {
+    ASSERT_TRUE(result.success);
+    next.ownership_version = result.checkout_version;
+  });
+  ASSERT_GT(next.ownership_version, owner.ownership_version);
+  db_.PutEntityWithOperation(operation, 42, 1, WriteFlags::kDelete, {}, "", [&](PutResult result) {
+    ++callbacks;
+    EXPECT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.dbid, 42);
+  });
+  EXPECT_EQ(callbacks, 2);
+  db_.GetEntity(42, 1, [&](GetResult result) {
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.data.blob, make_blob("replacement"));
+    ASSERT_TRUE(result.checked_out_by);
+    EXPECT_EQ(*result.checked_out_by, next);
+  });
+}

@@ -3,9 +3,9 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "foundation/error.h"
@@ -13,27 +13,6 @@
 namespace atlas::fs {
 
 namespace stdfs = std::filesystem;
-
-class ScopedFileLock {
- public:
-  ScopedFileLock();
-  ~ScopedFileLock();
-
-  ScopedFileLock(const ScopedFileLock&) = delete;
-  auto operator=(const ScopedFileLock&) -> ScopedFileLock& = delete;
-  ScopedFileLock(ScopedFileLock&& other) noexcept;
-  auto operator=(ScopedFileLock&& other) noexcept -> ScopedFileLock&;
-
-  [[nodiscard]] static auto TryAcquire(const stdfs::path& path, std::string_view content = {})
-      -> Result<ScopedFileLock>;
-  [[nodiscard]] auto IsHeld() const -> bool;
-
- private:
-  struct Impl;
-  explicit ScopedFileLock(std::unique_ptr<Impl> impl);
-
-  std::unique_ptr<Impl> impl_;
-};
 
 [[nodiscard]] auto ReadFile(const stdfs::path& path) -> Result<std::vector<std::byte>>;
 [[nodiscard]] auto ReadTextFile(const stdfs::path& path) -> Result<std::string>;

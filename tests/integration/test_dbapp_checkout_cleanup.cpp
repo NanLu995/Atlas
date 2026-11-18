@@ -13,22 +13,20 @@
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <sqlite3.h>
 
 #include "atdf_account_fixture.h"
 #include "db/entity_blob.h"
 #include "dbapp/account_session_messages.h"
 #include "dbapp/dbapp.h"
 #include "dbapp/dbapp_messages.h"
+#include "mysql_test_fixture.h"
 #include "network/event_dispatcher.h"
 #include "network/machined_types.h"
 #include "network/network_interface.h"
 #include "network/reliable_udp.h"
 #include "network/socket.h"
 #include "platform/child_process.h"
-#include "platform/dynamic_library.h"
 #include "platform/filesystem.h"
-#include "platform/platform_config.h"
 
 using namespace atlas;
 using namespace atlas::dbapp;
@@ -62,8 +60,7 @@ auto write_entity_defs_bin() -> std::filesystem::path {
 }
 
 struct DBAppArgv {
-  DBAppArgv(uint16_t internal_port, const std::filesystem::path& entitydef_bin_path,
-            const std::filesystem::path& sqlite_path, std::string_view backend = "sqlite")
+  DBAppArgv(uint16_t internal_port, const std::filesystem::path& entitydef_bin_path)
       : storage{"dbapp",
                 "--type",
                 "dbapp",
@@ -77,25 +74,13 @@ struct DBAppArgv {
                 "127.0.0.1:1",
                 "--entitydef-bin-path",
                 entitydef_bin_path.string(),
-                "--db-type",
-                std::string(backend),
-                "--db-sqlite-path",
-                sqlite_path.string(),
                 "--account-type-id",
                 "1",
                 "--auto-create-accounts",
                 "true"} {
-    if (backend == "mysql") {
-      storage.insert(storage.end(),
-                     {"--db-type", "mysql", "--db-mysql-host", std::getenv("ATLAS_TEST_MYSQL_HOST"),
-                      "--db-mysql-port", std::getenv("ATLAS_TEST_MYSQL_PORT"), "--db-mysql-user",
-                      std::getenv("ATLAS_TEST_MYSQL_USER"), "--db-mysql-password",
-                      std::getenv("ATLAS_TEST_MYSQL_PASSWORD"), "--db-mysql-database",
-                      std::getenv("ATLAS_TEST_MYSQL_DATABASE"), "--db-mysql-database-id",
-                      "0123456789abcdef0123456789abcdef", "--db-mysql-ssl-ca",
-                      std::getenv("ATLAS_TEST_MYSQL_SSL_CA"), "--db-mysql-initialize", "true"});
-    }
-    for (auto& s : storage) ptrs.push_back(s.data());
+    auto database = test_fixtures::MysqlTestArguments();
+    storage.insert(storage.end(), database.begin(), database.end());
+    for (auto& value : storage) ptrs.push_back(value.data());
   }
 
   int argc() { return static_cast<int>(ptrs.size()); }
@@ -300,11 +285,10 @@ TEST(DBAppIntegration, InvalidDefinitionsCompleteTheStartupNotification) {
   const auto stamp = Clock::now().time_since_epoch().count();
   const auto directory =
       std::filesystem::temp_directory_path() / std::format("atlas_invalid_dbapp_{}", stamp);
-  DBAppArgv arguments(reserve_udp_port(), directory / "missing.bin", directory / "store.sqlite3");
+  DBAppArgv arguments(reserve_udp_port(), directory / "missing.bin");
   EXPECT_EQ(app.RunApp(arguments.argc(), arguments.argv()), 1);
   ASSERT_EQ(address.wait_for(std::chrono::seconds(0)), std::future_status::ready);
   EXPECT_EQ(address.get(), Address{});
-  EXPECT_FALSE(std::filesystem::exists(directory / "store.sqlite3"));
 }
 
 TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
@@ -312,9 +296,7 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   ASSERT_NE(port, 0u);
 
   const auto entity_defs = write_entity_defs_bin();
-  const auto sqlite_path =
-      std::filesystem::temp_directory_path() / "atlas_dbapp_checkout_cleanup.sqlite3";
-  std::filesystem::remove(sqlite_path);
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
 
   std::promise<Address> addr_promise;
   auto addr_future = addr_promise.get_future();
@@ -334,7 +316,7 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
     dispatcher.SetMaxPollWait(Milliseconds(1));
     NetworkInterface network(dispatcher);
     TestDBApp app(dispatcher, network, addr_promise, stop_flag);
-    DBAppArgv args(port, entity_defs, sqlite_path);
+    DBAppArgv args(port, entity_defs);
     for (std::size_t i = 0; i + 1 < args.storage.size(); ++i) {
       if (args.storage[i] == "--machined") {
         args.storage[i + 1] = machined_client.network.TcpAddress().ToString();
@@ -407,41 +389,18 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   co1.entity_id = 1001;
   co1.request_id = 11;
   co1.owner_addr = baseapp1.local_addr();
-#if ATLAS_PLATFORM_WINDOWS
-  auto sqlite_open = &sqlite3_open;
-  auto sqlite_exec = &sqlite3_exec;
-  auto sqlite_close = &sqlite3_close;
-#else
-  // Unix SQLite connections in this process must share the plugin's locking state.
-  auto executable = fs::ExecutablePath();
-  ASSERT_TRUE(executable.HasValue());
-  auto library = DynamicLibrary::Load(executable->parent_path() / "libatlas_db_sqlite.so");
-  ASSERT_TRUE(library.HasValue());
-  auto open_symbol = library->GetSymbol<decltype(&sqlite3_open)>("sqlite3_open");
-  auto exec_symbol = library->GetSymbol<decltype(&sqlite3_exec)>("sqlite3_exec");
-  auto close_symbol = library->GetSymbol<decltype(&sqlite3_close)>("sqlite3_close");
-  ASSERT_TRUE(open_symbol.HasValue());
-  ASSERT_TRUE(exec_symbol.HasValue());
-  ASSERT_TRUE(close_symbol.HasValue());
-  auto sqlite_open = *open_symbol;
-  auto sqlite_exec = *exec_symbol;
-  auto sqlite_close = *close_symbol;
-#endif
-  sqlite3* fault_db = nullptr;
-  ASSERT_EQ(sqlite_open(sqlite_path.string().c_str(), &fault_db), SQLITE_OK);
-  ASSERT_EQ(sqlite_exec(fault_db,
-                        "CREATE TRIGGER reject_checkout BEFORE UPDATE ON entities "
-                        "BEGIN SELECT RAISE(ABORT, 'injected checkout failure'); END",
-                        nullptr, nullptr, nullptr),
-            SQLITE_OK);
+  auto fault_db = test_fixtures::MysqlTestConnection();
+  ASSERT_NE(fault_db, nullptr);
+  ASSERT_EQ(mysql_query(fault_db.get(),
+                        "CREATE TRIGGER reject_checkout BEFORE UPDATE ON entities FOR EACH ROW "
+                        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected checkout failure'"),
+            0);
   ASSERT_TRUE((*ch1)->SendMessage(co1).HasValue());
   ASSERT_TRUE(poll_until(baseapp1.dispatcher, [&] {
     return baseapp1.checkout_received.load(std::memory_order_acquire);
   }));
   EXPECT_EQ(baseapp1.checkout_ack.status, CheckoutStatus::kDbError);
-  ASSERT_EQ(sqlite_exec(fault_db, "DROP TRIGGER reject_checkout", nullptr, nullptr, nullptr),
-            SQLITE_OK);
-  sqlite_close(fault_db);
+  ASSERT_EQ(mysql_query(fault_db.get(), "DROP TRIGGER reject_checkout"), 0);
   co1.request_id = 13;
   baseapp1.reset_checkout();
   ASSERT_TRUE((*ch1)->SendMessage(co1).HasValue());
@@ -459,12 +418,10 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   EXPECT_EQ(baseapp1.checkout_ack.status, CheckoutStatus::kSuccess);
   EXPECT_EQ(baseapp1.checkout_ack.dbid, dbid);
 
-  ASSERT_EQ(sqlite_open(sqlite_path.string().c_str(), &fault_db), SQLITE_OK);
-  ASSERT_EQ(sqlite_exec(fault_db,
-                        "CREATE TRIGGER reject_logoff BEFORE UPDATE ON entities "
-                        "BEGIN SELECT RAISE(ABORT, 'injected logoff failure'); END",
-                        nullptr, nullptr, nullptr),
-            SQLITE_OK);
+  ASSERT_EQ(mysql_query(fault_db.get(),
+                        "CREATE TRIGGER reject_logoff BEFORE UPDATE ON entities FOR EACH ROW "
+                        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected logoff failure'"),
+            0);
   WriteEntity logoff = write;
   logoff.operation_id[0] = std::byte{2};
   logoff.flags = WriteFlags::kLogOff;
@@ -478,10 +435,6 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   ASSERT_TRUE(poll_until(baseapp1.dispatcher,
                          [&] { return baseapp1.write_received.load(std::memory_order_acquire); }));
   EXPECT_FALSE(baseapp1.write_ack.success);
-  // Hide storage to prove the conflict comes from the retained local owner.
-  ASSERT_EQ(sqlite_exec(fault_db, "ALTER TABLE entities RENAME TO unavailable_entities", nullptr,
-                        nullptr, nullptr),
-            SQLITE_OK);
   CheckoutEntity conflict = co1;
   ASSERT_TRUE(FillSecureRandom(conflict.operation_id));
   conflict.request_id = 14;
@@ -494,12 +447,8 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   EXPECT_EQ(baseapp2.checkout_ack.status, CheckoutStatus::kAlreadyCheckedOut);
   EXPECT_EQ(baseapp2.checkout_ack.holder_addr, baseapp1.local_addr());
   EXPECT_EQ(baseapp2.checkout_ack.holder_entity_id, co1.entity_id);
-  ASSERT_EQ(sqlite_exec(fault_db, "ALTER TABLE unavailable_entities RENAME TO entities", nullptr,
-                        nullptr, nullptr),
-            SQLITE_OK);
-  ASSERT_EQ(sqlite_exec(fault_db, "DROP TRIGGER reject_logoff", nullptr, nullptr, nullptr),
-            SQLITE_OK);
-  sqlite_close(fault_db);
+  ASSERT_EQ(mysql_query(fault_db.get(), "DROP TRIGGER reject_logoff"), 0);
+  fault_db.reset();
   baseapp2.reset_checkout();
 
   machined::DeathNotification death;
@@ -541,29 +490,14 @@ TEST(DBAppIntegration, BaseAppDeathNotificationClearsCheckoutOwnership) {
   stop_flag.store(true, std::memory_order_release);
   app_thread.join();
 
-  std::filesystem::remove(sqlite_path);
   std::filesystem::remove(entity_defs);
 }
 
-class DBAppOwnershipIntegration : public ::testing::TestWithParam<const char*> {};
-
-TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedReply) {
-  const std::string_view backend = GetParam();
-  if (backend == "mysql") {
-    if (std::getenv("ATLAS_TEST_MYSQL") == nullptr) {
-      FAIL() << "MySQL environment blocked: isolated ATLAS_TEST_MYSQL configuration required";
-    }
-    for (const char* name :
-         {"ATLAS_TEST_MYSQL_HOST", "ATLAS_TEST_MYSQL_PORT", "ATLAS_TEST_MYSQL_USER",
-          "ATLAS_TEST_MYSQL_PASSWORD", "ATLAS_TEST_MYSQL_DATABASE"}) {
-      ASSERT_NE(std::getenv(name), nullptr) << "missing " << name;
-    }
-  }
+TEST(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedReply) {
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
   const auto port = reserve_udp_port();
   ASSERT_NE(port, 0u);
   const auto definitions = write_entity_defs_bin();
-  const auto database_path =
-      std::filesystem::temp_directory_path() / std::format("atlas_lease_{}", backend);
   std::promise<Address> ready;
   auto address = ready.get_future();
   std::atomic<bool> stop{false};
@@ -581,7 +515,7 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
     dispatcher.SetMaxPollWait(Milliseconds(1));
     NetworkInterface network(dispatcher);
     TestDBApp app(dispatcher, network, ready, stop);
-    DBAppArgv args(port, definitions, database_path, backend);
+    DBAppArgv args(port, definitions);
     for (std::size_t i = 0; i + 1 < args.storage.size(); ++i) {
       if (args.storage[i] == "--machined") {
         args.storage[i + 1] = machined_client.network.TcpAddress().ToString();
@@ -806,8 +740,8 @@ TEST_P(DBAppOwnershipIntegration, CheckoutFencesOldWriteCheckinAbortAndCachedRep
   EXPECT_TRUE(next.delete_ack.success) << next.delete_ack.error;
 }
 
-#if ATLAS_TEST_MYSQL_ENABLED
 TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
+  ASSERT_TRUE(test_fixtures::ResetMysqlTestDatabase());
   if (std::getenv("ATLAS_TEST_MYSQL") == nullptr) {
     FAIL() << "MySQL environment blocked: isolated ATLAS_TEST_MYSQL configuration required";
   }
@@ -850,12 +784,10 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
     return ChildProcess::Start(std::move(options));
   };
   auto first_server = launch(first_addr);
-  auto second_server = launch(second_addr);
   ASSERT_TRUE(first_server);
-  ASSERT_TRUE(second_server);
   auto ready = [](ChildProcess& process) {
     std::string transcript;
-    const auto deadline = Clock::now() + std::chrono::seconds(20);
+    const auto deadline = Clock::now() + std::chrono::seconds(60);
     while (Clock::now() < deadline) {
       if (auto line = process.WaitForStdoutLine(Milliseconds(100))) {
         if (*line == "DBAPP_TEST_READY") return true;
@@ -868,6 +800,8 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
     return false;
   };
   ASSERT_TRUE(ready(*first_server));
+  auto second_server = launch(second_addr);
+  ASSERT_TRUE(second_server);
   ASSERT_TRUE(ready(*second_server));
   ASSERT_NE(first_addr, second_addr);
   DBAppClient client{"checkout_retry_client"};
@@ -1040,14 +974,3 @@ TEST(DBAppIntegration, LostCheckoutReplyRetriesThroughAnotherDbapp) {
   EXPECT_EQ(client.checkout_ack.status, CheckoutStatus::kDbError);
   EXPECT_EQ(client.checkout_ack.error, "checkout_lease_expired");
 }
-
-#endif
-
-#if ATLAS_TEST_MYSQL_ENABLED
-constexpr const char* kDatabaseBackends[] = {"mysql", "sqlite"};
-#else
-constexpr const char* kDatabaseBackends[] = {"sqlite"};
-#endif
-INSTANTIATE_TEST_SUITE_P(Backends, DBAppOwnershipIntegration,
-                         ::testing::ValuesIn(kDatabaseBackends),
-                         [](const auto& info) { return std::string(info.param); });

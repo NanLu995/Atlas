@@ -56,11 +56,7 @@ struct ServerConfig {
   // Binary descriptor (ATDF, emitted by Atlas.Tools.DefDump) consumed by
   // EntityDefRegistry::RegisterFromBinaryFile on DBApp startup.
   std::filesystem::path entitydef_bin_path;
-  std::string db_type{"mysql"};  // "mysql" or explicitly selected "sqlite"
-  std::filesystem::path db_sqlite_path{"data/atlas_dev.sqlite3"};
-  bool db_sqlite_wal{true};
-  int db_sqlite_busy_timeout_ms{5000};
-  bool db_sqlite_foreign_keys{true};
+  std::string db_type{"mysql"};
   std::string db_mysql_host{"127.0.0.1"};
   uint16_t db_mysql_port{3306};
   std::string db_mysql_user;

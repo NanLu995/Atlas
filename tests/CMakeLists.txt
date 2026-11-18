@@ -2,7 +2,7 @@
 
 # Helper function to reduce test boilerplate
 function(atlas_add_test)
-  cmake_parse_arguments(ARG "" "NAME;LABEL" "SOURCES;DEPS" ${ARGN})
+  cmake_parse_arguments(ARG "" "NAME;LABEL" "SOURCES;DEPS;ARGS" ${ARGN})
 
   if(NOT ARG_LABEL)
     set(ARG_LABEL "unit")
@@ -26,7 +26,7 @@ function(atlas_add_test)
   endif()
   atlas_deploy_db_plugins_if_needed(${ARG_NAME})
 
-  add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME})
+  add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME} ${ARG_ARGS})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS "${ARG_LABEL}")
 
   # Output directory: ${ATLAS_BIN_ROOT} — derived from the build directory

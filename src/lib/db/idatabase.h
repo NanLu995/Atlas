@@ -4,7 +4,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
@@ -19,12 +18,7 @@
 namespace atlas {
 
 struct DatabaseConfig {
-  std::string type{"mysql"};  // "mysql" or explicitly selected "sqlite"
-
-  std::filesystem::path sqlite_path{"data/atlas_dev.sqlite3"};
-  bool sqlite_wal{true};
-  int sqlite_busy_timeout_ms{5000};
-  bool sqlite_foreign_keys{true};
+  std::string type{"mysql"};
 
   std::string mysql_host{"127.0.0.1"};
   uint16_t mysql_port{3306};
@@ -348,10 +342,6 @@ class IDatabase {
                                     std::function<void(Result<AccountSession>)> callback) {
     callback(Error{ErrorCode::kNotSupported, "account sessions are not supported"});
   }
-
-  virtual void BeginBatch() {}
-
-  virtual void EndBatch() {}
 
   [[nodiscard]] virtual auto SupportsMultiDbapp() const -> bool { return false; }
 

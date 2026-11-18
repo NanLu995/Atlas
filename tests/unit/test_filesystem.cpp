@@ -57,29 +57,6 @@ TEST(Filesystem, AtomicReplaceFileReplacesTarget) {
   (void)fs::RemoveFile(target);
 }
 
-TEST(Filesystem, ScopedFileLockRejectsSecondHolderAndAllowsReacquire) {
-  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-  auto path = fs::TempDirectory() / std::format("atlas_test_lock_{}.lock", stamp);
-
-  {
-    auto first = fs::ScopedFileLock::TryAcquire(path, "first");
-    ASSERT_TRUE(first.HasValue()) << first.Error().Message();
-    EXPECT_TRUE(first->IsHeld());
-
-    auto second = fs::ScopedFileLock::TryAcquire(path, "second");
-    ASSERT_FALSE(second.HasValue());
-    EXPECT_EQ(second.Error().Code(), atlas::ErrorCode::kAlreadyExists);
-  }
-
-  {
-    auto reacquired = fs::ScopedFileLock::TryAcquire(path, "third");
-    ASSERT_TRUE(reacquired.HasValue()) << reacquired.Error().Message();
-    EXPECT_TRUE(reacquired->IsHeld());
-  }
-
-  (void)fs::RemoveFile(path);
-}
-
 TEST(Filesystem, AtomicReplaceCreatesMissingTarget) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   auto target = fs::TempDirectory() / std::format("atlas_atomic_new_{}.txt", stamp);

@@ -142,7 +142,7 @@ function(atlas_deploy_db_plugins target)
   endif()
   set_target_properties(${target} PROPERTIES _ATLAS_DB_PLUGINS_DEPLOYED TRUE)
 
-  foreach(_plugin IN ITEMS atlas_db_sqlite_plugin atlas_db_mysql_plugin)
+  foreach(_plugin IN ITEMS atlas_db_mysql_plugin)
     if(TARGET ${_plugin})
       add_dependencies(${target} ${_plugin})
       if(_plugin STREQUAL "atlas_db_mysql_plugin")

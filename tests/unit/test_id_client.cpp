@@ -6,10 +6,6 @@ using namespace atlas;
 
 TEST(IDClient, AllocateFromSingleRange) {
   IDClient client;
-  // Provision 2·kCriticallyLow IDs.  AllocateId returns invalid as soon
-  // as Available drops below kCriticallyLow, so exactly
-  // kCriticallyLow + 1 calls succeed before refusal — pegging the test
-  // to the live constant keeps it valid through threshold retunes.
   const auto kProvisioned = 2 * IDClient::kCriticallyLow;
   const auto kSuccessfulAllocs = IDClient::kCriticallyLow + 1;
   client.AddIds(100, 100 + kProvisioned - 1);
@@ -37,9 +33,6 @@ TEST(IDClient, CriticallyLowThreshold) {
   IDClient client;
   client.AddIds(1, IDClient::kCriticallyLow);
 
-  // Available() == kCriticallyLow → IsCriticallyLow() is false (the
-  // threshold is `< kCriticallyLow`, exclusive), so one allocation
-  // succeeds before crossing.
   EXPECT_FALSE(client.IsCriticallyLow());
   EXPECT_NE(client.AllocateId(), kInvalidEntityID);
   EXPECT_EQ(client.Available(), IDClient::kCriticallyLow - 1);
@@ -72,11 +65,57 @@ TEST(IDClient, IdsToRequestReturnsDesiredCount) {
   EXPECT_EQ(client.IdsToRequest(), IDClient::kDesired);
 }
 
+TEST(IDClient, OutstandingReservationSuppressesRepeatedRequests) {
+  IDClient client;
+  const auto now = TimePoint{} + std::chrono::seconds(1);
+  client.SetRequestPending(true, now);
+  for (int tick = 0; tick < 100; ++tick) EXPECT_EQ(client.IdsToRequest(now), 0u);
+  client.AddIds(1, IDClient::kDesired);
+  for (uint64_t i = 0; i < IDClient::kDesired - IDClient::kLow + 1; ++i) {
+    ASSERT_NE(client.AllocateId(), kInvalidEntityID);
+  }
+  EXPECT_TRUE(client.NeedsRefill());
+  EXPECT_EQ(client.IdsToRequest(now), IDClient::kDesired);
+}
+
+TEST(IDClient, FailedReservationOrDisconnectedChannelAllowsRetry) {
+  IDClient client;
+  const auto now = TimePoint{} + std::chrono::seconds(1);
+  client.SetRequestPending(true, now);
+  client.AddIds(0, 0);
+  EXPECT_EQ(client.IdsToRequest(now), IDClient::kDesired);
+  client.SetRequestPending(true, now);
+  client.SetRequestPending(false, now);
+  EXPECT_EQ(client.IdsToRequest(now), IDClient::kDesired);
+}
+
+TEST(IDClient, MissingReplyAllowsOneRetryAtEachDeadline) {
+  IDClient client;
+  const auto start = TimePoint{} + std::chrono::seconds(1);
+  client.SetRequestPending(true, start);
+  EXPECT_EQ(client.IdsToRequest(start + std::chrono::seconds(5) - std::chrono::nanoseconds(1)), 0u);
+  EXPECT_EQ(client.IdsToRequest(start + std::chrono::seconds(5)), IDClient::kDesired);
+  client.SetRequestPending(true, start + std::chrono::seconds(5));
+  EXPECT_EQ(client.IdsToRequest(start + std::chrono::seconds(10) - std::chrono::nanoseconds(1)),
+            0u);
+  EXPECT_EQ(client.IdsToRequest(start + std::chrono::seconds(10)), IDClient::kDesired);
+}
+
+TEST(IDClient, LateAndOverlappingRepliesCannotReuseIdsAfterRetry) {
+  IDClient client;
+  const auto start = TimePoint{} + std::chrono::seconds(1);
+  client.SetRequestPending(true, start);
+  ASSERT_EQ(client.IdsToRequest(start + std::chrono::seconds(5)), IDClient::kDesired);
+  client.SetRequestPending(true, start + std::chrono::seconds(5));
+  client.AddIds(4097, 8192);
+  client.AddIds(1, 4096);
+  client.AddIds(4097, 8192);
+  client.AddIds(8192, 9000);
+  EXPECT_EQ(client.Available(), 4096u);
+  EXPECT_EQ(client.AllocateId(), 4097u);
+}
+
 TEST(IDClient, MultipleRangesAreConsumedInOrder) {
-  // Provision three non-contiguous ranges of n IDs each, where n is
-  // sized off kCriticallyLow so the test stays valid when the threshold
-  // is retuned.  Drain all 3·n IDs and verify each came back in
-  // declaration order across range boundaries.
   IDClient client;
   const auto n = IDClient::kCriticallyLow;  // ≥ 16 IDs per range
   client.AddIds(100, 100 + n - 1);
@@ -93,9 +132,6 @@ TEST(IDClient, MultipleRangesAreConsumedInOrder) {
     EXPECT_EQ(client.AllocateId(), 300u + third_idx);
     ++third_idx;
   }
-  // Cache holds kCriticallyLow - 1 IDs after the loop (the alloc that
-  // dropped Available below the threshold ran one tick before the
-  // condition was re-checked).
   EXPECT_EQ(client.Available(), IDClient::kCriticallyLow - 1);
   EXPECT_EQ(client.AllocateId(), kInvalidEntityID);
 }

@@ -76,7 +76,6 @@ jobs:
 
       - name: Configure
         env:
-          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || 'Unix Makefiles' }}
           SCCACHE_DIR: ${{ github.workspace }}/.sccache
           CMAKE_GENERATOR: Ninja
         run: >
@@ -101,4 +100,6 @@ jobs:
           # Keep memory errors, but drop leak detection noise in this preset.
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:abort_on_error=1
-        run: ctest --build-config Debug --label-regex unit --output-on-failure
+        run: |
+          ctest --build-config Debug --label-regex unit -LE mysql --output-on-failure --no-tests=error
+          python ../../tools/test_mysql.py --docker -- ctest --build-config Debug -R "^test_mysql_database$" --output-on-failure --no-tests=error

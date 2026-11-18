@@ -37,16 +37,6 @@ FetchContent_Declare(
   URL_HASH SHA256=17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c
 )
 
-# ── sqlite3 3.47.2 (amalgamation, no CMakeLists.txt) ────────────────────────
-# SOURCE_SUBDIR points to a non-existent path so FetchContent_MakeAvailable
-# skips add_subdirectory — we build the static lib manually below.
-FetchContent_Declare(
-  sqlite3
-  URL https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip
-    URL_HASH SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
-  SOURCE_SUBDIR cmake-noop
-)
-
 # ── mimalloc 2.3.1 (optional heap backend) ───────────────────────────────────
 # Fetched only when ATLAS_HEAP_ALLOCATOR=mimalloc. Built as a shared
 # library so a single mi_heap instance backs every Atlas binary —
@@ -206,26 +196,6 @@ if(ATLAS_ENABLE_RECAST)
   set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
   FetchContent_MakeAvailable(recastnavigation)
   unset(CMAKE_POLICY_VERSION_MINIMUM)
-endif()
-
-# sqlite3 — build manually from amalgamation
-FetchContent_MakeAvailable(sqlite3)
-if(NOT TARGET sqlite3)
-  add_library(sqlite3 STATIC
-    "${sqlite3_SOURCE_DIR}/sqlite3.c"
-  )
-  target_include_directories(sqlite3 PUBLIC "${sqlite3_SOURCE_DIR}")
-  target_compile_definitions(sqlite3 PRIVATE
-    SQLITE_THREADSAFE=1
-    SQLITE_ENABLE_FTS5
-    SQLITE_ENABLE_JSON1
-  )
-  # Suppress all warnings for third-party code
-  if(MSVC)
-    target_compile_options(sqlite3 PRIVATE /W0)
-  else()
-    target_compile_options(sqlite3 PRIVATE -w)
-  endif()
 endif()
 
 if(ATLAS_DB_MYSQL)

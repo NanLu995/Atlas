@@ -29,6 +29,7 @@ auto IDClient::AllocateId() -> EntityID {
 }
 
 void IDClient::AddIds(EntityID start, EntityID end) {
+  request_deadline_ = {};
   // Discarding a late range wastes IDs; accepting overlapping IDs could reuse live identities.
   if (!IsServerEntityId(start) || !IsServerEntityId(end) || start > end ||
       start <= highest_received_id_) {
@@ -49,8 +50,8 @@ auto IDClient::NeedsRefill() const -> bool {
   return total_available_ < kLow;
 }
 
-auto IDClient::IdsToRequest() const -> uint32_t {
-  if (total_available_ >= kHigh) return 0;
+auto IDClient::IdsToRequest(TimePoint now) const -> uint32_t {
+  if (now < request_deadline_ || total_available_ >= kHigh) return 0;
 
   return static_cast<uint32_t>(kDesired);
 }

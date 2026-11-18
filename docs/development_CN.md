@@ -21,6 +21,7 @@ tools\bin\build.bat debug
 Ubuntu 使用 `bash tools/bin/<同名工具>.sh` 与相同参数。构建不修改系统设置；
 `setup_linux` 会安装系统软件包，属于需要单独授权的管理工具，不是自动构建步骤。
 `--build-dir build/<唯一名称>` 可隔离构建；切换工具链使用新名称，避免混用旧对象文件。
+如果 MSVC 头文件依赖元数据被拒绝，使用全新构建目录重新生成全部对象文件。
 Debug 用于日常开发，Release 用于交付，Profile 和 Sanitizer 用于诊断。
 每个构建目录只使用一个配置，本地与 CI 共用 SDK 声明。
 
@@ -33,6 +34,8 @@ tools\bin\test_mysql.bat -- ctest --test-dir build/debug -C Debug --output-on-fa
 fixture 启动自己的固定版本 MySQL，创建专用数据库账号，向子命令提供 TLS 配置，
 结束后关闭自己的服务；数据和日志保留在隔离目录供诊断，不分发其中私钥或备份。
 Linux CI 使用固定 digest 的 Docker fixture，不连接现有开发数据库。
+工作区存储超过 MySQL 超时预算时，使用 `--directory <全新本地目录>` 将测试库放在更快的本地存储，
+保留现有超时与断言。
 许可边界见 [Oracle MySQL 说明](oracle_mysql_CN.md)。 fixture 的 RELOAD 权限和可信函数创建设置仅用于认证缓存及故障触发器测试，不是生产账号要求。
 
 已有隔离开发数据库使用 `--database-config <本地.json>` 或 `ATLAS_DB_MYSQL_*`。
@@ -40,10 +43,24 @@ Linux CI 使用固定 digest 的 Docker fixture，不连接现有开发数据库
 密码使用进程环境变量，不提交到 JSON。CA、主机身份和逻辑数据库 ID 必须明确。
 缺配置、连接或启动失败直接报错，不回退 SQLite。
 
-SQLite 仅显式用于单 DBApp 冒烟：集群工具加 `--db-backend sqlite`，托管实集群测试设置
-`ATLAS_TEST_DB_BACKEND=sqlite`。SQLite 结果不能代替 MySQL 验收。
-快速检查是相关单测和工具测试；正式验收还包括数据库契约、托管测试、集群就绪与退出、
-Godot 联网闭环及格式检查。
+显式选择 SQLite 实体存档会被拒绝；已有文件不会自动删除或迁移。
+本次不新增策划配置数据库系统。
+
+集群启动器先等待 MySQL DBApp 初始化完成，再启动 LoginApp、BaseApp 等使用方。
+
+VS Code 的 `CMake: Test All` 同样使用该隔离 MySQL 夹具；单独运行公共单测仍无需数据库。
+单项测试在所选平台没有匹配用例时明确失败。
+
+原生全栈登录测试仅在 Windows 注册。两平台测试工作流都会执行已有托管真实登录用例，
+要求恰好执行一次并通过，跳过或零匹配均失败：
+
+```bat
+tools\bin\test_mysql.bat -- python tools/verify_real_login.py --build debug
+```
+
+Linux 使用 `bash tools/bin/test_mysql.sh -- python3 tools/verify_real_login.py --build debug`。
+工具选择同构建的 `Atlas.RpcFixture.Base.dll`，保留 `ATLAS_TEST_BASE_ASSEMBLY` 显式覆盖。
+工具打印保留的 TRX 报告路径；MySQL 环境或构建产物缺失时明确失败。
 
 ## 开发集群与 Godot
 

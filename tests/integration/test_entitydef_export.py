@@ -60,7 +60,6 @@ class EntityDefExportTests(unittest.TestCase):
     def run_dbapp(self, *arguments):
         return subprocess.run(
             [str(ARGS.dbapp), "--type", "dbapp", "--name", "dbapp", "--internal-port", "0",
-             "--db-type", "sqlite", "--db-sqlite-path", str(self.output.with_suffix(".sqlite3")),
              *map(str, arguments)], capture_output=True, text=True, timeout=15,
         )
 
@@ -68,7 +67,7 @@ class EntityDefExportTests(unittest.TestCase):
         result = self.run_dbapp()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--entitydef-bin-path", result.stdout + result.stderr)
-        self.assertFalse(self.output.with_suffix(".sqlite3").exists())
+        self.assertNotIn("database startup failed", result.stdout + result.stderr)
 
     def test_dbapp_rejects_empty_definitions_before_opening_the_database(self):
         data = struct.pack("<IHH32s", 0x46445441, 4, 0, bytes(range(32))) + bytes(3)
@@ -76,7 +75,7 @@ class EntityDefExportTests(unittest.TestCase):
         result = self.run_dbapp("--entitydef-bin-path", self.output)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("entity types", result.stdout + result.stderr)
-        self.assertFalse(self.output.with_suffix(".sqlite3").exists())
+        self.assertNotIn("database startup failed", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

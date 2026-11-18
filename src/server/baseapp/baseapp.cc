@@ -180,6 +180,7 @@ auto BaseApp::Init(int argc, char* argv[]) -> bool {
     if (&ch == dbapp_channel_) {
       ATLAS_LOG_WARNING("BaseApp: dbapp channel down (RUDP dead link), clearing");
       dbapp_channel_ = nullptr;
+      id_client_.SetRequestPending(false);
       dbapp_channel_down = true;
     }
     for (auto it = dbapp_channels_.begin(); it != dbapp_channels_.end();) {
@@ -2859,6 +2860,7 @@ void BaseApp::OnDbAppDeath(const machined::DeathNotification& msg) {
   bool removed_legacy = false;
   if (dbapp_channel_ != nullptr && dbapp_channel_->RemoteAddress() == msg.internal_addr) {
     dbapp_channel_ = nullptr;
+    id_client_.SetRequestPending(false);
     removed_legacy = true;
   }
   if (msg.reason == 0) {
@@ -4253,7 +4255,11 @@ void BaseApp::MaybeRequestMoreIds() {
 
   dbapp::GetEntityIds req;
   req.count = count;
-  (void)dbapp_channel_->SendMessage(req);
+  if (auto sent = dbapp_channel_->SendMessage(req); !sent) {
+    ATLAS_LOG_WARNING("BaseApp: EntityID request failed: {}", sent.Error().Message());
+    return;
+  }
+  id_client_.SetRequestPending(true);
   ATLAS_LOG_INFO("BaseApp: requested {} EntityIDs from DBApp", count);
 }
 

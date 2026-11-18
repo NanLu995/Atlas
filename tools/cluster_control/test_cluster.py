@@ -98,8 +98,7 @@ def _port_bindable(port: int) -> bool:
 
 def main() -> int:
     args = parse_args()
-    if args.db_backend == 'mysql':
-        database_config(args, Path())
+    database_config(args)
     # Retry on bind failure — even with the probe filter, a port can be
     # transiently reserved between probe and child bind. Fixed port_base skips.
     if args.port_base > 0:
@@ -228,11 +227,9 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_root = repo_root / ".tmp" / "test_cluster" / timestamp
     log_dir = run_root / "logs"
-    db_dir = run_root / "db"
     db_config_path = run_root / "dbapp.json"
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    db_dir.mkdir(parents=True, exist_ok=True)
 
     entitydef_path = run_root / "entity_defs.bin"
     try:
@@ -241,7 +238,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
         print(str(error), file=sys.stderr, flush=True)
         return 1
 
-    database = database_config(args, db_dir / 'test_cluster.sqlite3')
+    database = database_config(args)
     record_database_run(run_root, database, baseapps=args.baseapps,
                         cellapps=args.cellapps if args.cell_assembly else 0)
 
@@ -299,7 +296,7 @@ def _spawn_cluster(args: argparse.Namespace, port_base: int) -> int:
             processes[-1].start_order = 3
             for index in range(args.cellapps):
                 name = "cellapp" if index == 0 else "cellapp-2"
-                port = port_base + (9 if index == 0 else 14)
+                port = port_base + (9 if index == 0 else 15)
                 processes.append(start_logged_process(
                     name=name, file_path=cellapp,
                     working_directory=repo_root, log_directory=log_dir,

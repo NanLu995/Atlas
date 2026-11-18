@@ -49,6 +49,11 @@ tools\bin\run_mvp_cluster.bat
 # 4. Open samples/mvp/UnityClient in Unity Hub and hit Play.
 ```
 
+Entity persistence uses Oracle MySQL 8.4 in development and production. Follow the
+[MySQL setup](../../docs/oracle_mysql.md), then supply `--database-config` or `ATLAS_DB_MYSQL_*`
+before launching. The launcher waits for DBApp initialization before starting consumers.
+Explicit SQLite persistence selections fail; existing files are not removed or migrated.
+
 LoginApp port defaults to `20018` on both sides. Cluster runs CellApps and
 BaseApp at 20 Hz (50 ms tick). `UnityClient/Assets/Scenes/Main.unity`
 already contains the runtime `Bootstrap` object.
